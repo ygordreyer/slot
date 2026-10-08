@@ -202,6 +202,8 @@ fn a_card_from_before_the_settings_keeps_all_its_values() {
             ff_speed: FF_SPEED_DEFAULT,
             ff_sound: false,
             colour_correction: false,
+            shader: String::new(),
+            twelve_hour: false,
         }
     );
 }
@@ -388,4 +390,32 @@ fn home_wifi_defaults_off_and_malformed_optional_flag_preserves_old_settings() {
         assert_eq!(restored.volume, 30);
         assert_eq!(restored.utc_offset_min, 345);
     }
+}
+
+#[test]
+fn shader_clock_and_home_wifi_round_trip_together_in_config() {
+    let root = tmp_root();
+    for shader in ["", "LCD", "Off", "blend-grid"] {
+        for twelve_hour in [false, true] {
+            for home_wifi_enabled in [false, true] {
+                let state = SlotState {
+                    shader: shader.into(),
+                    twelve_hour,
+                    home_wifi_enabled,
+                    ..SlotState::default()
+                };
+                write_slot_state(root.path(), &state).unwrap();
+                assert_eq!(read_slot_state(root.path()), state);
+                let text = std::fs::read_to_string(root.path().join("Config/slot.state")).unwrap();
+                assert!(text.lines().any(|line| line == format!("shader={shader}")));
+                assert!(text
+                    .lines()
+                    .any(|line| line == format!("clock_12h={}", twelve_hour as u8)));
+                assert!(text
+                    .lines()
+                    .any(|line| line == format!("home_wifi_enabled={}", home_wifi_enabled as u8)));
+            }
+        }
+    }
+    assert!(!root.path().join("System/slot.state").exists());
 }

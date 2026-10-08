@@ -45,6 +45,17 @@ fn shader(kind: gl::types::GLenum, src: &str) -> Result<gl::types::GLuint, GfxEr
 }
 
 pub fn program(vert: &str, frag: &str) -> Result<gl::types::GLuint, GfxError> {
+    program_with(vert, frag, &[("a_pos", crate::quad::POS_LOCATION)])
+}
+
+/// `program` with the attribute locations spelled out. Every one of slot's own shaders takes
+/// the quad in `a_pos`; a RetroArch shader names its inputs `VertexCoord` and `TexCoord`, and
+/// ES 1.00 has no layout qualifiers, so the only place to pin them is here, before the link.
+pub fn program_with(
+    vert: &str,
+    frag: &str,
+    attribs: &[(&str, gl::types::GLuint)],
+) -> Result<gl::types::GLuint, GfxError> {
     let vs = shader(gl::VERTEX_SHADER, vert)?;
     let fs = match shader(gl::FRAGMENT_SHADER, frag) {
         Ok(fs) => fs,
@@ -57,8 +68,10 @@ pub fn program(vert: &str, frag: &str) -> Result<gl::types::GLuint, GfxError> {
         let p = gl::CreateProgram();
         gl::AttachShader(p, vs);
         gl::AttachShader(p, fs);
-        if let Ok(pos) = CString::new("a_pos") {
-            gl::BindAttribLocation(p, crate::quad::POS_LOCATION, pos.as_ptr());
+        for (name, loc) in attribs {
+            if let Ok(c) = CString::new(*name) {
+                gl::BindAttribLocation(p, *loc, c.as_ptr());
+            }
         }
         gl::LinkProgram(p);
         gl::DeleteShader(vs);

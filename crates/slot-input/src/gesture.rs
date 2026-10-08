@@ -38,6 +38,12 @@ pub enum Action {
     GameMenu,
     MuteToggle,
     ColourCorrectionToggle,
+    /// SELECT+X in a game: every enabled cheat in the cart's `.cht` on or off together. X, like
+    /// Y, never reaches the core, so the chord costs the game nothing.
+    CheatsToggle,
+    /// The press itself. Nothing visible hangs off it — it exists so the save state is
+    /// flushed before a hold can reach the PMIC's own cutoff, which takes the rails away
+    /// whatever the software wanted.
     PowerPress,
     PowerTap,
     /// The hold threshold, while the button is still down. Starts graceful shutdown.
@@ -63,7 +69,8 @@ enum Select {
 #[derive(Default)]
 pub struct Gestures {
     select: Select,
-    chord_held: u8,
+    /// Buttons swallowed by a chord, so their release is swallowed too.
+    chord_held: u16,
     menu_down_at: Option<Millis>,
     menu_last_tap: Option<Millis>,
     menu_eject_fired: bool,
@@ -406,7 +413,7 @@ impl Gestures {
     }
 }
 
-fn chord(b: Btn) -> Option<(u8, Action)> {
+fn chord(b: Btn) -> Option<(u16, Action)> {
     Some(match b {
         Btn::Up => (1, Action::BrightnessUp),
         Btn::Down => (2, Action::BrightnessDown),
@@ -415,6 +422,7 @@ fn chord(b: Btn) -> Option<(u8, Action)> {
         Btn::L1 => (16, Action::LoadState),
         Btn::R1 => (32, Action::SaveState),
         Btn::Y => (64, Action::ColourCorrectionToggle),
+        Btn::X => (128, Action::CheatsToggle),
         _ => return None,
     })
 }

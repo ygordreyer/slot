@@ -1,11 +1,23 @@
 use crate::draw::{Draw, Sprites, TexId};
 use crate::grade::blue_light_gain;
-use crate::pipeline::GamePass;
+use crate::pipeline::{GamePass, Look};
 use crate::quad::Quad;
+use crate::retroshader::RetroShader;
 use crate::shaders::{BLIT_FRAG, BLIT_VERT};
 use crate::surface::{blit_rect, GfxError, Surface, OUT_H, OUT_W};
 
 pub const BACKDROP: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+/// How the game layer is drawn, as a caller outside this crate names it.
+#[derive(Copy, Clone, Debug)]
+pub enum ShaderChoice<'a> {
+    /// The built-in LCD3x mask. The default.
+    Lcd,
+    /// No filter at all: the frame at 3x, nearest neighbour.
+    Plain,
+    /// The text of a single-pass RetroArch `.glsl` file.
+    RetroArch(&'a str),
+}
 
 pub struct Compositor {
     fbo: gl::types::GLuint,
@@ -61,6 +73,25 @@ impl Compositor {
         }
     }
 
+    /// Changes how the game layer is drawn from the next frame on. A RetroArch shader that will
+    /// not compile or link puts the built-in LCD look back, so a bad file on the card never
+    /// leaves the panel black, and hands the driver's log back for whoever wants to show it.
+    pub fn set_shader(&mut self, choice: ShaderChoice) -> Result<(), GfxError> {
+        let look = match choice {
+            ShaderChoice::Lcd => Look::Lcd,
+            ShaderChoice::Plain => Look::Plain,
+            ShaderChoice::RetroArch(src) => match RetroShader::new(src) {
+                Ok(shader) => Look::Retro(shader),
+                Err(e) => {
+                    self.game.set_look(Look::Lcd);
+                    return Err(e);
+                }
+            },
+        };
+        self.game.set_look(look);
+        Ok(())
+    }
+
     pub fn upload_game(&mut self, xrgb8888: &[u8]) {
         self.game.upload(xrgb8888);
     }
@@ -112,6 +143,10 @@ impl Compositor {
 
     pub fn set_game_source_rect(&mut self, rect: [f32; 4]) {
         self.game.set_source_rect(rect);
+    }
+
+    pub fn set_game_shader_source(&mut self, rect: [f32; 4], actual: bool) {
+        self.game.set_shader_source(rect, actual);
     }
 
     pub fn set_shake(&mut self, dx: f32) {

@@ -16,10 +16,17 @@ pub enum Toast {
     BiosMismatch,
     ColourOn,
     ColourOff,
+    /// The cheat list closing on a change: on when any cheat is left on, off when none are.
+    CheatsOn,
+    CheatsOff,
+    /// SELECT+X on a cart with no cheat file, or one with no cheats in it.
+    NoCheats,
+    /// A shader from `Shaders/` that the driver would not compile. The LCD look is back.
+    ShaderFailed,
 }
 
 impl Toast {
-    pub const ALL: [Toast; 9] = [
+    pub const ALL: [Toast; 13] = [
         Toast::StateSaved,
         Toast::StateLoaded,
         Toast::NeedsGpsp,
@@ -29,6 +36,10 @@ impl Toast {
         Toast::BiosMismatch,
         Toast::ColourOn,
         Toast::ColourOff,
+        Toast::CheatsOn,
+        Toast::CheatsOff,
+        Toast::NoCheats,
+        Toast::ShaderFailed,
     ];
 
     pub fn index(self) -> usize {
@@ -46,6 +57,10 @@ impl Toast {
             Toast::BiosMismatch => "BIOS does not match",
             Toast::ColourOn => "Correction On",
             Toast::ColourOff => "Correction Off",
+            Toast::CheatsOn => "Cheats On",
+            Toast::CheatsOff => "Cheats Off",
+            Toast::NoCheats => "No cheats found",
+            Toast::ShaderFailed => "Shader failed",
         }
     }
 }

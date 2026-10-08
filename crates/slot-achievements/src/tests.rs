@@ -253,6 +253,10 @@ impl RetroCore for TestCore {
             sample_rate: 48000.0,
         }
     }
+    fn set_cheats(&mut self, codes: &[String]) -> bool {
+        self.value = codes.len() as u8;
+        !codes.iter().any(|code| code == "unsupported")
+    }
     fn achievement_memory(&self, ram: &mut [u8]) -> [usize; 3] {
         ram[0] = self.value;
         [0x8000, 0x40000, 0]
@@ -711,4 +715,17 @@ fn artwork_identity_follows_rom_bytes_instead_of_its_filename() {
     );
     std::fs::write(&moved, b"different rom bytes").unwrap();
     assert!(artwork_title(root.path(), &moved).is_none());
+}
+
+#[test]
+fn tracked_forwards_cheats_clearing_and_the_cores_result() {
+    let root = tempfile::tempdir().unwrap();
+    let service = Service::start_with(root.path().into(), Offline);
+    let mut tracked = service.wrap(Box::<TestCore>::default());
+    assert!(tracked.set_cheats(&["code1".into(), "code2".into()]));
+    assert_eq!(tracked.serialize().unwrap(), [2]);
+    assert!(tracked.set_cheats(&[]));
+    assert_eq!(tracked.serialize().unwrap(), [0]);
+    assert!(!tracked.set_cheats(&["unsupported".into()]));
+    assert_eq!(tracked.serialize().unwrap(), [1]);
 }

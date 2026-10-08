@@ -557,3 +557,78 @@ fn the_mask_period_is_three_pixels_in_both_modes() {
         "fullscreen: the grille does not repeat every 3 px down"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn custom_shaders_crop_both_frames_and_receive_game_texture_and_output_sizes() {
+    use slot_gfx::ShaderChoice;
+    let Some((_guard, _surface, mut compositor)) = compositor() else {
+        eprintln!(
+            "custom shader readback unavailable: host headless GL context could not be created"
+        );
+        return;
+    };
+    for (source, actual, input, output) in [
+        (GB_RECT, true, (160, 144), (480, 432)),
+        (GB_RECT, false, (160, 144), (720, 480)),
+        (WHOLE, true, (240, 160), (720, 480)),
+    ] {
+        let shader = format!(
+            r#"
+#if defined(VERTEX)
+in vec4 VertexCoord;
+in vec4 TexCoord;
+uniform mat4 MVPMatrix;
+out vec2 uv;
+void main() {{ gl_Position = MVPMatrix * VertexCoord; uv = TexCoord.xy; }}
+#elif defined(FRAGMENT)
+in vec2 uv;
+out vec4 colour;
+uniform sampler2D Texture;
+uniform sampler2D PrevTexture;
+uniform vec2 InputSize;
+uniform vec2 OrigInputSize;
+uniform vec2 TextureSize;
+uniform vec2 OrigTextureSize;
+uniform vec2 OutputSize;
+void main() {{
+    bool sizes = distance(InputSize, vec2({iw}.0, {ih}.0)) < 0.1
+        && distance(OrigInputSize, InputSize) < 0.1
+        && distance(TextureSize, vec2(240.0, 160.0)) < 0.1
+        && distance(OrigTextureSize, TextureSize) < 0.1
+        && distance(OutputSize, vec2({ow}.0, {oh}.0)) < 0.1;
+    colour = vec4(texture(Texture, uv).r, texture(PrevTexture, uv).g, sizes ? 1.0 : 0.0, 1.0);
+}}
+#endif
+"#,
+            iw = input.0,
+            ih = input.1,
+            ow = output.0,
+            oh = output.1
+        );
+        compositor
+            .set_shader(ShaderChoice::RetroArch(&shader))
+            .expect("compile size-check shader");
+        compositor.set_game_source_rect(if actual { WHOLE } else { source });
+        compositor.set_game_shader_source(source, actual);
+        compositor.begin_frame();
+        compositor.upload_game(&gb_shaped(|_, _| [0, 120, 0], [0, 0, 0]));
+        compositor.upload_game(&gb_shaped(|_, _| [180, 0, 0], [0, 0, 0]));
+        compositor.draw_game();
+        let frame = compositor.read_frame();
+        assert_eq!(px(&frame, 360, 240), [180, 120, 255]);
+        if source == GB_RECT {
+            let (x, y) = if actual { (120, 24) } else { (0, 0) };
+            assert_eq!(
+                px(&frame, x, y),
+                [180, 120, 255],
+                "source begins at the real game pixel"
+            );
+            assert_eq!(px(&frame, 719 - x, 479 - y), [180, 120, 255]);
+            if actual {
+                assert_eq!(px(&frame, 119, 240), [0, 0, 0]);
+                assert_eq!(px(&frame, 360, 23), [0, 0, 0]);
+            }
+        }
+    }
+}

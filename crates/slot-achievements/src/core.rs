@@ -1,3 +1,5 @@
+//! RetroCore forwarding with asynchronous achievement snapshots.
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -90,6 +92,9 @@ impl RetroCore for Tracked {
     fn run_frame_linked(&mut self, p1: ButtonMask, p2: ButtonMask) {
         self.core.run_frame_linked(p1, p2);
         self.timeline += 1;
+    }
+    fn set_cheats(&mut self, codes: &[String]) -> bool {
+        self.core.set_cheats(codes)
     }
     fn set_option(&mut self, key: &str, value: &str) {
         self.core.set_option(key, value);

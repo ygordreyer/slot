@@ -80,6 +80,10 @@ enum Cmd {
     EndLink,
     BeginCable(u8, Box<dyn LinkChannel>),
     SetOption(String, String),
+    /// Every cheat the core should be running, replacing whatever it ran before. Empty turns
+    /// them all off. Sent after `spawn` queues the load, and commands are only drained once the
+    /// game is loaded, so a list sent the moment a cart goes in lands on a loaded game.
+    SetCheats(Vec<String>),
 }
 
 struct Shared {
@@ -283,6 +287,11 @@ impl EmuHandle {
                 Err(e) => e.into_inner().0,
             };
         }
+    }
+
+    /// See `Cmd::SetCheats`.
+    pub fn set_cheats(&self, codes: Vec<String>) {
+        let _ = self.cmds.send(Cmd::SetCheats(codes));
     }
 
     pub fn set_input(&self, mask: ButtonMask) {
@@ -881,6 +890,13 @@ impl Worker {
             }
             Cmd::SetOption(key, value) => {
                 core.set_option(&key, &value);
+            }
+            Cmd::SetCheats(codes) => {
+                if !core.set_cheats(&codes) && !codes.is_empty() {
+                    eprintln!("slot: cheats: this core took none of the {} sent", codes.len());
+                } else if crate::session::trace() {
+                    eprintln!("slot: cheats: {} running", codes.len());
+                }
             }
             Cmd::EndLink => {
                 self.shared.link_lost.store(false, Ordering::Relaxed);

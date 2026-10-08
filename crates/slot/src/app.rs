@@ -6,8 +6,9 @@ use slot_input::{Action, Btn, MUTE_CHORD_MS};
 use slot_power::{Battery, Charge, LedState, LidPolicy, Power};
 use slot_retro::LinkChannel;
 use slot_store::{
-    format_stamp, read_slot_state, scan, write_slot_state, Cart, Core, Platform, SlotState,
-    StateEntry, StateRing, Theme, BLUE_LIGHT_MAX, BRIGHTNESS_MAX, FF_SPEEDS, RING_MAX, VOLUME_MAX,
+    format_stamp, list_shaders, read_slot_state, scan, write_slot_state, Cart, Core, Platform,
+    SlotState, StateEntry, StateRing, Theme, BLUE_LIGHT_MAX, BRIGHTNESS_MAX, FF_SPEEDS, RING_MAX,
+    SHADER_LCD, SHADER_OFF, VOLUME_MAX,
 };
 use slot_ui::{
     board_from, board_zoom, draw_backdrop, draw_empty_slot, draw_footer, draw_slot_name,
@@ -17,6 +18,7 @@ use slot_ui::{
     BOARD_X, CART_W, CHIP_H, CHIP_U, CHIP_V, CHIP_W, HINT_EDGE, HINT_H, HOP_LIFT, SHADOW_H,
     SHADOW_W, SOCKET_H, SOCKET_U, SOCKET_V, SOCKET_W, TURN_PAD,
 };
+use slot_ui::{cheat_window, CheatMenu, CHEAT_ROWS};
 
 use crate::audio::Sfx;
 use crate::core_picker::{Chip, CorePicker, Outcome, Press};
@@ -253,6 +255,48 @@ pub enum Phase {
     },
 }
 
+/// The cheat list while it is up: one title and one flag per cheat in the cart's file, in the
+/// file's order, and where the bar and the window are. `App` never reads the file itself;
+/// `Session` hands the list over and collects the flags when it closes.
+#[derive(Debug)]
+struct CheatList {
+    titles: Vec<String>,
+    enabled: Vec<bool>,
+    /// What the file said when the list opened. Closing on exactly this is closing on no
+    /// change, however many flips it took to get back here.
+    opened: Vec<bool>,
+    row: usize,
+    top: usize,
+}
+
+impl CheatList {
+    fn select(&mut self, row: usize) {
+        let len = self.titles.len();
+        if len == 0 {
+            return;
+        }
+        self.row = row.min(len - 1);
+        self.top = cheat_window(self.top, self.row, len);
+    }
+
+    fn set(&mut self, on: bool) {
+        if let Some(flag) = self.enabled.get_mut(self.row) {
+            *flag = on;
+        }
+    }
+}
+
+/// What the binary needs to raster the cheat list's faces: which list this is (`generation`
+/// changes every time one opens, so a face built for another cart's cheat is never reused),
+/// the window, the bar, and how long the list is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CheatView {
+    pub generation: u64,
+    pub top: usize,
+    pub row: usize,
+    pub len: usize,
+}
+
 pub struct App {
     phase: Phase,
     shelves: Vec<(Platform, Shelf)>,
@@ -295,6 +339,31 @@ pub struct App {
     snapshot: Option<Box<dyn Snapshot>>,
     core: Core,
     colour_pending: Option<bool>,
+    /// Every look the Shader row steps through: the two built in, then `Shaders/` by name.
+    /// Read once at boot, as the carts are.
+    shaders: Vec<String>,
+    /// A look for the binary to put on the game layer, and `None` the rest of the time. Set at
+    /// boot and by the row. `App` never touches GL, so this is the same set-here, drained-there
+    /// shape as `colour_pending`; the binary is what compiles it.
+    shader_pending: Option<String>,
+    /// SELECT+X was pressed with a game on screen. `Session` owns the card and the core, so it
+    /// is what reads the cart's cheats and carries them over.
+    cheats_pending: bool,
+    /// The cheat list, while it is up. It pauses the game the way the in-game menu does.
+    cheat_menu: Option<CheatList>,
+    /// Counts the lists opened, so the binary can tell one from the next. See `CheatView`.
+    cheat_generation: u64,
+    /// The flags the list closed on, for `Session` to write back and hand to the core. Only
+    /// set when something changed.
+    cheat_commit: Option<Vec<bool>>,
+    /// One face per window row, for whichever cheat is in that row now.
+    cheat_row_faces: Vec<Option<(TexId, u32, u32)>>,
+    /// "12 OF 140" over the rows, and its width.
+    cheat_count_face: Option<(TexId, u32)>,
+    /// B DONE and A ON / OFF, uploaded once at boot.
+    cheat_legend_faces: Option<[(TexId, u32); 2]>,
+    /// Which port this device drives once a cable session is loaded for, and `None` whenever the
+    /// seated core is not being opened for one. Read by `Session::spawn_core`.
     link_player: Option<u8>,
     platform: Platform,
     named_core: bool,
@@ -308,6 +377,10 @@ pub struct App {
     clock_faces: Option<(TexId, TexId)>,
     quick_menu_faces: Option<QuickMenuFaces>,
     quick_clock_faces: Option<[(TexId, u32, u32); 2]>,
+    /// Shader's value, grey then lit. Rebuilt by the binary when the name changes, and only
+    /// while the menu is up.
+    quick_shader_faces: Option<[(TexId, u32, u32); 2]>,
+    /// The label, rasterised whole. Re-uploaded when the gauge moves.
     sticker_face: Option<TexId>,
     wallpaper: Option<TexId>,
     battery_percent: slot_ui::Printed,
@@ -399,6 +472,15 @@ impl App {
             snapshot: None,
             core: Core::default(),
             colour_pending: None,
+            shaders: vec![SHADER_LCD.to_string(), SHADER_OFF.to_string()],
+            shader_pending: None,
+            cheats_pending: false,
+            cheat_menu: None,
+            cheat_generation: 0,
+            cheat_commit: None,
+            cheat_row_faces: vec![None; CHEAT_ROWS],
+            cheat_count_face: None,
+            cheat_legend_faces: None,
             link_player: None,
             platform: Platform::default(),
             named_core: false,
@@ -412,6 +494,7 @@ impl App {
             clock_faces: None,
             quick_menu_faces: None,
             quick_clock_faces: None,
+            quick_shader_faces: None,
             sticker_face: None,
             wallpaper: None,
             battery_percent: slot_ui::Printed::default(),
@@ -449,6 +532,10 @@ impl App {
         app.root = Some(root.to_path_buf());
         app.state = read_slot_state(root);
         app.radio.ask(RadioJob::Home(app.state.home_wifi_enabled));
+        app.shaders = list_shaders(root);
+        // Whatever the card remembers, including a file that has since been taken off it, which
+        // reads as the default rather than as nothing at all.
+        app.shader_pending = Some(app.shader().to_string());
         if app.state.clock_set {
             app.start();
         } else {
@@ -621,7 +708,9 @@ impl App {
             QuickRow::ColourCorrection => Some(QuickValue::flag(self.state.colour_correction)),
             QuickRow::Rumble => Some(QuickValue::flag(self.state.rumble)),
             QuickRow::HomeWifi => Some(QuickValue::flag(self.state.home_wifi_enabled)),
-            QuickRow::DateTime | QuickRow::About => None,
+            QuickRow::TwelveHour => Some(QuickValue::flag(self.state.twelve_hour)),
+            // A name off the card, which `QuickValue` has no face for. The binary rasters it.
+            QuickRow::Shader | QuickRow::DateTime | QuickRow::About => None,
         }
     }
 
@@ -631,6 +720,179 @@ impl App {
 
     pub fn set_quick_clock_faces(&mut self, dim: (TexId, u32, u32), lit: (TexId, u32, u32)) {
         self.quick_clock_faces = Some([dim, lit]);
+    }
+
+    /// Shader's value, grey and lit, each with the size it was rastered at.
+    pub fn set_quick_shader_faces(&mut self, dim: (TexId, u32, u32), lit: (TexId, u32, u32)) {
+        self.quick_shader_faces = Some([dim, lit]);
+    }
+
+    /// The look in use: the card's choice if it is still on offer, and the LCD mask if it is
+    /// not, which is also what an empty choice from a card written before the row means.
+    pub fn shader(&self) -> &str {
+        let chosen = self.state.shader.as_str();
+        self.shaders
+            .iter()
+            .find(|s| s.as_str() == chosen)
+            .map_or(SHADER_LCD, String::as_str)
+    }
+
+    /// Every look the row steps through, in order.
+    pub fn shaders(&self) -> &[String] {
+        &self.shaders
+    }
+
+    /// A look to put on the game layer, handed over once.
+    pub fn take_shader(&mut self) -> Option<String> {
+        self.shader_pending.take()
+    }
+
+    /// The binary could not compile the look it was handed, and has put the LCD mask back.
+    /// The card is left alone: the file may be fixed and the row gone back to, and a choice
+    /// that quietly changed itself would be one more thing to explain.
+    pub fn shader_failed(&mut self) {
+        self.hud.toast(Toast::ShaderFailed, self.now());
+    }
+
+    /// SELECT+X, handed over once. See `cheats_pending`.
+    pub fn take_cheats_toggle(&mut self) -> bool {
+        std::mem::take(&mut self.cheats_pending)
+    }
+
+    /// A line of the HUD for something `App` did not do itself: the cheats `Session` carried.
+    pub fn show_toast(&mut self, toast: Toast) {
+        self.hud.toast(toast, self.now());
+    }
+
+    /// Whether every clock on the panel reads 3:07 PM rather than 15:07.
+    pub fn twelve_hour(&self) -> bool {
+        self.state.twelve_hour
+    }
+
+    /// Puts the cheat list up over the game, one `(title, on)` per cheat, the bar on the first.
+    /// Only over a game that is playing and not already under another screen: `Session` asks
+    /// a moment after SELECT+X, and a great deal can have happened in that moment.
+    pub fn open_cheat_menu(&mut self, cheats: Vec<(String, bool)>) {
+        let playing = matches!(self.phase, Phase::Playing { .. });
+        if !playing || cheats.is_empty() || self.game_menu.is_some() {
+            return;
+        }
+        let (titles, enabled): (Vec<String>, Vec<bool>) = cheats.into_iter().unzip();
+        self.cheat_generation = self.cheat_generation.wrapping_add(1);
+        self.cheat_row_faces = vec![None; CHEAT_ROWS];
+        self.cheat_menu = Some(CheatList {
+            titles,
+            opened: enabled.clone(),
+            enabled,
+            row: 0,
+            top: 0,
+        });
+    }
+
+    pub fn cheat_menu_open(&self) -> bool {
+        self.cheat_menu.is_some()
+    }
+
+    pub fn cheat_menu_view(&self) -> Option<CheatView> {
+        self.cheat_menu.as_ref().map(|m| CheatView {
+            generation: self.cheat_generation,
+            top: m.top,
+            row: m.row,
+            len: m.titles.len(),
+        })
+    }
+
+    /// The title of the cheat at `index` in the open list.
+    pub fn cheat_title(&self, index: usize) -> Option<&str> {
+        self.cheat_menu
+            .as_ref()
+            .and_then(|m| m.titles.get(index))
+            .map(String::as_str)
+    }
+
+    /// Whether the cheat at `index` in the open list is on, as the list now has it.
+    pub fn cheat_enabled(&self, index: usize) -> Option<bool> {
+        self.cheat_menu
+            .as_ref()
+            .and_then(|m| m.enabled.get(index).copied())
+    }
+
+    pub fn set_cheat_row_face(&mut self, slot: usize, face: (TexId, u32, u32)) {
+        if let Some(s) = self.cheat_row_faces.get_mut(slot) {
+            *s = Some(face);
+        }
+    }
+
+    pub fn set_cheat_count_face(&mut self, face: (TexId, u32)) {
+        self.cheat_count_face = Some(face);
+    }
+
+    pub fn set_cheat_legend_faces(&mut self, faces: [(TexId, u32); 2]) {
+        self.cheat_legend_faces = Some(faces);
+    }
+
+    /// The flags the list closed on, handed over once, and only if any of them changed.
+    pub fn take_cheat_commit(&mut self) -> Option<Vec<bool>> {
+        self.cheat_commit.take()
+    }
+
+    fn close_cheat_menu(&mut self) {
+        if let Some(m) = self.cheat_menu.take() {
+            if m.enabled != m.opened {
+                self.cheat_commit = Some(m.enabled);
+            }
+        }
+    }
+
+    /// Up and Down move the bar a cheat at a time, L and R a window at a time. A flips the one
+    /// in hand; Left turns it off and Right on, the way the quick menu's arrows change a value.
+    /// B, or SELECT+X again, closes the list and the game carries on with what it now says.
+    fn cheat_menu_input(&mut self, action: Action) {
+        if action == Action::Eject {
+            self.close_cheat_menu();
+            return self.eject();
+        }
+        let Some(m) = &mut self.cheat_menu else {
+            return;
+        };
+        match action {
+            Action::GbaDown(Btn::Up) => m.select(m.row.saturating_sub(1)),
+            Action::GbaDown(Btn::Down) => m.select(m.row + 1),
+            Action::GbaDown(Btn::L1) => m.select(m.row.saturating_sub(CHEAT_ROWS)),
+            Action::GbaDown(Btn::R1) => m.select(m.row + CHEAT_ROWS),
+            Action::GbaDown(Btn::A) => {
+                let on = !m.enabled.get(m.row).copied().unwrap_or(false);
+                m.set(on);
+            }
+            Action::GbaDown(Btn::Left) => m.set(false),
+            Action::GbaDown(Btn::Right) => m.set(true),
+            Action::GbaDown(Btn::B) | Action::CheatsToggle | Action::QuickMenu => {
+                self.close_cheat_menu()
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_cheat_menu(&self, out: &mut Vec<Draw>) {
+        let Some(m) = &self.cheat_menu else {
+            return;
+        };
+        let value = |v: QuickValue| {
+            self.quick_menu_faces
+                .as_ref()
+                .and_then(|f| f.values.get(v.index()).copied())
+        };
+        CheatMenu {
+            row: m.row,
+            top: m.top,
+            enabled: &m.enabled,
+            labels: &self.cheat_row_faces,
+            off: value(QuickValue::Off),
+            on: value(QuickValue::On),
+            count: self.cheat_count_face,
+            legend: self.cheat_legend_faces,
+        }
+        .draw(out);
     }
 
     pub fn set_sticker_face(&mut self, face: TexId) {
@@ -769,6 +1031,13 @@ impl App {
 
     pub fn set_video_mode(&mut self, mode: VideoMode) {
         self.video_mode = mode;
+    }
+
+    pub fn shader_source(&self) -> ([f32; 4], bool) {
+        (
+            video_mode::source_rect(self.platform, VideoMode::Stretch),
+            self.video_mode == VideoMode::Actual,
+        )
     }
 
     pub fn source_rect(&self) -> [f32; 4] {
@@ -1107,6 +1376,11 @@ impl App {
         if self.game_menu.is_some() {
             return self.game_menu_input(action);
         }
+        // The same place and for the same reasons as the in-game menu: over a game, with the
+        // device's own keys still answered above.
+        if self.cheat_menu.is_some() {
+            return self.cheat_menu_input(action);
+        }
         let now = self.now();
         match self.phase {
             Phase::Shelf => match action {
@@ -1145,6 +1419,15 @@ impl App {
                 Action::Polaroids => self.open_polaroids(),
                 Action::SaveState => self.save_state(),
                 Action::LoadState => self.load_newest(),
+                // Not while linked: the far end runs the same game without them, and two
+                // machines that differ in memory are two games, not one.
+                Action::CheatsToggle if self.link_active() || self.link_player.is_some() => {
+                    self.refuse()
+                }
+                Action::CheatsToggle => self.cheats_pending = true,
+                // Rewinding interrupts communication libretro's contract says must not be
+                // interrupted. Declined the same way every other "nothing doing" action in
+                // this file is, so the press reads as answered rather than dropped.
                 Action::RewindStart if !self.may_rewind() => self.refuse(),
                 Action::FfStart if !self.may_fast_forward() => self.refuse(),
                 _ => {}
@@ -1200,7 +1483,9 @@ impl App {
             | QuickRow::FastForwardSound
             | QuickRow::ColourCorrection
             | QuickRow::Rumble
-            | QuickRow::HomeWifi => {}
+            | QuickRow::HomeWifi
+            | QuickRow::Shader
+            | QuickRow::TwelveHour => {}
         }
     }
 
@@ -1219,11 +1504,36 @@ impl App {
                 s.colour_correction = !s.colour_correction;
                 self.colour_pending = Some(s.colour_correction);
             }
+            // Stops at either end, as Fast Forward does, rather than wrapping: the list is short
+            // and an end that stops is how a row says it has no more.
+            QuickRow::Shader => {
+                let at = self
+                    .shaders
+                    .iter()
+                    .position(|n| n == &s.shader)
+                    .unwrap_or(0);
+                let to = match right {
+                    true => (at + 1).min(self.shaders.len().saturating_sub(1)),
+                    false => at.saturating_sub(1),
+                };
+                // Against the look in use rather than the card's spelling of it: an empty or
+                // stale choice already reads as the first look, so a press that stays there is
+                // a press against the end.
+                if to == at {
+                    return;
+                }
+                let Some(name) = self.shaders.get(to).cloned() else {
+                    return;
+                };
+                s.shader = name.clone();
+                self.shader_pending = Some(name);
+            }
             QuickRow::Rumble => s.rumble = !s.rumble,
             QuickRow::HomeWifi => {
                 s.home_wifi_enabled = !s.home_wifi_enabled;
                 self.radio.ask(RadioJob::Home(s.home_wifi_enabled));
             }
+            QuickRow::TwelveHour => s.twelve_hour = !s.twelve_hour,
             QuickRow::DateTime | QuickRow::About => return,
         }
         self.persist();
@@ -1725,6 +2035,7 @@ impl App {
                 row: *row,
                 values: QuickRow::ALL.map(|r| self.quick_value(r)),
                 clock: self.quick_clock_faces,
+                shader: self.quick_shader_faces,
                 faces: self.quick_menu_faces.as_ref(),
             }
             .draw(out),
@@ -1807,6 +2118,11 @@ impl App {
         if let Some(menu) = self.game_menu {
             self.draw_game_menu(menu, out);
         }
+        // Only a playing game can raise it, as the in-game menu, so it goes in the same place.
+        if self.cheat_menu.is_some() {
+            self.draw_cheat_menu(out);
+        }
+        // Over everything, in every phase. The bar is never what the user is looking at.
         self.hud.draw(self.now(), out);
     }
 
@@ -3012,7 +3328,7 @@ impl App {
     pub fn polaroid_title(&self, now: &str) -> String {
         self.polaroids
             .as_ref()
-            .map_or_else(String::new, |p| p.title(now))
+            .map_or_else(String::new, |p| p.title_as(now, self.state.twelve_hour))
     }
 
     pub fn set_polaroid_title_face(&mut self, face: TexId) {

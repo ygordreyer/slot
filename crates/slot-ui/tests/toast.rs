@@ -34,6 +34,10 @@ fn the_banner_says_what_happened_and_never_what_is_on_screen() {
             Toast::BiosMismatch,
             Toast::ColourOn,
             Toast::ColourOff,
+            Toast::CheatsOn,
+            Toast::CheatsOff,
+            Toast::NoCheats,
+            Toast::ShaderFailed,
         ],
         "a banner was added or dropped: every face is uploaded by its place in this list"
     );

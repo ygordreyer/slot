@@ -768,6 +768,28 @@ impl RetroCore for LibretroCore {
         let _a = Active::bind(&mut self.host);
         unsafe { halt_link() };
     }
+
+    /// Reset, then one `retro_cheat_set` per code, indexed in order. Only while a game is
+    /// loaded: both cores keep their cheats on the loaded game and have nowhere to put one
+    /// before it.
+    fn set_cheats(&mut self, codes: &[String]) -> bool {
+        let (Some(reset), Some(set)) = (self.api.cheat_reset, self.api.cheat_set) else {
+            return false;
+        };
+        if !self.loaded {
+            return false;
+        }
+        let _a = Active::bind(&mut self.host);
+        unsafe { reset() };
+        for (i, code) in codes.iter().enumerate() {
+            let Ok(c) = CString::new(code.as_str()) else {
+                eprintln!("slot-retro: cheat {i} contains a nul, skipped");
+                continue;
+            };
+            unsafe { set(i as c_uint, true, c.as_ptr()) };
+        }
+        true
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,12 @@ pub struct SlotState {
     pub ff_speed: u8,
     pub ff_sound: bool,
     pub colour_correction: bool,
+    /// The look the game layer is drawn through: a name from `list_shaders`. Empty is the
+    /// built-in LCD mask, which is what every card written before this line meant.
+    pub shader: String,
+    /// The clock on the shelf, in the quick menu and on older polaroids, read as 3:07 PM rather
+    /// than 15:07. Off by default, which is what every card written before this line shows.
+    pub twelve_hour: bool,
 }
 
 impl Default for SlotState {
@@ -52,6 +58,8 @@ impl Default for SlotState {
             ff_speed: FF_SPEED_DEFAULT,
             ff_sound: false,
             colour_correction: false,
+            shader: String::new(),
+            twelve_hour: false,
         }
     }
 }
@@ -70,7 +78,7 @@ pub fn read_slot_state(root: &Path) -> SlotState {
 
 pub fn write_slot_state(root: &Path, s: &SlotState) -> std::io::Result<()> {
     let text = format!(
-        "cart={}\ncart_platform={}\nbrightness={}\nblue_light={}\nvolume={}\nvolume_hp={}\nmuted={}\nmuted_hp={}\nclock_set={}\nutc_offset_min={}\nrumble={}\nff_speed={}\nff_sound={}\ncolour_correction={}\nhome_wifi_enabled={}\n",
+        "cart={}\ncart_platform={}\nbrightness={}\nblue_light={}\nvolume={}\nvolume_hp={}\nmuted={}\nmuted_hp={}\nclock_set={}\nutc_offset_min={}\nrumble={}\nff_speed={}\nff_sound={}\ncolour_correction={}\nhome_wifi_enabled={}\nshader={}\nclock_12h={}\n",
         s.cart.as_deref().unwrap_or(""),
         s.cart_platform.map_or(String::new(), platform_key),
         s.brightness,
@@ -85,7 +93,9 @@ pub fn write_slot_state(root: &Path, s: &SlotState) -> std::io::Result<()> {
         s.ff_speed,
         s.ff_sound as u8,
         s.colour_correction as u8,
-        s.home_wifi_enabled as u8
+        s.home_wifi_enabled as u8,
+        s.shader,
+        s.twelve_hour as u8
     );
     atomic_write(&state_path(root), text.as_bytes())
 }
@@ -106,6 +116,8 @@ fn parse(text: &str) -> Option<SlotState> {
     let mut ff_speed = None;
     let mut ff_sound = None;
     let mut colour_correction = None;
+    let mut shader = None;
+    let mut twelve_hour = None;
     for line in text.lines().filter(|l| !l.is_empty()) {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -126,6 +138,8 @@ fn parse(text: &str) -> Option<SlotState> {
             "ff_speed" => ff_speed = ff_speed_value(value),
             "ff_sound" => ff_sound = flag(value),
             "colour_correction" => colour_correction = flag(value),
+            "shader" => shader = Some(value.to_string()),
+            "clock_12h" => twelve_hour = flag(value),
             _ => {}
         }
     }
@@ -147,6 +161,8 @@ fn parse(text: &str) -> Option<SlotState> {
         ff_speed: ff_speed.unwrap_or(fallback.ff_speed),
         ff_sound: ff_sound.unwrap_or(fallback.ff_sound),
         colour_correction: colour_correction.unwrap_or(fallback.colour_correction),
+        shader: shader.unwrap_or(fallback.shader),
+        twelve_hour: twelve_hour.unwrap_or(fallback.twelve_hour),
     })
 }
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 use slot_input::{Action, Gestures, Millis, RawEvent};
 use slot_retro::Rumble;
 use slot_store::Platform;
-use slot_ui::FfState;
+use slot_ui::{FfState, Toast};
 
 use crate::app::{App, Phase};
 use crate::audio::{open_sink, AudioSink, Ring, Sfx, GBA_HZ};
@@ -28,6 +28,9 @@ pub struct Session {
     motor: u16,
     reloading: bool,
     driven: bool,
+    custom_shader: bool,
+    /// The cheats the open list was made from, and whose cart they are. See `open_cheats`.
+    cheat_list: Option<(Platform, String, Vec<slot_store::Cheat>)>,
 }
 
 impl Session {
@@ -50,6 +53,8 @@ impl Session {
             motor: 0,
             reloading: false,
             driven: false,
+            custom_shader: false,
+            cheat_list: None,
         }
     }
 
@@ -113,6 +118,23 @@ impl Session {
 
     pub fn achievement_sync_status(&self) -> slot_achievements::SyncStatus {
         self.achievements.sync_status()
+    }
+
+    pub fn set_custom_shader(&mut self, active: bool) {
+        self.custom_shader = active;
+        if self.app.core() == slot_store::Core::Mgba {
+            if let Some(emu) = &self.emu {
+                emu.set_option(
+                    "mgba_interframe_blending",
+                    if active { "OFF" } else { "mix" },
+                );
+            }
+        }
+    }
+
+    /// The content root: the card, or wherever the host build was pointed.
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     pub fn app_mut(&mut self) -> &mut App {
@@ -261,6 +283,20 @@ impl Session {
                 }
             }
         }
+        // SELECT+X. Carried here for the same reason colour correction is: `App` never touches
+        // the card's cheat files or the core.
+        if self.app.take_cheats_toggle() {
+            self.open_cheats();
+        }
+        if let Some(flags) = self.app.take_cheat_commit() {
+            self.commit_cheats(flags);
+        }
+        // A list that closed with nothing changed leaves nothing to collect.
+        if !self.app.cheat_menu_open() {
+            self.cheat_list = None;
+        }
+        // A link picked in a mode the running core was not loaded with. Carried out here for the
+        // same reason the wire is: `App` never touches the core.
         if let Some((stem, serial)) = self.app.take_link_reload() {
             self.reload_for_link(&stem, serial);
         }
@@ -346,7 +382,7 @@ impl Session {
     }
 
     fn held(&self) -> bool {
-        self.app.game_menu_open() || self.app.shutting_down()
+        self.app.game_menu_open() || self.app.cheat_menu_open() || self.app.shutting_down()
     }
 
     fn dozing(&self) -> bool {
@@ -451,6 +487,23 @@ impl Session {
         };
         emu.set_volume(self.app.output_volume());
         emu.set_driven(self.driven);
+        if core == slot_store::Core::Mgba {
+            emu.set_option(
+                "mgba_interframe_blending",
+                if self.custom_shader { "OFF" } else { "mix" },
+            );
+        }
+        // Queued behind the load, which is the first thing the worker does, so they land on a
+        // loaded game. Never for a cable session: both devices run both consoles from the
+        // host's state, and a cheat on one is a machine the other is not simulating.
+        if self.app.link_player().is_none() {
+            let codes =
+                slot_store::enabled_codes(&slot_store::read_cheats(&self.root, platform, stem));
+            if !codes.is_empty() {
+                slot_store::backup_save_once(&self.root, platform, stem);
+                emu.set_cheats(codes);
+            }
+        }
         self.app.set_snapshot(Box::new(emu.snapshot()));
         self.emu = Some(emu);
     }
@@ -465,6 +518,62 @@ impl Session {
         self.reloading = true;
     }
 
+    /// SELECT+X: the seated cart's cheats read off the card and put up as a list. Read fresh
+    /// every time rather than remembered, so a `.cht` edited over USB since the cart went in is
+    /// what the list shows. Kept here as well, so the flags the list closes on can be matched
+    /// back to the lines of the file they came from.
+    fn open_cheats(&mut self) {
+        let Some((platform, stem)) = self.app.seated_cart().map(|c| (c.platform, c.stem.clone()))
+        else {
+            return;
+        };
+        let cheats = slot_store::read_cheats(&self.root, platform, &stem);
+        if cheats.is_empty() {
+            self.app.show_toast(Toast::NoCheats);
+            return;
+        }
+        self.app
+            .open_cheat_menu(cheats.iter().map(|c| (c.title(), c.enabled)).collect());
+        if self.app.cheat_menu_open() {
+            self.cheat_list = Some((platform, stem, cheats));
+        }
+    }
+
+    /// The list closed on a change. The file is written first, so the card and the running game
+    /// never disagree for longer than it takes to write one small file; then the core is handed
+    /// every cheat that is now on, which replaces whatever it was running.
+    fn commit_cheats(&mut self, flags: Vec<bool>) {
+        let Some((platform, stem, mut cheats)) = self.cheat_list.take() else {
+            return;
+        };
+        for (c, on) in cheats.iter_mut().zip(flags) {
+            c.enabled = on;
+        }
+        if let Err(e) = slot_store::write_cheat_enables(&self.root, platform, &stem, &cheats) {
+            // Still carried out: the game in hand is what the player is looking at. The card
+            // only decides what the next insert starts with.
+            eprintln!("slot: cheats: could not write {stem}.cht: {e}");
+        }
+        let codes = slot_store::enabled_codes(&cheats);
+        let any = !codes.is_empty();
+        if any {
+            slot_store::backup_save_once(&self.root, platform, &stem);
+        }
+        if let Some(emu) = &self.emu {
+            emu.set_cheats(codes);
+        }
+        self.app.show_toast(if any {
+            Toast::CheatsOn
+        } else {
+            Toast::CheatsOff
+        });
+    }
+
+    /// Follows a reload for a link to its end, which `App` is waiting on. A core that will not
+    /// load is dropped, as `sync_core` drops a refused cart's, and `App` decides what follows.
+    /// The first time that is the mode the game came from, carried out here straight away so no
+    /// frame passes with a seated cart and no core behind it; the second time, the cart comes
+    /// back out of the slot.
     fn sync_reload(&mut self) {
         if !self.reloading {
             return;

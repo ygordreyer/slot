@@ -8,8 +8,8 @@ use slot::app::{App, Phase};
 use slot_input::{Action, Btn};
 use slot_store::{read_slot_state, write_slot_state, SlotState};
 use slot_ui::{
-    edge, Draw, Icon, QuickMenuFaces, QuickRow, QuickValue, TexId, MENU_PAD, OUT_W, QUICK_EDGE,
-    QUICK_PITCH, QUICK_TOP,
+    edge, quick_window, Draw, Icon, QuickMenuFaces, QuickRow, QuickValue, TexId, MENU_PAD, OUT_W,
+    QUICK_EDGE, QUICK_PITCH, QUICK_ROWS, QUICK_TOP,
 };
 use tempfile::TempDir;
 
@@ -112,8 +112,10 @@ fn up_and_down_move_the_bar_and_wrap_at_the_ends() {
         QuickRow::FastForward,
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
+        QuickRow::Shader,
         QuickRow::Rumble,
         QuickRow::HomeWifi,
+        QuickRow::TwelveHour,
         QuickRow::DateTime,
         QuickRow::About,
         QuickRow::FastForward,
@@ -164,6 +166,8 @@ fn rumble_and_fast_forward_sound_flip_on_either_arrow_and_save() {
     );
     press(&mut a, Btn::Right);
     assert_eq!(card(&d), (false, true));
+    // Three rows down: Colour Correction and Shader sit between the Fast Forward pair and Rumble.
+    press(&mut a, Btn::Down);
     press(&mut a, Btn::Down);
     press(&mut a, Btn::Down);
     press(&mut a, Btn::Right);
@@ -439,7 +443,7 @@ fn the_arrows_stand_only_around_the_selected_rows_value() {
         drawn(&out, value(QuickValue::On, false)),
         "rumble's ON is not grey"
     );
-    assert!(drawn(&out, 500), "the date and time is not grey");
+    assert!(!drawn(&out, 500), "a clock outside the window is drawn");
 
     for _ in 0..QuickRow::DateTime.index() {
         press(&mut a, Btn::Down);
@@ -451,8 +455,9 @@ fn the_arrows_stand_only_around_the_selected_rows_value() {
     );
     assert!(drawn(&out, 501), "the date and time in hand is not lit");
     assert!(
-        drawn(&out, value(QuickValue::Speed6, false)),
-        "6× stayed lit after the bar left it"
+        !drawn(&out, value(QuickValue::Speed6, false))
+            && !drawn(&out, value(QuickValue::Speed6, true)),
+        "a speed outside the window is drawn"
     );
 }
 
@@ -469,7 +474,7 @@ fn the_bar_runs_edge_to_edge_behind_the_selected_row() {
                 _ => None,
             })
             .collect();
-        let top = QUICK_TOP + QUICK_PITCH * row.index() as f32;
+        let top = QUICK_TOP + QUICK_PITCH * (row.index() - quick_window(row)) as f32;
         assert_eq!(
             bars,
             vec![[0.0, top + 4.0, OUT_W as f32, QUICK_PITCH - 8.0]],
@@ -486,7 +491,7 @@ fn labels_start_and_values_end_thirty_two_pixels_in() {
     a.apply(Action::QuickMenu);
     let out = frame(&a);
     let right = OUT_W as f32 - QUICK_EDGE;
-    for row in QuickRow::ALL {
+    for row in QuickRow::ALL.into_iter().take(QUICK_ROWS) {
         let [x, ..] = placed(&out, 100 + row.index()).expect("a label was not drawn");
         assert_eq!(x + MENU_PAD as f32, QUICK_EDGE, "{row:?}'s label");
     }
@@ -581,6 +586,104 @@ fn footer_wifi_requires_enabled_and_observed_home_connection() {
             if let Some(Draw::Tex { x, y, .. }) = icon {
                 assert!(*x < 180.0 && *y > 400.0);
             }
+        }
+    }
+}
+
+/// With no `Shaders/` files the row holds the two looks slot draws itself, LCD first. Each step
+/// is on the card at once and handed to the binary exactly once; a press against either end
+/// changes nothing and hands over nothing.
+#[test]
+fn the_shader_row_steps_through_the_looks_and_stops_at_the_ends() {
+    let (d, mut a, _) = on_carousel();
+    assert_eq!(a.shader(), "LCD");
+    assert_eq!(
+        a.take_shader().as_deref(),
+        Some("LCD"),
+        "boot did not ask for its look"
+    );
+    open_at(&mut a, QuickRow::Shader);
+    press(&mut a, Btn::Left);
+    assert_eq!(a.take_shader(), None, "moved off the first look");
+    press(&mut a, Btn::Right);
+    assert_eq!(a.shader(), "Off");
+    assert_eq!(a.take_shader().as_deref(), Some("Off"));
+    assert_eq!(read_slot_state(d.path()).shader, "Off");
+    press(&mut a, Btn::Right);
+    assert_eq!(a.take_shader(), None, "ran past the last look");
+}
+
+/// A file in `Shaders/` is a look of its own, after the two built in. One named after a built-in
+/// is not allowed to shadow it.
+#[test]
+fn a_shader_on_the_card_joins_the_row_after_the_built_in_looks() {
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    std::fs::create_dir_all(d.path().join("Shaders")).unwrap();
+    std::fs::write(d.path().join("Shaders/zfast_lcd.glsl"), "void main() {}").unwrap();
+    std::fs::write(d.path().join("Shaders/lcd.glsl"), "void main() {}").unwrap();
+    std::fs::write(d.path().join("Shaders/readme.txt"), "not a shader").unwrap();
+    write_slot_state(
+        d.path(),
+        &SlotState {
+            clock_set: true,
+            shader: "zfast_lcd".into(),
+            ..SlotState::default()
+        },
+    )
+    .unwrap();
+    let (a, _) = app_booting_at(d.path(), CLOCK_IS_SET);
+    assert_eq!(a.shaders(), ["LCD", "Off", "zfast_lcd"]);
+    assert_eq!(a.shader(), "zfast_lcd");
+}
+
+/// A card that remembers a file since taken off it reads as the default look.
+#[test]
+fn a_shader_no_longer_on_the_card_reads_as_lcd() {
+    let (_d, a, _) = on_carousel_with(SlotState {
+        shader: "gone".into(),
+        ..SlotState::default()
+    });
+    assert_eq!(a.shader(), "LCD");
+}
+
+/// The clock row is a flag like Rumble: either arrow flips it, it is on the card at once, and
+/// the app reads it back for everything that prints a time.
+#[test]
+fn the_twelve_hour_row_flips_and_saves() {
+    let (d, mut a, _) = on_carousel();
+    assert!(!a.twelve_hour());
+    open_at(&mut a, QuickRow::TwelveHour);
+    assert_eq!(a.quick_value(QuickRow::TwelveHour), Some(QuickValue::Off));
+    press(&mut a, Btn::Right);
+    assert!(a.twelve_hour());
+    assert!(read_slot_state(d.path()).twelve_hour);
+    assert_eq!(a.quick_value(QuickRow::TwelveHour), Some(QuickValue::On));
+    press(&mut a, Btn::Left);
+    assert!(!read_slot_state(d.path()).twelve_hour);
+}
+
+#[test]
+fn scrolling_draws_only_window_rows_and_keeps_the_selection_visible_in_both_directions() {
+    let (_root, mut app, _) = on_carousel();
+    fake_faces(&mut app);
+    app.apply(Action::QuickMenu);
+    for direction in [Btn::Down, Btn::Up] {
+        for _ in 0..QuickRow::ALL.len() + 1 {
+            let selected = app.quick_menu().unwrap();
+            let top = quick_window(selected);
+            let out = frame(&app);
+            for row in QuickRow::ALL {
+                let label = placed(&out, 100 + row.index());
+                assert_eq!(
+                    label.is_some(),
+                    (top..top + QUICK_ROWS).contains(&row.index())
+                );
+                if let Some([_, y, _, h]) = label {
+                    assert!(y >= 40.0 && y + h < 427.0, "{row:?} overlaps panel chrome");
+                }
+            }
+            assert!(drawn(&out, 100 + selected.index()));
+            press(&mut app, direction);
         }
     }
 }

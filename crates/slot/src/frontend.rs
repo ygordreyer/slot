@@ -1,17 +1,18 @@
 use std::time::{Duration, Instant};
 
-use slot_gfx::{Compositor, Draw, TexId, OUT_H, OUT_W};
+use slot_gfx::{Compositor, Draw, ShaderChoice, TexId, OUT_H, OUT_W};
 use slot_input::{InputSource, Millis};
 use slot_power::{Platform, Power};
-use slot_store::format_stamp;
+use slot_store::{format_stamp, SHADER_LCD, SHADER_OFF};
 use slot_ui::{
     arrows_hint_face, badge_face, cart_face, cart_shadow, chip_face, chip_shadow_face,
-    date_time_text, gb_cart_shadow, hhmm, hint_face, icon_face, menu_face, photo_face,
-    quick_caret_face, quick_label_face, quick_legend_faces, quick_value_face, set_clock_hint_face,
-    socket_face, sticker_face, title_face, toast_face, wallpaper_face, word_face, GbShell, Icon,
-    LinkBadge, QuickMenuFaces, QuickRow, QuickValue, StickerFields, Toast, UndoFace, ALERT_PX,
-    BOLT_PX, HUD_ICON_PX, HUD_INK, LEGEND,
+    gb_cart_shadow, hint_face, icon_face, menu_face, photo_face, quick_caret_face,
+    quick_label_face, quick_legend_faces, quick_value_face, set_clock_hint_face, socket_face,
+    sticker_face, title_face, toast_face, wallpaper_face, word_face, GbShell, Icon, LinkBadge,
+    QuickMenuFaces, QuickRow, QuickValue, StickerFields, Toast, UndoFace, ALERT_PX, BOLT_PX,
+    HUD_ICON_PX, HUD_INK, LEGEND,
 };
+use slot_ui::{cheat_label_face, cheat_legend_faces, date_time_text_as, hhmm_as, CHEAT_ROWS};
 
 use crate::app::{App, LinkRow, Phase};
 use crate::build_info::Build;
@@ -47,6 +48,20 @@ pub struct Frontend {
     clocks: Clocks,
     about: AboutFace,
     quick_clock: QuickClock,
+    /// Shader's value in the quick menu. The same shape as the clock's: a line of menu type in
+    /// both inks and the text it was built for.
+    quick_shader: QuickClock,
+    cheats: CheatFaces,
+}
+
+/// The cheat list's faces: one texture per window row, reused as the list scrolls, with which
+/// list and which cheat each was last built for; and the count over the rows.
+#[derive(Default)]
+struct CheatFaces {
+    rows: Vec<Option<TexId>>,
+    built: Vec<Option<(u64, usize)>>,
+    count: Option<TexId>,
+    counted: String,
 }
 
 #[derive(Default)]
@@ -111,6 +126,12 @@ impl Frontend {
             clocks: Clocks::default(),
             about: AboutFace::default(),
             quick_clock: QuickClock::default(),
+            quick_shader: QuickClock::default(),
+            cheats: CheatFaces {
+                rows: vec![None; CHEAT_ROWS],
+                built: vec![None; CHEAT_ROWS],
+                ..CheatFaces::default()
+            },
         }
     }
 
@@ -174,8 +195,14 @@ impl Frontend {
             carets,
             legend,
         });
-        // blank chip in flight and its shadow, in `Core::ALL` order. Uploaded at boot so
-        // the first frame of a lid coming off is not spent in a rasteriser.
+        let cheat_legend = cheat_legend_faces().map(|f| {
+            let (tex, w, _) = up(f);
+            (tex, w)
+        });
+        self.session.app_mut().set_cheat_legend_faces(cheat_legend);
+        // The open cart's parts that never change: each socket, the chip seated in each, the
+        // blank chip in flight and its shadow, in `Core::ALL` order. At boot like the power
+        // menu's rows, so the first frame of a lid coming off is not spent in a rasteriser.
         let sockets = slot_store::Core::ALL
             .iter()
             .map(|c| {
@@ -281,6 +308,8 @@ impl Frontend {
         compositor.set_shake(self.session.app().screen_shake());
         compositor.set_screen_power(self.session.app().screen_power());
         compositor.set_game_source_rect(self.session.app().source_rect());
+        let (source, actual) = self.session.app().shader_source();
+        compositor.set_game_shader_source(source, actual);
         compositor.begin_frame();
         if let Some(frame) = self.session.frame() {
             compositor.upload_game(&frame);
@@ -290,6 +319,9 @@ impl Frontend {
         sync_clock(self.session.app_mut(), compositor, &mut self.clocks);
         sync_about(self.session.app_mut(), compositor, &mut self.about);
         sync_quick_clock(self.session.app_mut(), compositor, &mut self.quick_clock);
+        sync_quick_shader(self.session.app_mut(), compositor, &mut self.quick_shader);
+        sync_shader(&mut self.session, compositor);
+        sync_cheats(self.session.app_mut(), compositor, &mut self.cheats);
         sync_core_picker(
             self.session.app_mut(),
             compositor,
@@ -488,7 +520,7 @@ fn sync_clock(app: &mut App, compositor: &mut Compositor, clocks: &mut Clocks) {
             app.set_clock_faces(line, hint);
         }
     }
-    let shown = hhmm(app.wall_secs());
+    let shown = hhmm_as(app.wall_secs(), app.twelve_hour());
     if shown != clocks.shown {
         let face = word_face(&shown);
         clocks.shown = shown;
@@ -527,7 +559,7 @@ fn sync_quick_clock(app: &mut App, compositor: &mut Compositor, state: &mut Quic
     if app.quick_menu().is_none() {
         return;
     }
-    let text = date_time_text(app.wall_secs());
+    let text = date_time_text_as(app.wall_secs(), app.twelve_hour());
     if text == state.shown {
         return;
     }
@@ -542,6 +574,111 @@ fn sync_quick_clock(app: &mut App, compositor: &mut Compositor, state: &mut Quic
     state.shown = text;
 }
 
+/// The cheat list's rows, rastered only for the cheats in the window and only when the cheat in
+/// a row changes, which is every row when the list scrolls and none while the bar moves inside
+/// the window. The count over them is rebuilt when the bar moves.
+fn sync_cheats(app: &mut App, compositor: &mut Compositor, state: &mut CheatFaces) {
+    let Some(view) = app.cheat_menu_view() else {
+        return;
+    };
+    for slot in 0..CHEAT_ROWS {
+        let index = view.top + slot;
+        if index >= view.len || state.built[slot] == Some((view.generation, index)) {
+            continue;
+        }
+        let Some(title) = app.cheat_title(index).map(str::to_string) else {
+            continue;
+        };
+        let face = cheat_label_face(&title);
+        let (w, h) = (face.w, face.h);
+        if w == 0 {
+            continue;
+        }
+        let id = upload(compositor, &mut state.rows[slot], face);
+        app.set_cheat_row_face(slot, (id, w, h));
+        state.built[slot] = Some((view.generation, index));
+    }
+    let count = format!("{} of {}", view.row + 1, view.len);
+    if count != state.counted {
+        let face = word_face(&count);
+        let w = face.w;
+        let id = upload(compositor, &mut state.count, face);
+        app.set_cheat_count_face((id, w));
+        state.counted = count;
+    }
+}
+
+/// The longest shader name the row shows whole. Past this the value runs into the label, so
+/// the rest is cut and marked.
+const SHADER_NAME_MAX: usize = 22;
+
+fn shader_display(name: &str) -> String {
+    if name.chars().count() <= SHADER_NAME_MAX {
+        return name.to_string();
+    }
+    let kept: String = name.chars().take(SHADER_NAME_MAX - 3).collect();
+    format!("{kept}...")
+}
+
+/// Shader's value, built like Date & Time's: only while the menu is up, and only when the name
+/// in hand is not the one last built.
+fn sync_quick_shader(app: &mut App, compositor: &mut Compositor, state: &mut QuickClock) {
+    if app.quick_menu().is_none() {
+        return;
+    }
+    let text = shader_display(app.shader());
+    if text == state.shown {
+        return;
+    }
+    let (dim, lit) = (
+        quick_value_face(&text, false),
+        quick_value_face(&text, true),
+    );
+    let (dim_size, lit_size) = ((dim.w, dim.h), (lit.w, lit.h));
+    let dim = upload(compositor, &mut state.dim, dim);
+    let lit = upload(compositor, &mut state.lit, lit);
+    app.set_quick_shader_faces((dim, dim_size.0, dim_size.1), (lit, lit_size.0, lit_size.1));
+    state.shown = text;
+}
+
+/// Puts the look `App` asked for on the game layer. Here rather than in `App` because only
+/// this side holds a GL context; the file is read here too, at the moment it is compiled, so a
+/// shader edited over USB is picked up the next time the row lands on it.
+///
+/// Anything that goes wrong — a file gone since boot, one that will not compile — leaves the
+/// LCD look on the panel and says so. The driver's log goes to stderr, which on the device is
+/// the log on the card, and names the line.
+fn sync_shader(session: &mut Session, compositor: &mut Compositor) {
+    let Some(name) = session.app_mut().take_shader() else {
+        return;
+    };
+    let result = match name.as_str() {
+        SHADER_LCD => compositor.set_shader(ShaderChoice::Lcd),
+        SHADER_OFF => compositor.set_shader(ShaderChoice::Plain),
+        file => {
+            let src = slot_store::shader_path(session.root(), file)
+                .and_then(|p| std::fs::read_to_string(p).ok());
+            match src {
+                Some(src) => compositor.set_shader(ShaderChoice::RetroArch(&src)),
+                None => {
+                    let _ = compositor.set_shader(ShaderChoice::Lcd);
+                    eprintln!("slot: shader: {file}.glsl could not be read");
+                    session.set_custom_shader(false);
+                    session.app_mut().shader_failed();
+                    return;
+                }
+            }
+        }
+    };
+    session.set_custom_shader(result.is_ok() && !matches!(name.as_str(), SHADER_LCD | SHADER_OFF));
+    if let Err(e) = result {
+        eprintln!("slot: shader: {name}: {e}");
+        session.app_mut().shader_failed();
+    }
+}
+
+/// Built only once the screen is up: it is a 660 by 228 rasterisation and most sessions never
+/// open it.
 fn sync_about(app: &mut App, compositor: &mut Compositor, state: &mut AboutFace) {
     if !matches!(app.phase(), Phase::About) {
         return;

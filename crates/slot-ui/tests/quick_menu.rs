@@ -84,8 +84,10 @@ fn the_rows_run_in_the_order_the_user_chose() {
             "Fast Forward",
             "Fast Forward Sound",
             "Colour Correction",
+            "Shader",
             "Rumble",
             "Home Wi-Fi",
+            "12-Hour Clock",
             "Date & Time",
             "About"
         ]
@@ -148,4 +150,33 @@ fn the_arrows_are_faces_the_height_of_a_value() {
         );
         assert_eq!(caret.h, quick_value_face("On", true).h);
     }
+}
+
+#[test]
+fn scrolling_keeps_every_selection_and_its_bar_clear_of_the_legend() {
+    use slot_ui::{quick_window, Draw, QuickMenu, QUICK_PITCH, QUICK_ROWS, QUICK_TOP};
+    for row in QuickRow::ALL {
+        let top = quick_window(row);
+        assert!(top <= row.index() && row.index() < top + QUICK_ROWS);
+        assert!(top + QUICK_ROWS <= QuickRow::ALL.len());
+        let mut draws = Vec::new();
+        QuickMenu {
+            row,
+            values: [None; QuickRow::ALL.len()],
+            clock: None,
+            shader: None,
+            faces: None,
+        }
+        .draw(&mut draws);
+        let Draw::Rect { y, h, .. } = draws[1] else {
+            panic!("no selection bar")
+        };
+        assert!(y >= 40.0 && y + h < 427.0);
+    }
+    assert!(QUICK_TOP + QUICK_ROWS as f32 * QUICK_PITCH <= 427.0);
+    assert_eq!(quick_window(QuickRow::ALL[0]), 0);
+    assert_eq!(
+        quick_window(*QuickRow::ALL.last().unwrap()),
+        QuickRow::ALL.len() - QUICK_ROWS
+    );
 }

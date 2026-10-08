@@ -4,6 +4,7 @@ mod barcode;
 mod battery;
 mod board;
 mod cart;
+mod cheat_menu;
 mod clock;
 mod draw;
 mod footer;
@@ -39,7 +40,13 @@ pub use cart::{
     GB_CART_H, GB_CART_W, GB_LABEL_H, GB_LABEL_W, GB_LABEL_X, GB_LABEL_Y, LABEL_H, LABEL_W,
     LABEL_X, LABEL_Y,
 };
-pub use clock::{clock_label, date_time_text, hhmm, set_clock_hint_face, ClockPicker, Field};
+pub use cheat_menu::{
+    cheat_label_face, cheat_label_width, cheat_legend_faces, cheat_window, CheatMenu, CHEAT_ROWS,
+};
+pub use clock::{
+    clock_label, date_time_text, date_time_text_as, hhmm, hhmm_as, set_clock_hint_face,
+    ClockPicker, Field,
+};
 pub use draw::{Draw, TexId, OUT_H, OUT_W};
 pub use footer::{
     draw_footer, draw_footer_sync, draw_home_wifi, sync_icon_face, Printed, SyncIndicator, SYNC_PX,
@@ -62,8 +69,9 @@ pub use plate::{
 pub use polaroids::{photo_face, PhotoFace, Polaroids, DOT, LEGEND, PHOTO_H, PHOTO_W};
 pub use power_menu::{menu_face, MENU_PAD};
 pub use quick_menu::{
-    quick_caret_face, quick_label_face, quick_legend_faces, quick_value_face, QuickMenu,
-    QuickMenuFaces, QuickRow, QuickValue, QUICK_EDGE, QUICK_PITCH, QUICK_TOP,
+    quick_caret_face, quick_label_face, quick_legend_faces, quick_value_face, quick_window,
+    QuickMenu, QuickMenuFaces, QuickRow, QuickValue, QUICK_EDGE, QUICK_PITCH, QUICK_ROWS,
+    QUICK_TOP,
 };
 pub use refusal::Refusal;
 pub use shelf::{foot_y, rest_y, Shelf};

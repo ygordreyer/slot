@@ -1,3 +1,5 @@
+//! Settings in a scrolling window with fixed-size menu type.
+
 use crate::draw::{Draw, TexId, OUT_H, OUT_W};
 use crate::plate::{arrows_hint_face, centred_hints, hint_face, UndoFace, HINT_H, LEGEND_GAP};
 use crate::power_menu::{MENU_H, MENU_INK, MENU_PAD, MENU_PX};
@@ -9,19 +11,28 @@ pub enum QuickRow {
     FastForward,
     FastForwardSound,
     ColourCorrection,
+    /// The look the game layer is drawn through. Beside Colour Correction because both change
+    /// what every game looks like. Its value is a name off the card, so like Date & Time's it
+    /// is rastered by the binary rather than taken from `QuickValue`.
+    Shader,
     Rumble,
     HomeWifi,
+    /// Whether every clock slot draws reads 3:07 PM rather than 15:07. Last of the rows the
+    /// arrows change, right above the Date & Time it changes the look of.
+    TwelveHour,
     DateTime,
     About,
 }
 
 impl QuickRow {
-    pub const ALL: [QuickRow; 7] = [
+    pub const ALL: [QuickRow; 9] = [
         QuickRow::FastForward,
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
+        QuickRow::Shader,
         QuickRow::Rumble,
         QuickRow::HomeWifi,
+        QuickRow::TwelveHour,
         QuickRow::DateTime,
         QuickRow::About,
     ];
@@ -35,8 +46,10 @@ impl QuickRow {
             QuickRow::FastForward => "Fast Forward",
             QuickRow::FastForwardSound => "Fast Forward Sound",
             QuickRow::ColourCorrection => "Colour Correction",
+            QuickRow::Shader => "Shader",
             QuickRow::Rumble => "Rumble",
             QuickRow::HomeWifi => "Home Wi-Fi",
+            QuickRow::TwelveHour => "12-Hour Clock",
             QuickRow::DateTime => "Date & Time",
             QuickRow::About => "About",
         }
@@ -111,7 +124,8 @@ impl QuickValue {
 }
 
 pub const QUICK_PITCH: f32 = 52.0;
-pub const QUICK_TOP: f32 = (OUT_H as f32 - QUICK_PITCH * QuickRow::ALL.len() as f32) / 2.0;
+pub const QUICK_ROWS: usize = 7;
+pub const QUICK_TOP: f32 = (OUT_H as f32 - QUICK_PITCH * QUICK_ROWS as f32) / 2.0;
 const _: () = assert!(QUICK_TOP >= 40.0);
 pub const QUICK_EDGE: f32 = 32.0;
 const BAR_INSET: f32 = 4.0;
@@ -202,6 +216,9 @@ pub struct QuickMenu<'a> {
     pub row: QuickRow,
     pub values: [Option<QuickValue>; QuickRow::ALL.len()],
     pub clock: Option<[(TexId, u32, u32); 2]>,
+    /// Shader's value, grey then lit, built the same way: the name comes off the card.
+    pub shader: Option<[(TexId, u32, u32); 2]>,
+    /// `None` until boot has uploaded them, when only the ground and the bar are drawn.
     pub faces: Option<&'a QuickMenuFaces>,
 }
 
@@ -216,7 +233,7 @@ impl QuickMenu<'_> {
         });
         out.push(Draw::Rect {
             x: 0.0,
-            y: row_top(self.row) + BAR_INSET,
+            y: row_top(self.row, self.row) + BAR_INSET,
             w: OUT_W as f32,
             h: QUICK_PITCH - 2.0 * BAR_INSET,
             colour: edge(),
@@ -225,14 +242,19 @@ impl QuickMenu<'_> {
             return;
         };
         let (right, pad) = (OUT_W as f32 - QUICK_EDGE, MENU_PAD as f32);
-        for row in QuickRow::ALL {
-            let y = row_top(row) + TYPE_DROP;
+        for row in QuickRow::ALL
+            .into_iter()
+            .skip(quick_window(self.row))
+            .take(QUICK_ROWS)
+        {
+            let y = row_top(row, self.row) + TYPE_DROP;
             let lit = row == self.row;
             if let Some(&(tex, w, h)) = faces.labels.get(row.index()) {
                 push(out, tex, QUICK_EDGE - pad, y, w, h);
             }
             let value = match row {
                 QuickRow::DateTime => self.clock.map(|c| c[lit as usize]),
+                QuickRow::Shader => self.shader.map(|c| c[lit as usize]),
                 _ => self.values[row.index()]
                     .and_then(|v| faces.values.get(v.index()))
                     .map(|v| v[lit as usize]),
@@ -259,8 +281,14 @@ impl QuickMenu<'_> {
     }
 }
 
-fn row_top(row: QuickRow) -> f32 {
-    QUICK_TOP + QUICK_PITCH * row.index() as f32
+pub fn quick_window(row: QuickRow) -> usize {
+    row.index()
+        .saturating_sub(QUICK_ROWS / 2)
+        .min(QuickRow::ALL.len().saturating_sub(QUICK_ROWS))
+}
+
+fn row_top(row: QuickRow, selected: QuickRow) -> f32 {
+    QUICK_TOP + QUICK_PITCH * (row.index() - quick_window(selected)) as f32
 }
 
 fn push(out: &mut Vec<Draw>, tex: TexId, x: f32, y: f32, w: u32, h: u32) {
