@@ -463,7 +463,7 @@ mod bundled_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../card/Shaders");
         let mut paths = Vec::new();
         walk(&root, &mut paths);
-        assert_eq!(paths.len(), 10);
+        assert_eq!(paths.len(), 11);
         for path in paths {
             let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| e.to_string());
             let preset = resolve_preset(&path, &read).unwrap();

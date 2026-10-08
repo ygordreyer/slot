@@ -11,9 +11,11 @@ crt/zfast-crt.glslp | crt/zfast-crt.glslp | 435612f | Preset recipe for the lice
 handheld/agb001-gba-color-motionblur.glslp | handheld/agb001-gba-color-motionblur.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
 handheld/ags001-gba-color-motionblur.glslp | handheld/ags001-gba-color-motionblur.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
 handheld/ags001.glslp | handheld/ags001.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/bevel.glslp | handheld/bevel.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
 handheld/dot.glslp | handheld/dot.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
 handheld/gba-color.glslp | handheld/gba-color.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
 handheld/lcd1x.glslp | handheld/lcd1x.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/shaders/bevel.glsl | handheld/shaders/bevel.glsl | 435612f | GPL-2.0-or-later
 handheld/shaders/color/gba-color.glsl | handheld/shaders/color/gba-color.glsl | 435612f | Public domain
 handheld/shaders/dot.glsl | handheld/shaders/dot.glsl | 435612f | Public domain
 handheld/shaders/lcd1x.glsl | handheld/shaders/lcd1x.glsl | 435612f | GPL-2.0-or-later
@@ -42,6 +44,7 @@ handheld/gba-color | 1+copy | 240x160;720x480 copy | 1;1 | Public domain
 handheld/ags001 | 2+copy | 960x640;720x480;720x480 copy | 1;2;1 | MPL-2.0
 handheld/agb001-gba-color-motionblur | 3+copy | 240x160;960x640;720x480;720x480 copy | 8;1;1;1 | GPL-2.0-or-later;MPL-2.0;Public domain
 handheld/ags001-gba-color-motionblur | 4+copy | 240x160;960x640;960x640;720x480;720x480 copy | 8;1;1;2;1 | GPL-2.0-or-later;MPL-2.0;Public domain
+handheld/bevel | 1 | 720x480 | 1 | GPL-2.0-or-later
 handheld/dot | 1 | 720x480 | 9 | Public domain
 handheld/lcd1x | 1+copy | 720x480;720x480 copy | 1;1 | GPL-2.0-or-later
 interpolation/sharp-bilinear | 1 | 720x480 | 1 (bilinear) | Public domain
