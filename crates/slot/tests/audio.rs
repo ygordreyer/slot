@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use slot::audio::{ring_capacity, AudioSink, Ring, StubSink, GBA_HZ};
+use slot::audio::{ring_capacity, AudioSink, Ring, Silence, StubSink, GBA_HZ};
 use slot::emu::{CoreState, EmuHandle, Speed};
 use slot_retro::MockCore;
 
@@ -290,4 +290,41 @@ fn the_cushion_at_an_odd_capacity_still_ends_on_a_frame() {
         out, block,
         "the cushion ended mid frame, so left and right came back swapped"
     );
+}
+
+#[test]
+fn the_device_is_released_only_after_the_whole_quiet_stretch() {
+    let mut s = Silence::new(1000, 100, Duration::from_secs(1));
+    let quiet = vec![0i16; 200];
+    for _ in 0..9 {
+        assert!(!s.heard(&quiet), "released before a second of silence");
+    }
+    assert!(s.heard(&quiet), "a second of silence keeps the amp powered");
+    assert!(s.heard(&quiet), "and stays released while it lasts");
+}
+
+#[test]
+fn any_audible_sample_takes_the_device_back_and_restarts_the_count() {
+    let mut s = Silence::new(1000, 100, Duration::from_secs(1));
+    let quiet = vec![0i16; 200];
+    for _ in 0..10 {
+        s.heard(&quiet);
+    }
+    let mut blip = quiet.clone();
+    blip[150] = -400;
+    assert!(!s.heard(&blip), "a sound effect must reopen the device");
+    for _ in 0..9 {
+        assert!(
+            !s.heard(&quiet),
+            "the quiet stretch starts over after a sound"
+        );
+    }
+    assert!(s.heard(&quiet));
+}
+
+#[test]
+fn a_hiss_of_dither_still_counts_as_silence() {
+    let mut s = Silence::new(1000, 100, Duration::from_millis(100));
+    let dither: Vec<i16> = (0..200).map(|i| if i % 2 == 0 { 3 } else { -3 }).collect();
+    assert!(s.heard(&dither));
 }

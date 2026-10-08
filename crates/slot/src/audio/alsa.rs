@@ -2,6 +2,7 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use libloading::Library;
 
@@ -16,6 +17,12 @@ const CHANNELS: c_uint = 2;
 const LATENCY_US: c_uint = 40_000;
 
 const PERIOD_FRAMES: usize = 512;
+
+const RELEASE_AFTER: Duration = Duration::from_secs(3);
+
+const RETRY_EVERY: Duration = Duration::from_secs(1);
+
+const HUSH: i16 = 8;
 
 const DEVICES: [&str; 4] = ["plug:default", "default", "plughw:0,0", "hw:0,0"];
 
@@ -157,7 +164,7 @@ impl AudioSink for AlsaSink {
         let join = std::thread::Builder::new()
             .name("slot-audio".into())
             .spawn(move || match play(&ring, sample_rate) {
-                Ok(device) => {
+                Ok(mut device) => {
                     let _ = ready_tx.send(Ok(()));
                     device.run(&ring, &flag);
                 }
@@ -187,42 +194,120 @@ impl AudioSink for AlsaSink {
     }
 }
 
+pub struct Silence {
+    periods: u32,
+    limit: u32,
+}
+
+impl Silence {
+    pub fn new(sample_rate: u32, period_frames: usize, after: Duration) -> Self {
+        let periods = after.as_secs_f64() * f64::from(sample_rate) / period_frames as f64;
+        Silence {
+            periods: 0,
+            limit: periods.ceil().max(1.0) as u32,
+        }
+    }
+
+    pub fn heard(&mut self, samples: &[i16]) -> bool {
+        if samples.iter().any(|s| s.unsigned_abs() > HUSH as u16) {
+            self.periods = 0;
+            return false;
+        }
+        self.periods = self.periods.saturating_add(1);
+        self.periods >= self.limit
+    }
+}
+
 struct Playback {
     alsa: Alsa,
     pcm: *mut c_void,
+    rate: u32,
 }
 
 fn play(ring: &Arc<Ring>, sample_rate: u32) -> Result<Playback, AudioError> {
     let alsa = Alsa::load()?;
     let pcm = alsa.open_pcm(sample_rate)?;
     ring.reopen(sample_rate);
-    Ok(Playback { alsa, pcm })
+    Ok(Playback {
+        alsa,
+        pcm,
+        rate: sample_rate,
+    })
 }
 
 impl Playback {
-    fn run(&self, ring: &Ring, stop: &AtomicBool) {
+    fn run(&mut self, ring: &Ring, stop: &AtomicBool) {
         let mut buf = vec![0i16; PERIOD_FRAMES * CHANNELS as usize];
+        let period = Duration::from_secs_f64(PERIOD_FRAMES as f64 / f64::from(self.rate));
+        let mut silence = Silence::new(self.rate, PERIOD_FRAMES, RELEASE_AFTER);
+        let mut next = Instant::now();
+        let mut retry_at = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             ring.fill(&mut buf);
-            let mut written = 0;
-            while written < PERIOD_FRAMES {
-                let at = written * CHANNELS as usize;
-                let frames = unsafe {
-                    (self.alsa.writei)(
-                        self.pcm,
-                        buf[at..].as_ptr() as *const c_void,
-                        (PERIOD_FRAMES - written) as u64,
-                    )
-                };
-                if frames < 0 {
-                    let err = unsafe { (self.alsa.recover)(self.pcm, frames as c_int, 1) };
-                    if err < 0 {
-                        eprintln!("slot: audio: {}", self.alsa.message(err));
-                        return;
-                    }
-                    continue;
+            let quiet = silence.heard(&buf);
+            if quiet && !self.pcm.is_null() {
+                self.release();
+                next = Instant::now();
+            }
+            if !quiet && self.pcm.is_null() && Instant::now() >= retry_at && !self.claim() {
+                retry_at = Instant::now() + RETRY_EVERY;
+            }
+            if self.pcm.is_null() {
+                next += period;
+                match next.checked_duration_since(Instant::now()) {
+                    Some(wait) => std::thread::sleep(wait),
+                    None => next = Instant::now(),
                 }
-                written += frames as usize;
+                continue;
+            }
+            if !self.write(&buf) {
+                return;
+            }
+        }
+    }
+
+    fn write(&self, buf: &[i16]) -> bool {
+        let mut written = 0;
+        while written < PERIOD_FRAMES {
+            let at = written * CHANNELS as usize;
+            let frames = unsafe {
+                (self.alsa.writei)(
+                    self.pcm,
+                    buf[at..].as_ptr() as *const c_void,
+                    (PERIOD_FRAMES - written) as u64,
+                )
+            };
+            if frames < 0 {
+                let err = unsafe { (self.alsa.recover)(self.pcm, frames as c_int, 1) };
+                if err < 0 {
+                    eprintln!("slot: audio: {}", self.alsa.message(err));
+                    return false;
+                }
+                continue;
+            }
+            written += frames as usize;
+        }
+        true
+    }
+
+    fn release(&mut self) {
+        unsafe {
+            (self.alsa.drop)(self.pcm);
+            (self.alsa.close)(self.pcm);
+        }
+        self.pcm = std::ptr::null_mut();
+        eprintln!("slot: audio: silent, released the device");
+    }
+
+    fn claim(&mut self) -> bool {
+        match self.alsa.open_pcm(self.rate) {
+            Ok(pcm) => {
+                self.pcm = pcm;
+                true
+            }
+            Err(e) => {
+                eprintln!("slot: audio: could not reopen: {e}");
+                false
             }
         }
     }
@@ -230,6 +315,9 @@ impl Playback {
 
 impl Drop for Playback {
     fn drop(&mut self) {
+        if self.pcm.is_null() {
+            return;
+        }
         unsafe {
             (self.alsa.drop)(self.pcm);
             (self.alsa.close)(self.pcm);
