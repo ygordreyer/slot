@@ -1,4 +1,6 @@
-use std::fs::File;
+//! Atomic replacement with durable temporary files.
+
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,8 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, bytes, false)
+}
+
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_mode(path, bytes, true)
+}
+
+fn atomic_write_mode(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     let tmp = temp_path(path);
-    match write_then_rename(&tmp, path, bytes) {
+    match write_then_rename(&tmp, path, bytes, private) {
         Ok(()) => {}
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -26,8 +36,17 @@ pub(crate) fn sync_dir(path: &Path) {
     }
 }
 
-fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = File::create(tmp)?;
+fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut f = options.open(tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);

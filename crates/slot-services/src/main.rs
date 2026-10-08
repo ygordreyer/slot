@@ -315,6 +315,24 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
                         home.enable(action == "on", root);
                         respond(&mut stream, 0, "ACCEPTED");
                     }
+                    ("home", "scan") => {
+                        let mut ours = home.interface.pids();
+                        ours.extend(link.interface.pids());
+                        match home.scan(link.busy(), &ours) {
+                            Ok(scan) => respond(&mut stream, 0, &scan),
+                            Err(error) => respond(&mut stream, 1, error),
+                        }
+                    }
+                    ("home", action) if action.starts_with("connect:") => {
+                        if link.busy() {
+                            respond(&mut stream, 1, "LINK_BUSY");
+                        } else {
+                            match home.connect(root, &action[8..]) {
+                                Ok(()) => respond(&mut stream, 0, "CONNECTING"),
+                                Err(error) => respond(&mut stream, 1, error),
+                            }
+                        }
+                    }
                     ("home", "reload") => {
                         if home.enabled {
                             home.reload(root);
@@ -334,14 +352,16 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
                             &mut stream,
                             0,
                             &format!(
-                                "home_enabled={} home_connected={} home_error={} link={} freq={:?}",
+                                "home_enabled={} home_connected={} home_error={} link={} freq={:?} home_ssid={} home_ip={}",
                                 home.enabled,
                                 home.enabled
                                     && connected(&home.interface.status())
                                     && home.interface.has_ip(),
                                 home.error,
                                 link.role,
-                                link.freq
+                                link.freq,
+                                if home.enabled && connected(&home.interface.status()) { config::hex(&home.active_ssid) } else { String::new() },
+                                home_lan_address(&home).map(|ip| ip.to_string()).unwrap_or_default()
                             ),
                         );
                     }
@@ -516,7 +536,9 @@ fn main() {
     let result = (|| -> std::io::Result<u8> {
         let mut s = connect(&root, &run)?;
         s.set_read_timeout(Some(Duration::from_secs(
-            if args[0] == "link" && ["host", "join"].contains(&args[1].as_str()) {
+            if (args[0] == "link" && ["host", "join"].contains(&args[1].as_str()))
+                || (args[0] == "home" && args[1] == "scan")
+            {
                 45
             } else {
                 8
@@ -531,13 +553,13 @@ fn main() {
             args[1]
         )?;
         let mut response = String::new();
-        s.take(2048).read_to_string(&mut response)?;
+        s.take(256 * 1024).read_to_string(&mut response)?;
         let code = response
             .split_whitespace()
             .next()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        if args[1] == "status" || (args[1] == "lan" && code == 0) {
+        if args[1] == "status" || (["lan", "scan"].contains(&args[1].as_str()) && code == 0) {
             println!("{}", response.trim());
         } else if code != 0 {
             eprintln!("slot-services: {}", response.trim());

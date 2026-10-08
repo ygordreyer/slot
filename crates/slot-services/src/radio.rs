@@ -83,9 +83,19 @@ impl Interface {
         system::private_write(&conf, &config::supplicant(n, &ctrl, freq, ap))
             .map_err(|_| "RUNTIME_CONFIG")?;
         output("ip", &["link", "set", self.name, "up"])?;
+        let log = self.run.join(format!("{}.log", self.name));
+        let _ = fs::remove_file(&log);
         self.wpa = Some(Process::spawn(
             "wpa_supplicant",
-            &["-i", self.name, "-c", conf.to_str().unwrap(), "-Dnl80211"],
+            &[
+                "-i",
+                self.name,
+                "-c",
+                conf.to_str().unwrap(),
+                "-Dnl80211",
+                "-f",
+                log.to_str().unwrap(),
+            ],
             self.run.join(format!("{}.wpa.pid", self.name)),
         )?);
         Ok(())
@@ -250,11 +260,16 @@ pub struct Home {
     deadline: Instant,
     retry: Instant,
     connected: bool,
+    requested: bool,
+    pub active_ssid: String,
 }
 impl Home {
     pub fn new(run: &Path) -> Self {
         let interface = Interface::new("wlan0", run);
         let connected = connected(&interface.status()) && interface.has_ip();
+        let active_ssid = system::field(&interface.status(), "ssid")
+            .unwrap_or("")
+            .to_owned();
         Self {
             interface,
             enabled: false,
@@ -263,10 +278,15 @@ impl Home {
             next: 0,
             deadline: Instant::now() + Duration::from_secs(25),
             retry: Instant::now(),
+            active_ssid,
+            requested: false,
             connected,
         }
     }
     pub fn enable(&mut self, enabled: bool, root: &Path) {
+        if enabled && self.enabled {
+            return;
+        }
         self.enabled = enabled;
         if !enabled {
             self.interface.stop();
@@ -286,6 +306,7 @@ impl Home {
     pub fn reload(&mut self, root: &Path) {
         match config::read(root) {
             Ok(p) => {
+                self.requested = false;
                 if self.profiles != p && !self.profiles.is_empty() || p.is_empty() {
                     self.interface.stop();
                     self.connected = false;
@@ -293,10 +314,11 @@ impl Home {
                 if self.profiles.is_empty() && self.interface.wpa.is_some() && !p.is_empty() {
                     let conf = fs::read_to_string(self.interface.run.join("wlan0.conf"))
                         .unwrap_or_default();
-                    if !p
-                        .iter()
-                        .any(|n| conf == config::supplicant(n, &self.interface.ctrl(), None, false))
-                    {
+                    if let Some(network) = p.iter().find(|n| {
+                        conf == config::supplicant(n, &self.interface.ctrl(), None, false)
+                    }) {
+                        self.active_ssid = network.ssid.clone();
+                    } else {
                         self.interface.stop();
                         self.connected = false;
                     }
@@ -312,6 +334,44 @@ impl Home {
             }
         }
     }
+    pub fn connect(&mut self, root: &Path, ssid_hex: &str) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Err("HOME_DISABLED");
+        }
+        let profiles = config::read(root)?;
+        let profile = profiles
+            .into_iter()
+            .find(|n| config::hex(&n.ssid) == ssid_hex)
+            .ok_or("NETWORK_NOT_SAVED")?;
+        self.interface.stop();
+        self.connected = false;
+        self.active_ssid.clear();
+        self.profiles = vec![profile];
+        self.next = 0;
+        self.requested = true;
+        self.error = "";
+        self.retry = Instant::now();
+        Ok(())
+    }
+
+    pub fn scan(&mut self, link_busy: bool, ours: &[u32]) -> Result<String, &'static str> {
+        if !self.enabled {
+            return Err("HOME_DISABLED");
+        }
+        if link_busy {
+            return Err("LINK_BUSY");
+        }
+        if system::external_radio_owner(ours) {
+            return Err("EXTERNAL_OWNER");
+        }
+        if !net_exists("wlan0") {
+            return Err("RADIO_UNAVAILABLE");
+        }
+        output("rfkill", &["unblock", "wifi"])?;
+        output("ip", &["link", "set", "wlan0", "up"])?;
+        system::output_timeout("iw", &["dev", "wlan0", "scan"], Duration::from_secs(10))
+    }
+
     pub fn tick(&mut self, root: &Path, link_busy: bool, link_freq: Option<u32>, ours: &[u32]) {
         if !self.enabled {
             return;
@@ -335,9 +395,10 @@ impl Home {
             if now < self.deadline {
                 return;
             }
+            let auth_log = auth_log_tail(&self.interface.run.join("wlan0.log"));
+            self.error = connection_error(&status, &auth_log);
             self.interface.stop();
             self.connected = false;
-            self.error = "HOME_CONNECT_FAILED";
             self.retry = now + Duration::from_secs(2);
         }
         if now < self.retry {
@@ -355,6 +416,11 @@ impl Home {
             return;
         }
         if self.next >= self.profiles.len() {
+            if self.requested {
+                self.next = 0;
+                self.retry = now + Duration::from_secs(15);
+                return;
+            }
             self.reload(root);
             self.retry = now + Duration::from_secs(15);
             if self.profiles.is_empty() {
@@ -381,6 +447,7 @@ impl Home {
         }
         match self.interface.start(profile, None, false) {
             Ok(()) => {
+                self.active_ssid = profile.ssid.clone();
                 self.next += 1;
                 self.error = "";
                 self.deadline = now + Duration::from_secs(25);
@@ -433,5 +500,105 @@ mod tests {
         ));
         assert!(!permitted("* 5745 MHz [149] (disabled)", 5745));
         assert!(permitted("* 2412 MHz [1] (20.0 dBm)", 2412));
+    }
+}
+
+fn auth_log_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or_default();
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(65536)))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    let _ = file.take(65536).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// An association without a lease differs from a rejected WPA key.
+pub fn connection_error(status: &str, log: &str) -> &'static str {
+    if connected(status) {
+        "NO_DHCP_LEASE"
+    } else if log.contains("reason=WRONG_KEY") || log.contains("pre-shared key may be incorrect") {
+        "WRONG_PASSWORD"
+    } else {
+        "HOME_CONNECT_FAILED"
+    }
+}
+
+#[cfg(test)]
+mod home_error_tests {
+    use super::*;
+    #[test]
+    fn choosing_a_saved_network_targets_it_and_reload_restores_all_profiles() {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run");
+        fs::create_dir(&run).unwrap();
+        let profiles = vec![
+            Network {
+                ssid: "Home".into(),
+                password: Some("password".into()),
+            },
+            Network {
+                ssid: "Guest \"".into(),
+                password: None,
+            },
+        ];
+        slot_store::write_wifi(root.path(), &profiles).unwrap();
+        let mut home = Home::new(&run);
+        assert_eq!(
+            home.connect(root.path(), &config::hex("Home")),
+            Err("HOME_DISABLED")
+        );
+        home.enabled = true;
+        home.connect(root.path(), &config::hex("Guest \"")).unwrap();
+        assert_eq!(home.profiles, vec![profiles[1].clone()]);
+        assert!(home.requested);
+        assert_eq!(
+            home.connect(root.path(), &config::hex("Missing")),
+            Err("NETWORK_NOT_SAVED")
+        );
+        fs::write(root.path().join("Config/wifi.toml"), "broken='").unwrap();
+        home.reload(root.path());
+        assert!(home.requested);
+        assert_eq!(home.profiles, vec![profiles[1].clone()]);
+        slot_store::write_wifi(root.path(), &profiles).unwrap();
+        home.reload(root.path());
+        assert!(!home.requested);
+        assert_eq!(home.profiles, profiles);
+    }
+
+    #[test]
+    fn authentication_log_reads_only_a_bounded_tail() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wlan0.log");
+        fs::write(&path, format!("{}reason=WRONG_KEY", "x".repeat(100000))).unwrap();
+        let log = auth_log_tail(&path);
+        assert_eq!(log.len(), 65536);
+        assert!(log.ends_with("reason=WRONG_KEY"));
+    }
+
+    #[test]
+    fn reports_authentication_and_dhcp_failures_separately() {
+        assert_eq!(
+            connection_error("wpa_state=COMPLETED\n", ""),
+            "NO_DHCP_LEASE"
+        );
+        assert_eq!(
+            connection_error(
+                "wpa_state=DISCONNECTED\n",
+                "CTRL-EVENT-SSID-TEMP-DISABLED reason=WRONG_KEY"
+            ),
+            "WRONG_PASSWORD"
+        );
+        assert_eq!(
+            connection_error("wpa_state=SCANNING\n", ""),
+            "HOME_CONNECT_FAILED"
+        );
     }
 }

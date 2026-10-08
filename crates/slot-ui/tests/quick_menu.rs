@@ -87,13 +87,17 @@ fn the_rows_run_in_the_order_the_user_chose() {
             "Shader",
             "Rumble",
             "Home Wi-Fi",
+            "Wi-Fi Networks",
             "12-Hour Clock",
             "Date & Time",
             "About"
         ]
     );
     let opens: Vec<QuickRow> = QuickRow::ALL.into_iter().filter(|r| r.opens()).collect();
-    assert_eq!(opens, [QuickRow::DateTime, QuickRow::About]);
+    assert_eq!(
+        opens,
+        [QuickRow::WifiNetworks, QuickRow::DateTime, QuickRow::About]
+    );
 }
 
 #[test]
@@ -179,4 +183,39 @@ fn scrolling_keeps_every_selection_and_its_bar_clear_of_the_legend() {
         quick_window(*QuickRow::ALL.last().unwrap()),
         QuickRow::ALL.len() - QUICK_ROWS
     );
+}
+
+#[test]
+fn scroll_chevrons_show_only_hidden_rows_and_clear_text_and_legend() {
+    use slot_ui::{quick_window, Draw, QuickMenu, QUICK_PITCH, QUICK_ROWS, QUICK_TOP};
+    for row in QuickRow::ALL {
+        let mut draws = Vec::new();
+        QuickMenu {
+            row,
+            values: [None; QuickRow::ALL.len()],
+            clock: None,
+            shader: None,
+            faces: None,
+        }
+        .draw(&mut draws);
+        let hints: Vec<_> = draws[2..]
+            .iter()
+            .map(|d| match d {
+                Draw::Rect { y, h, .. } => (*y, *h),
+                _ => panic!("unexpected hint"),
+            })
+            .collect();
+        assert_eq!(
+            hints.iter().any(|(y, _)| *y < QUICK_TOP),
+            quick_window(row) > 0
+        );
+        let bottom = QUICK_TOP + QUICK_PITCH * QUICK_ROWS as f32;
+        assert_eq!(
+            hints.iter().any(|(y, _)| *y >= bottom),
+            quick_window(row) + QUICK_ROWS < QuickRow::ALL.len()
+        );
+        assert!(hints
+            .iter()
+            .all(|(y, h)| (*y + *h < QUICK_TOP || *y >= bottom) && *y + *h <= 427.0));
+    }
 }

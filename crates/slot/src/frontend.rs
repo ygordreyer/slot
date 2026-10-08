@@ -51,6 +51,8 @@ pub struct Frontend {
     /// Shader's value in the quick menu. The same shape as the clock's: a line of menu type in
     /// both inks and the text it was built for.
     quick_shader: QuickClock,
+    wifi_shown: Option<crate::wifi::WifiScreen>,
+    wifi_tex: Option<TexId>,
     cheats: CheatFaces,
 }
 
@@ -127,6 +129,8 @@ impl Frontend {
             about: AboutFace::default(),
             quick_clock: QuickClock::default(),
             quick_shader: QuickClock::default(),
+            wifi_shown: None,
+            wifi_tex: None,
             cheats: CheatFaces {
                 rows: vec![None; CHEAT_ROWS],
                 built: vec![None; CHEAT_ROWS],
@@ -322,6 +326,18 @@ impl Frontend {
         sync_quick_shader(self.session.app_mut(), compositor, &mut self.quick_shader);
         sync_shader(&mut self.session, compositor);
         sync_cheats(self.session.app_mut(), compositor, &mut self.cheats);
+        if let Some(screen) = self.session.app().wifi_screen() {
+            if self.wifi_shown.as_ref() != Some(screen) {
+                let face = screen.face();
+                self.wifi_shown = Some(screen.clone());
+                let tex = upload(compositor, &mut self.wifi_tex, face);
+                self.session.app_mut().set_wifi_panel_face(tex);
+            } else if let Some(tex) = self.wifi_tex {
+                self.session.app_mut().set_wifi_panel_face(tex);
+            }
+        } else {
+            self.wifi_shown = None;
+        }
         sync_core_picker(
             self.session.app_mut(),
             compositor,

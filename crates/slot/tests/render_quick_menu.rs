@@ -9,7 +9,7 @@ use slot::frontend::Frontend;
 use slot_gfx::{Compositor, HeadlessSurface, OUT_H, OUT_W};
 use slot_input::{Btn, InputSource, Millis, RawEvent};
 use slot_power::SimPlatform;
-use slot_ui::{QuickRow, QUICK_PITCH, QUICK_TOP};
+use slot_ui::{quick_window, QuickRow, QUICK_PITCH, QUICK_ROWS, QUICK_TOP};
 
 struct Script(VecDeque<Vec<RawEvent>>);
 
@@ -85,7 +85,8 @@ fn the_quick_menu_renders_full_screen() {
         bar_on = selected;
         let px = composed(&mut f, &mut c, name);
 
-        let top = (QUICK_TOP + QUICK_PITCH * selected.index() as f32) as usize;
+        let top =
+            (QUICK_TOP + QUICK_PITCH * (selected.index() - quick_window(selected)) as f32) as usize;
         for x in [1, OUT_W as usize - 2] {
             assert_eq!(at(&px, x, top + 26), bar, "{name}: no bar at x {x}");
         }
@@ -104,15 +105,20 @@ fn the_quick_menu_renders_full_screen() {
             "{name}: not on the ground"
         );
 
-        for row in QuickRow::ALL {
-            let top = (QUICK_TOP + QUICK_PITCH * row.index() as f32) as usize;
+        for row in QuickRow::ALL
+            .into_iter()
+            .skip(quick_window(selected))
+            .take(QUICK_ROWS)
+        {
+            let top =
+                (QUICK_TOP + QUICK_PITCH * (row.index() - quick_window(selected)) as f32) as usize;
             let label = inked(&px, 0..360, top);
             let first = *label.first().expect("a row with no label");
             assert!(
                 (32..=36).contains(&first),
                 "{name}: {row:?}'s label starts at x {first}"
             );
-            if row == QuickRow::About {
+            if matches!(row, QuickRow::About | QuickRow::WifiNetworks) {
                 continue;
             }
             let value = inked(&px, 360..OUT_W as usize, top);

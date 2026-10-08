@@ -17,6 +17,7 @@ pub enum QuickRow {
     Shader,
     Rumble,
     HomeWifi,
+    WifiNetworks,
     /// Whether every clock slot draws reads 3:07 PM rather than 15:07. Last of the rows the
     /// arrows change, right above the Date & Time it changes the look of.
     TwelveHour,
@@ -25,13 +26,14 @@ pub enum QuickRow {
 }
 
 impl QuickRow {
-    pub const ALL: [QuickRow; 9] = [
+    pub const ALL: [QuickRow; 10] = [
         QuickRow::FastForward,
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
         QuickRow::Shader,
         QuickRow::Rumble,
         QuickRow::HomeWifi,
+        QuickRow::WifiNetworks,
         QuickRow::TwelveHour,
         QuickRow::DateTime,
         QuickRow::About,
@@ -49,6 +51,7 @@ impl QuickRow {
             QuickRow::Shader => "Shader",
             QuickRow::Rumble => "Rumble",
             QuickRow::HomeWifi => "Home Wi-Fi",
+            QuickRow::WifiNetworks => "Wi-Fi Networks",
             QuickRow::TwelveHour => "12-Hour Clock",
             QuickRow::DateTime => "Date & Time",
             QuickRow::About => "About",
@@ -56,7 +59,10 @@ impl QuickRow {
     }
 
     pub fn opens(self) -> bool {
-        matches!(self, QuickRow::DateTime | QuickRow::About)
+        matches!(
+            self,
+            QuickRow::WifiNetworks | QuickRow::DateTime | QuickRow::About
+        )
     }
 
     pub fn up(self) -> QuickRow {
@@ -238,6 +244,7 @@ impl QuickMenu<'_> {
             h: QUICK_PITCH - 2.0 * BAR_INSET,
             colour: edge(),
         });
+        draw_quick_scroll_hints(out, self.row);
         let Some(faces) = self.faces else {
             return;
         };
@@ -300,4 +307,36 @@ fn push(out: &mut Vec<Draw>, tex: TexId, x: f32, y: f32, w: u32, h: u32) {
         tex,
         alpha: 1.0,
     });
+}
+
+/// Pixel chevrons occupy the clear gaps above and below the scrolling window.
+pub fn draw_quick_scroll_hints(out: &mut Vec<Draw>, row: QuickRow) {
+    let top = quick_window(row);
+    for (visible, y, down) in [
+        (top > 0, QUICK_TOP - 12.0, false),
+        (
+            top + QUICK_ROWS < QuickRow::ALL.len(),
+            QUICK_TOP + QUICK_PITCH * QUICK_ROWS as f32,
+            true,
+        ),
+    ] {
+        if !visible {
+            continue;
+        }
+        for step in 0..5 {
+            let offset = if down { step } else { 4 - step };
+            for x in [
+                OUT_W as f32 / 2.0 - offset as f32 * 2.0,
+                OUT_W as f32 / 2.0 + offset as f32 * 2.0,
+            ] {
+                out.push(Draw::Rect {
+                    x,
+                    y: y + step as f32,
+                    w: 2.0,
+                    h: 1.0,
+                    colour: [0.6, 0.6, 0.64, 1.0],
+                });
+            }
+        }
+    }
 }

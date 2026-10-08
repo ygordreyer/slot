@@ -28,6 +28,7 @@ use crate::link_screen::LinkSprites;
 use crate::link_start::{link_port, LinkFail, LinkProgress, LinkStarter, LinkStep};
 use crate::persist::{self, Snapshot};
 use crate::video_mode::{self, VideoMode};
+use crate::wifi::{WifiEffect, WifiRadio, WifiScreen, WifiWorker};
 
 pub const INSERT_S: f32 = 0.73;
 const INSERT_HOLD_S: f32 = 0.28;
@@ -375,6 +376,12 @@ pub struct App {
     legend_faces: Vec<TexId>,
     undo_face: Option<TexId>,
     clock_faces: Option<(TexId, TexId)>,
+    wifi_screen: Option<WifiScreen>,
+    wifi_worker: Option<WifiWorker>,
+    wifi_generation: u64,
+    wifi_poll_at: Millis,
+    wifi_status_pending: bool,
+    wifi_face: Option<TexId>,
     quick_menu_faces: Option<QuickMenuFaces>,
     quick_clock_faces: Option<[(TexId, u32, u32); 2]>,
     /// Shader's value, grey then lit. Rebuilt by the binary when the name changes, and only
@@ -492,6 +499,12 @@ impl App {
             legend_faces: Vec::new(),
             undo_face: None,
             clock_faces: None,
+            wifi_screen: None,
+            wifi_worker: None,
+            wifi_generation: 0,
+            wifi_poll_at: 0,
+            wifi_status_pending: false,
+            wifi_face: None,
             quick_menu_faces: None,
             quick_clock_faces: None,
             quick_shader_faces: None,
@@ -694,6 +707,95 @@ impl App {
         }
     }
 
+    pub fn wifi_screen(&self) -> Option<&WifiScreen> {
+        self.wifi_screen.as_ref()
+    }
+
+    pub fn set_wifi_panel_face(&mut self, tex: TexId) {
+        self.wifi_face = Some(tex);
+    }
+
+    pub fn set_wifi_radio(&mut self, radio: Box<dyn WifiRadio>) {
+        if let Some(root) = &self.root {
+            self.wifi_worker = Some(WifiWorker::new(root.clone(), radio));
+        }
+    }
+
+    fn open_wifi(&mut self) {
+        if self.wifi_worker.is_none() {
+            let Some(root) = &self.root else {
+                return;
+            };
+            self.wifi_worker = Some(WifiWorker::device_or_host(root));
+        }
+        self.wifi_generation = self.wifi_generation.wrapping_add(1);
+        self.wifi_status_pending = false;
+        self.wifi_face = None;
+        self.wifi_screen = Some(WifiScreen::new(self.state.home_wifi_enabled));
+        if self.state.home_wifi_enabled {
+            self.wifi_ask(WifiEffect::Scan);
+        }
+    }
+
+    fn wifi_ask(&self, effect: WifiEffect) {
+        if let Some(worker) = &self.wifi_worker {
+            worker.ask(self.wifi_generation, effect);
+        }
+    }
+
+    fn wifi_input(&mut self, button: Btn) {
+        let Some(effect) = self
+            .wifi_screen
+            .as_mut()
+            .and_then(|screen| screen.input(button))
+        else {
+            return;
+        };
+        if effect != WifiEffect::Back {
+            self.wifi_generation = self.wifi_generation.wrapping_add(1);
+            self.wifi_status_pending = false;
+        }
+        match effect {
+            WifiEffect::Back => {
+                self.wifi_screen = None;
+                self.phase = Phase::QuickMenu {
+                    row: QuickRow::WifiNetworks,
+                };
+            }
+            WifiEffect::Enable => {
+                self.state.home_wifi_enabled = true;
+                self.persist();
+                self.wifi_ask(effect);
+            }
+            _ => self.wifi_ask(effect),
+        }
+    }
+
+    fn poll_wifi(&mut self) {
+        while let Some((generation, reply)) = self.wifi_worker.as_ref().and_then(WifiWorker::take) {
+            if generation != self.wifi_generation {
+                continue;
+            }
+            if matches!(reply, crate::wifi::WifiReply::Status(_)) {
+                self.wifi_status_pending = false;
+            }
+            if let Some(screen) = &mut self.wifi_screen {
+                screen.reply(reply);
+            }
+        }
+        if self.now() >= self.wifi_poll_at
+            && !self.wifi_status_pending
+            && self
+                .wifi_screen
+                .as_ref()
+                .is_some_and(|s| s.enabled && !s.busy)
+        {
+            self.wifi_poll_at = self.now() + 1000;
+            self.wifi_status_pending = true;
+            self.wifi_ask(WifiEffect::Status);
+        }
+    }
+
     pub fn quick_menu(&self) -> Option<QuickRow> {
         match self.phase {
             Phase::QuickMenu { row } => Some(row),
@@ -710,7 +812,9 @@ impl App {
             QuickRow::HomeWifi => Some(QuickValue::flag(self.state.home_wifi_enabled)),
             QuickRow::TwelveHour => Some(QuickValue::flag(self.state.twelve_hour)),
             // A name off the card, which `QuickValue` has no face for. The binary rasters it.
-            QuickRow::Shader | QuickRow::DateTime | QuickRow::About => None,
+            QuickRow::Shader | QuickRow::WifiNetworks | QuickRow::DateTime | QuickRow::About => {
+                None
+            }
         }
     }
 
@@ -1373,6 +1477,14 @@ impl App {
             Action::GbaUp(Btn::Right) => self.shelf_mut().release_right(),
             _ => {}
         }
+        if self.wifi_screen.is_some() {
+            if let Action::GbaDown(button) = action {
+                self.wifi_input(button);
+            } else if action == Action::QuickMenu {
+                self.wifi_input(Btn::B);
+            }
+            return;
+        }
         if self.game_menu.is_some() {
             return self.game_menu_input(action);
         }
@@ -1479,6 +1591,7 @@ impl App {
                 self.phase = clock_screen(self.utc_secs(), self.state.utc_offset_min, true);
             }
             QuickRow::About => self.phase = Phase::About,
+            QuickRow::WifiNetworks => self.open_wifi(),
             QuickRow::FastForward
             | QuickRow::FastForwardSound
             | QuickRow::ColourCorrection
@@ -1534,7 +1647,7 @@ impl App {
                 self.radio.ask(RadioJob::Home(s.home_wifi_enabled));
             }
             QuickRow::TwelveHour => s.twelve_hour = !s.twelve_hour,
-            QuickRow::DateTime | QuickRow::About => return,
+            QuickRow::WifiNetworks | QuickRow::DateTime | QuickRow::About => return,
         }
         self.persist();
     }
@@ -1813,6 +1926,7 @@ impl App {
     }
 
     fn timers(&mut self) {
+        self.poll_wifi();
         self.play_hold();
         let offer = self.undo_label();
         if let Some(p) = &mut self.polaroids {
@@ -2123,6 +2237,25 @@ impl App {
             self.draw_cheat_menu(out);
         }
         // Over everything, in every phase. The bar is never what the user is looking at.
+        if self.wifi_screen.is_some() && !matches!(self.phase, Phase::Doze { .. }) {
+            out.push(Draw::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: OUT_W as f32,
+                h: OUT_H as f32,
+                colour: slot_ui::opening(),
+            });
+            if let Some(tex) = self.wifi_face {
+                out.push(Draw::Tex {
+                    x: 0.0,
+                    y: 0.0,
+                    w: OUT_W as f32,
+                    h: OUT_H as f32,
+                    tex,
+                    alpha: 1.0,
+                });
+            }
+        }
         self.hud.draw(self.now(), out);
     }
 
@@ -2560,6 +2693,7 @@ impl App {
     /// The one function every doze actually goes through: `LidClose` and
     /// `PowerTap` by way of `power_press` both return
     fn doze(&mut self) {
+        self.wifi_screen = None;
         if self.link_active() {
             self.end_link();
         }

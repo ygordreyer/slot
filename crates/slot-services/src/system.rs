@@ -19,6 +19,14 @@ pub fn private_write(path: &Path, text: &str) -> io::Result<()> {
 
 // Short control commands are bounded. Supplicant and DHCP are separate owned children.
 pub fn output(program: &str, args: &[&str]) -> Result<String, &'static str> {
+    output_timeout(program, args, Duration::from_secs(2))
+}
+
+pub fn output_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, &'static str> {
     let bundled = std::env::var_os("SLOT_ROOT")
         .map(PathBuf::from)
         .map(|root| root.join("System/slot-net"));
@@ -45,7 +53,7 @@ pub fn output(program: &str, args: &[&str]) -> Result<String, &'static str> {
         let _ = stdout.take(256 * 1024).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {

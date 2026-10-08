@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use slot_input::{Action, Gestures, Millis, RawEvent};
+use slot_input::{Action, Btn, Gestures, Millis, RawEvent};
 use slot_retro::Rumble;
 use slot_store::Platform;
 use slot_ui::{FfState, Toast};
@@ -196,6 +196,32 @@ impl Session {
     pub fn feed(&mut self, events: impl IntoIterator<Item = RawEvent>, now: Millis) {
         let mut actions = Vec::new();
         for ev in events {
+            if self.app.wifi_screen().is_some() {
+                let button = match ev {
+                    RawEvent::Down(button) | RawEvent::Up(button) => button,
+                };
+                if matches!(
+                    button,
+                    Btn::Up
+                        | Btn::Down
+                        | Btn::Left
+                        | Btn::Right
+                        | Btn::A
+                        | Btn::B
+                        | Btn::X
+                        | Btn::Y
+                        | Btn::L1
+                        | Btn::R1
+                        | Btn::Start
+                        | Btn::Select
+                ) {
+                    actions.push(match ev {
+                        RawEvent::Down(button) => Action::GbaDown(button),
+                        RawEvent::Up(button) => Action::GbaUp(button),
+                    });
+                    continue;
+                }
+            }
             actions.extend(self.gestures.feed(ev, now));
         }
         actions.extend(self.gestures.tick(now));

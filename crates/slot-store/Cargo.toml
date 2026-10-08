@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+toml = "0.8"
 unicode-normalization.workspace = true
 
 [dev-dependencies]

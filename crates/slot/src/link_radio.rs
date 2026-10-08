@@ -137,7 +137,7 @@ fn queue() -> &'static Sender<RadioJob> {
 
 /// The card's own `slot-services`, through the loader: exFAT carries no exec bit.
 #[cfg(feature = "device")]
-fn helper() -> std::process::Command {
+pub(crate) fn helper() -> std::process::Command {
     let root = std::env::var_os("SLOT_ROOT").unwrap_or_else(|| "/mnt/sdcard".into());
     let service = std::path::Path::new(&root).join("System/slot-services");
     let loader = std::path::Path::new("/lib/ld-linux-aarch64.so.1");

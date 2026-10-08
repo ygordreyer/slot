@@ -2690,7 +2690,6 @@ dependencies = [
  "sha1",
  "slot-store",
  "tempfile",
- "toml 0.8.20",
 ]
 
 [[package]]
@@ -2702,6 +2701,7 @@ name = "slot-store"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+ "toml 0.8.20",
  "unicode-normalization",
 ]
 

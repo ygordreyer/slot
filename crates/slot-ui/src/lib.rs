@@ -10,6 +10,7 @@ mod draw;
 mod footer;
 mod hud;
 mod icon;
+mod keyboard;
 mod link_art;
 mod plate;
 mod polaroids;
@@ -23,6 +24,7 @@ mod slot_chrome;
 mod sticker;
 pub mod text;
 mod toast;
+mod wifi_menu;
 
 pub use backdrop::{draw_backdrop, wallpaper_face};
 pub use barcode::{code39, CODE39_NARROW, CODE39_WIDE};
@@ -56,6 +58,7 @@ pub use hud::{
     LINK_HOST_INK, LINK_JOIN_INK, PLATE_H,
 };
 pub use icon::{achievement_icon_face, badge_face, icon_box, icon_face, Badge, Icon};
+pub use keyboard::{Keyboard, KeyboardInput, KeyboardResult, KEY_COLS, KEY_ROWS};
 pub use link_art::{
     link_art, LinkArt, ADAPTER_BASE_X, ADAPTER_BASE_Y, ADAPTER_H, ADAPTER_W, ARCS, ARROW_H,
     ARROW_LEFT_X, ARROW_RIGHT_X, ARROW_W, ARROW_Y, CLICKS_H, CLICKS_W, CLICKS_X, CLICKS_Y, NET_H,
@@ -90,3 +93,4 @@ pub use sticker::{
     HOME, ORIGIN, STICKER_H, STICKER_W,
 };
 pub use toast::{toast_box, toast_face, toast_rect, Toast};
+pub use wifi_menu::{WifiMenu, WifiMenuRow, WIFI_ROWS};

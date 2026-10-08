@@ -1,83 +1,9 @@
+//! Supplicant configuration derived from shared saved profiles.
+
+#[cfg(test)]
+use slot_store::parse_wifi as parse;
+pub use slot_store::{read_wifi as read, WifiNetwork as Network};
 use std::path::Path;
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct Network {
-    pub ssid: String,
-    pub password: Option<String>,
-}
-
-// Never format TOML errors: they include the source line, potentially a password.
-pub fn read(root: &Path) -> Result<Vec<Network>, &'static str> {
-    let path = root.join("Config/wifi.toml");
-    use std::io::Read;
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err("CONFIG_UNREADABLE"),
-    };
-    let mut text = String::new();
-    file.take(65537)
-        .read_to_string(&mut text)
-        .map_err(|_| "CONFIG_UNREADABLE")?;
-    if text.len() > 65536 {
-        return Err("CONFIG_TOO_LARGE");
-    }
-    parse(&text)
-}
-
-pub fn parse(text: &str) -> Result<Vec<Network>, &'static str> {
-    let doc = text.parse::<toml::Table>().map_err(|_| "CONFIG_SYNTAX")?;
-    if doc.keys().any(|k| k != "networks") {
-        return Err("CONFIG_UNKNOWN_FIELD");
-    }
-    let Some(value) = doc.get("networks") else {
-        return Ok(Vec::new());
-    };
-    let entries = value.as_array().ok_or("CONFIG_NETWORKS")?;
-    if entries.len() > 32 {
-        return Err("CONFIG_TOO_MANY_NETWORKS");
-    }
-    entries
-        .iter()
-        .map(|entry| {
-            let t = entry.as_table().ok_or("CONFIG_NETWORK")?;
-            if t.keys()
-                .any(|k| !["ssid", "password", "security"].contains(&k.as_str()))
-            {
-                return Err("CONFIG_UNKNOWN_FIELD");
-            }
-            let ssid = t
-                .get("ssid")
-                .and_then(|v| v.as_str())
-                .ok_or("CONFIG_SSID")?;
-            if ssid.is_empty() || ssid.len() > 32 || ssid.contains('\0') {
-                return Err("CONFIG_SSID");
-            }
-            let security = match t.get("security") {
-                None => "wpa-psk",
-                Some(v) => v.as_str().ok_or("CONFIG_SECURITY")?,
-            };
-            let password = match security {
-                "open" if !t.contains_key("password") => None,
-                "wpa-psk" => {
-                    let p = t
-                        .get("password")
-                        .and_then(|v| v.as_str())
-                        .ok_or("CONFIG_PASSWORD")?;
-                    if !(8..=63).contains(&p.len()) || !p.bytes().all(|b| (32..=126).contains(&b)) {
-                        return Err("CONFIG_PASSWORD");
-                    }
-                    Some(p.to_owned())
-                }
-                _ => return Err("CONFIG_SECURITY"),
-            };
-            Ok(Network {
-                ssid: ssid.into(),
-                password,
-            })
-        })
-        .collect()
-}
 
 pub fn hex(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
@@ -85,7 +11,7 @@ pub fn hex(s: &str) -> String {
 
 pub fn supplicant(n: &Network, ctrl: &Path, freq: Option<u32>, ap: bool) -> String {
     let mut s = format!(
-        "ctrl_interface={}\nupdate_config=0\nnetwork={{\nssid={}\n",
+        "ctrl_interface={}\nupdate_config=0\nnetwork={{\nssid={}\nscan_ssid=1\n",
         ctrl.display(),
         hex(&n.ssid)
     );
