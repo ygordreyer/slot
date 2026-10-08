@@ -69,6 +69,9 @@ impl AccountScreen {
     }
 
     pub fn input(&mut self, button: Btn) -> Option<AccountEffect> {
+        if button == Btn::L2 && self.keyboard.is_none() {
+            return None;
+        }
         self.revision = self.revision.wrapping_add(1);
         if let Some(keyboard) = &mut self.keyboard {
             let input = match button {
@@ -78,6 +81,7 @@ impl AccountScreen {
                 Btn::Right => KeyboardInput::Right,
                 Btn::A => KeyboardInput::Type,
                 Btn::B => KeyboardInput::Delete,
+                Btn::L2 => KeyboardInput::Cancel,
                 Btn::X => KeyboardInput::Caps,
                 Btn::Y => KeyboardInput::Symbols,
                 Btn::L1 => KeyboardInput::CursorLeft,
@@ -169,9 +173,9 @@ mod tests {
         screen.input(Btn::A);
         assert_eq!(screen.keyboard.as_ref().unwrap().display(), "*|");
         screen.input(Btn::Select);
-        assert_eq!(screen.keyboard.as_ref().unwrap().display(), "a|");
+        assert_eq!(screen.keyboard.as_ref().unwrap().display(), "1|");
         screen.input(Btn::Start);
-        assert_eq!(&**screen.password, "a");
+        assert_eq!(&**screen.password, "1");
         assert!(screen.keyboard.is_none());
     }
     #[test]

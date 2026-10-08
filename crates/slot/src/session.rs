@@ -211,6 +211,7 @@ impl Session {
                         | Btn::X
                         | Btn::Y
                         | Btn::L1
+                        | Btn::L2
                         | Btn::R1
                         | Btn::Start
                         | Btn::Select

@@ -177,3 +177,57 @@ fn select_reveals_and_following_buttons_edit_instead_of_triggering_chords() {
         before.colour_correction
     );
 }
+
+#[test]
+fn raw_l2_discards_password_entry_without_changing_saved_networks() {
+    let root = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    clocked(root.path());
+    let saved = vec![slot_store::WifiNetwork {
+        ssid: "Saved".into(),
+        password: Some("password".into()),
+    }];
+    slot_store::write_wifi(root.path(), &saved).unwrap();
+    let path = root.path().join("Config/wifi.toml");
+    let before = std::fs::read(&path).unwrap();
+    let mut session = Session::boot(root.path().into());
+    session.app_mut().set_wifi_radio(Box::new(HostWifi {
+        networks: vec![NearbyNetwork {
+            ssid: "New".into(),
+            signal: -40,
+            secured: true,
+            supported: true,
+        }],
+        ..Default::default()
+    }));
+    open(session.app_mut());
+    session.feed([RawEvent::Down(Btn::A), RawEvent::Up(Btn::A)], 100);
+    await_scan(session.app_mut());
+    session.feed([RawEvent::Down(Btn::A), RawEvent::Up(Btn::A)], 200);
+    for i in 0..8 {
+        session.feed(
+            [RawEvent::Down(Btn::A), RawEvent::Up(Btn::A)],
+            300 + i * 100,
+        );
+    }
+    assert_eq!(
+        session
+            .app()
+            .wifi_screen()
+            .unwrap()
+            .keyboard
+            .as_ref()
+            .unwrap()
+            .text(),
+        "11111111"
+    );
+    session.feed([RawEvent::Down(Btn::L2)], 1100);
+    let screen = session.app().wifi_screen().unwrap();
+    assert!(screen.keyboard.is_none());
+    assert!(!screen.busy);
+    assert_eq!(read_wifi(root.path()).unwrap(), saved);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    session.feed([RawEvent::Up(Btn::L2)], 1200);
+    assert!(session.app().wifi_screen().unwrap().keyboard.is_none());
+    assert_eq!(read_wifi(root.path()).unwrap(), saved);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}

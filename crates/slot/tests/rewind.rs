@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use slot::app::Phase;
 use slot::rewind::{Rewind, RewindThread};
 use slot::session::Session;
-use slot_input::{Btn, Millis, RawEvent};
+use slot_input::{Action, Btn, Millis, RawEvent};
 use slot_store::{write_slot_state, SlotState};
-use slot_ui::Draw;
+use slot_ui::{Draw, QuickRow};
 
 const STATE_LEN: usize = 400_000;
 const CHURN: usize = 12_000;
@@ -155,6 +155,86 @@ fn the_rewind_bar_is_up_while_l2_is_held_and_gone_once_it_is_let_go() {
     );
     step(&mut s, &mut now, Some(RawEvent::Up(Btn::L2)));
     assert!(drawn(&s).is_empty(), "the bar outlived the hold");
+}
+
+#[test]
+fn raw_l2_without_a_keyboard_leaves_screens_unchanged_and_does_not_leak_rewind() {
+    for row in [QuickRow::WifiNetworks, QuickRow::RetroAchievements] {
+        let d = common::tmp_root_with_carts(&["Emerald", "Fusion"]);
+        common::clocked(d.path());
+        let mut s = Session::boot(d.path().into());
+        let mut now = 0;
+        s.app_mut().apply(Action::QuickMenu);
+        for _ in 0..row.index() {
+            s.app_mut().apply(Action::GbaDown(Btn::Down));
+        }
+        s.app_mut().apply(Action::GbaDown(Btn::A));
+        if row == QuickRow::RetroAchievements {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while s.app().account_screen().unwrap().account.message != "Signed out" {
+                assert!(
+                    Instant::now() < deadline,
+                    "the account worker never initialized"
+                );
+                s.update(0.0);
+                std::thread::yield_now();
+            }
+        }
+        let wifi = s.app().wifi_screen().cloned();
+        let account_face = s.app().account_screen().map(|screen| screen.face().rgba);
+        let account = s.app().account_screen().map(|screen| {
+            assert!(screen.keyboard.is_none());
+            (
+                screen.account.clone(),
+                screen.selected,
+                screen.username.clone(),
+                screen.status.clone(),
+                screen.revision(),
+            )
+        });
+        assert!(wifi.is_some() || account.is_some());
+        assert!(wifi.as_ref().is_none_or(|screen| screen.keyboard.is_none()));
+        for event in [RawEvent::Down(Btn::L2), RawEvent::Up(Btn::L2)] {
+            now += 16;
+            s.feed([event], now);
+            assert_eq!(s.app().wifi_screen(), wifi.as_ref());
+            assert_eq!(
+                s.app().account_screen().map(|screen| (
+                    screen.account.clone(),
+                    screen.selected,
+                    screen.username.clone(),
+                    screen.status.clone(),
+                    screen.revision(),
+                )),
+                account
+            );
+            assert!(s.app().account_screen().is_none_or(|screen| {
+                screen.keyboard.is_none() && Some(screen.face().rgba) == account_face
+            }));
+        }
+        now += 16;
+        s.feed([RawEvent::Down(Btn::L2)], now);
+        for _ in 0..2 {
+            now += 16;
+            s.feed([RawEvent::Down(Btn::B), RawEvent::Up(Btn::B)], now);
+        }
+        assert!(s.app().wifi_screen().is_none());
+        assert!(s.app().account_screen().is_none());
+        assert!(matches!(s.app().phase(), Phase::Shelf));
+        s.app_mut().apply(Action::Insert);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(s.app().phase(), Phase::Playing { .. }) || !s.game_visible() {
+            assert!(Instant::now() < deadline, "the game never came up");
+            step(&mut s, &mut now, None);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..200 {
+            step(&mut s, &mut now, None);
+        }
+        assert!(drawn(&s).is_empty(), "{row:?} leaked a rewind hold");
+        step(&mut s, &mut now, Some(RawEvent::Up(Btn::L2)));
+        assert!(drawn(&s).is_empty());
+    }
 }
 
 #[test]

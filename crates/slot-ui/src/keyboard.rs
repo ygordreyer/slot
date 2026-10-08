@@ -9,8 +9,33 @@ use crate::{OUT_H, OUT_W};
 
 pub const KEY_COLS: usize = 10;
 pub const KEY_ROWS: usize = 4;
-const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789 ";
+const LETTERS: &[u8] = b"1234567890qwertyuiopasdfghjkl-zxcvbnm_. ";
 const SYMBOLS: &[u8] = b" !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Case {
+    Lower,
+    Shift,
+    Caps,
+}
+
+impl Case {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lower => "lowercase",
+            Self::Shift => "Shift",
+            Self::Caps => "CAPS",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Lower => Self::Shift,
+            Self::Shift => Self::Caps,
+            Self::Caps => Self::Lower,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyboardInput {
@@ -20,6 +45,7 @@ pub enum KeyboardInput {
     Right,
     Type,
     Delete,
+    Cancel,
     Caps,
     Symbols,
     CursorLeft,
@@ -42,7 +68,7 @@ pub struct Keyboard {
     text: String,
     cursor: usize,
     focus: usize,
-    caps: bool,
+    case: Case,
     symbols: bool,
     password: bool,
     masked: bool,
@@ -77,7 +103,7 @@ impl std::fmt::Debug for Keyboard {
         debug
             .field("cursor", &self.cursor)
             .field("focus", &self.focus)
-            .field("caps", &self.caps)
+            .field("case", &self.case)
             .field("symbols", &self.symbols)
             .field("password", &self.password)
             .field("masked", &self.masked)
@@ -104,7 +130,7 @@ impl Keyboard {
             text: String::new(),
             cursor: 0,
             focus: 0,
-            caps: false,
+            case: Case::Lower,
             symbols: false,
             password,
             masked: password,
@@ -150,7 +176,7 @@ impl Keyboard {
     pub fn key(&self, index: usize) -> char {
         let page = if self.symbols { SYMBOLS } else { LETTERS };
         let c = page.get(index).copied().unwrap_or(b' ') as char;
-        if self.caps {
+        if self.case != Case::Lower {
             c.to_ascii_uppercase()
         } else {
             c
@@ -166,11 +192,19 @@ impl Keyboard {
             KeyboardInput::Left => self.focus = row * KEY_COLS + (col + KEY_COLS - 1) % KEY_COLS,
             KeyboardInput::Right => self.focus = row * KEY_COLS + (col + 1) % KEY_COLS,
             KeyboardInput::Type if self.text.len() < self.max => {
-                self.text.insert(self.cursor, self.key(self.focus));
+                let key = self.key(self.focus);
+                self.text.insert(self.cursor, key);
                 self.cursor += 1;
                 self.hint.clear();
+                if self.case == Case::Shift && key.is_ascii_alphabetic() {
+                    self.case = Case::Lower;
+                }
             }
             KeyboardInput::Type => self.hint = format!("Maximum {} characters", self.max),
+            KeyboardInput::Cancel => {
+                self.clear_secret();
+                return KeyboardResult::Cancelled;
+            }
             KeyboardInput::Delete if self.text.is_empty() => return KeyboardResult::Cancelled,
             KeyboardInput::Delete if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -178,7 +212,7 @@ impl Keyboard {
                 self.hint.clear();
             }
             KeyboardInput::Delete => {}
-            KeyboardInput::Caps => self.caps = !self.caps,
+            KeyboardInput::Caps => self.case = self.case.next(),
             KeyboardInput::Symbols => self.symbols = !self.symbols,
             KeyboardInput::CursorLeft => self.cursor = self.cursor.saturating_sub(1),
             KeyboardInput::CursorRight => self.cursor = (self.cursor + 1).min(self.text.len()),
@@ -232,10 +266,10 @@ impl Keyboard {
                 "{} / {}    L / R: cursor    {}",
                 self.text.len(),
                 self.max,
-                if self.caps { "CAPS" } else { "lowercase" }
+                self.case.label()
             )
         } else {
-            self.hint.clone()
+            format!("{}    {}", self.hint, self.case.label())
         };
         panel_text(&mut face, &hint, 24, 110, 672, 22.0);
         for index in 0..KEY_COLS * KEY_ROWS {
@@ -254,7 +288,12 @@ impl Keyboard {
         }
         panel_legend(
             &mut face,
-            &[("A", "Type"), ("B", "Delete / Back"), ("X", "Caps")],
+            &[
+                ("A", "Type"),
+                ("B", "Delete / Back"),
+                ("X", "Shift"),
+                ("L2", "Cancel"),
+            ],
             394,
         );
         let mut legend = vec![("Y", "Symbols"), ("START", "Done")];
@@ -349,6 +388,126 @@ mod tests {
     use KeyboardInput::*;
 
     #[test]
+    fn letters_use_a_full_qwerty_grid() {
+        let mut k = Keyboard::new("Name", 1, 32, false);
+        assert_eq!(LETTERS.len(), KEY_COLS * KEY_ROWS);
+        let keys: String = (0..KEY_COLS * KEY_ROWS).map(|i| k.key(i)).collect();
+        assert_eq!(keys, "1234567890qwertyuiopasdfghjkl-zxcvbnm_. ");
+        k.focus = 10;
+        k.input(Type);
+        k.focus = 39;
+        k.input(Type);
+        assert_eq!(k.text(), "q ");
+    }
+
+    #[test]
+    fn shift_releases_after_one_letter_and_caps_stays_on() {
+        let mut k = Keyboard::new("Name", 1, 32, false);
+        k.focus = 20;
+        k.input(Caps);
+        k.input(Type);
+        k.focus = 34;
+        k.input(Type);
+        assert_eq!(k.text(), "Ab");
+        assert_eq!(k.case, Case::Lower);
+        k.input(Caps);
+        k.input(Caps);
+        k.focus = 20;
+        k.input(Type);
+        k.focus = 34;
+        k.input(Type);
+        assert_eq!(k.text(), "AbAB");
+        assert_eq!(k.case, Case::Caps);
+        k.input(Caps);
+        assert_eq!(k.case, Case::Lower);
+        for expected in [Case::Shift, Case::Caps, Case::Lower] {
+            k.input(Caps);
+            assert_eq!(k.case, expected);
+        }
+    }
+
+    #[test]
+    fn shift_survives_digits_punctuation_and_page_changes() {
+        let mut k = Keyboard::new("Name", 1, 32, false);
+        k.input(Caps);
+        k.input(Type);
+        k.focus = 20;
+        k.input(Type);
+        assert_eq!(k.text(), "1A");
+        assert_eq!(k.case, Case::Lower);
+        for case in [Case::Shift, Case::Caps] {
+            k.input(Caps);
+            for (i, &key) in LETTERS.iter().enumerate() {
+                assert_eq!(k.key(i), (key as char).to_ascii_uppercase());
+            }
+            k.focus = 29;
+            k.input(Type);
+            k.input(Symbols);
+            for i in 0..KEY_COLS * KEY_ROWS {
+                assert_eq!(k.key(i), SYMBOLS.get(i).copied().unwrap_or(b' ') as char);
+            }
+            k.focus = 1;
+            k.input(Type);
+            k.input(Symbols);
+            assert_eq!(k.case, case);
+            assert_eq!(k.key(20), 'A');
+        }
+        assert_eq!(k.text(), "1A-!-!");
+    }
+
+    #[test]
+    fn rejected_input_does_not_consume_shift() {
+        let mut k = Keyboard::new("Name", 1, 1, false);
+        k.input(Type);
+        k.input(Caps);
+        k.focus = 20;
+        k.input(Type);
+        assert_eq!(k.text(), "1");
+        assert_eq!(k.case, Case::Shift);
+        k.input(Delete);
+        k.input(Type);
+        assert_eq!(k.text(), "A");
+        assert_eq!(k.case, Case::Lower);
+    }
+
+    #[test]
+    fn cancel_preserves_regular_text_and_clears_secure_text() {
+        let mut k = Keyboard::new("Name", 8, 32, false);
+        k.input(Type);
+        assert_eq!(k.input(Cancel), KeyboardResult::Cancelled);
+        assert_eq!(k.text(), "1");
+        assert_eq!(k.cursor(), 1);
+        let mut secret = Keyboard::secret("Password", 8, 32);
+        secret.input(Type);
+        assert_eq!(secret.input(Cancel), KeyboardResult::Cancelled);
+        assert!(secret.text().is_empty());
+        assert_eq!(secret.cursor(), 0);
+        assert_eq!(k.input(Delete), KeyboardResult::Editing);
+        assert_eq!(k.input(Delete), KeyboardResult::Cancelled);
+        assert_eq!(secret.input(Delete), KeyboardResult::Cancelled);
+    }
+
+    #[test]
+    fn case_hints_and_legends_fit_on_both_pages() {
+        for password in [false, true] {
+            let mut k = Keyboard::new("Name", 1, 32, password);
+            for (case, label) in [
+                (Case::Lower, "lowercase"),
+                (Case::Shift, "Shift"),
+                (Case::Caps, "CAPS"),
+            ] {
+                assert_eq!(k.case, case);
+                assert_eq!(k.case.label(), label);
+                for _ in 0..2 {
+                    assert_eq!(k.face().rgba.len(), (OUT_W * OUT_H * 4) as usize);
+                    k.input(Symbols);
+                }
+                k.input(Caps);
+            }
+        }
+    }
+
+    #[test]
     fn debug_redacts_secret_text_and_all_confirmed_payloads() {
         let mut keyboard = Keyboard::secret("Password", 1, 127);
         keyboard.text.push_str("secret");
@@ -383,8 +542,10 @@ mod tests {
     fn every_printable_ascii_byte_is_available() {
         let mut k = Keyboard::new("Password", 8, 63, true);
         let mut available = std::collections::BTreeSet::new();
-        for input in [Caps, Caps, Symbols] {
-            k.input(input);
+        for input in [None, Some(Caps), Some(Caps), Some(Symbols)] {
+            if let Some(input) = input {
+                k.input(input);
+            }
             for i in 0..KEY_ROWS * KEY_COLS {
                 available.insert(k.key(i) as u8);
             }
@@ -398,6 +559,7 @@ mod tests {
     #[test]
     fn cursor_edits_preserve_case_and_password_display_is_optional() {
         let mut k = Keyboard::new("Password", 2, 3, true);
+        k.focus = 20;
         k.input(Type);
         k.input(Caps);
         k.input(Type);
@@ -407,10 +569,11 @@ mod tests {
         assert_eq!(k.display(), "aA|");
         k.input(CursorLeft);
         k.input(Right);
+        k.input(Caps);
         k.input(Type);
-        assert_eq!(k.text(), "aBA");
+        assert_eq!(k.text(), "aSA");
         k.input(Type);
-        assert_eq!(k.text(), "aBA");
+        assert_eq!(k.text(), "aSA");
         assert!(!k.hint.is_empty());
         k.input(Delete);
         assert_eq!(k.text(), "aA");
@@ -426,7 +589,7 @@ mod tests {
         keyboard.input(Type);
         assert_eq!(
             keyboard.input(Confirm),
-            KeyboardResult::Confirmed("a".into())
+            KeyboardResult::Confirmed("1".into())
         );
         assert!(keyboard.text().is_empty());
         keyboard.input(Type);
@@ -444,7 +607,7 @@ mod tests {
         }
         assert_eq!(
             k.input(Confirm),
-            KeyboardResult::Confirmed("aaaaaaaa".into())
+            KeyboardResult::Confirmed("11111111".into())
         );
         assert_eq!(
             Keyboard::new("Optional", 0, 10, false).input(Confirm),

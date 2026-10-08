@@ -545,6 +545,7 @@ impl WifiScreen {
                 Btn::Right => KeyboardInput::Right,
                 Btn::A => KeyboardInput::Type,
                 Btn::B => KeyboardInput::Delete,
+                Btn::L2 => KeyboardInput::Cancel,
                 Btn::X => KeyboardInput::Caps,
                 Btn::Y => KeyboardInput::Symbols,
                 Btn::L1 => KeyboardInput::CursorLeft,
@@ -947,7 +948,7 @@ mod tests {
             s.input(Btn::Start),
             Some(WifiEffect::Connect(WifiNetwork {
                 ssid: "Home".into(),
-                password: Some("aaaaaaaa".into())
+                password: Some("11111111".into())
             }))
         );
         assert!(s.busy);
@@ -1008,15 +1009,15 @@ mod tests {
         s.input(Btn::A);
         s.input(Btn::A);
         s.input(Btn::Start);
-        assert_eq!(s.keyboard.as_ref().unwrap().title, "Password for a");
+        assert_eq!(s.keyboard.as_ref().unwrap().title, "Password for 1");
         for _ in 0..8 {
             s.input(Btn::A);
         }
         assert_eq!(
             s.input(Btn::Start),
             Some(WifiEffect::Connect(WifiNetwork {
-                ssid: "a".into(),
-                password: Some("aaaaaaaa".into())
+                ssid: "1".into(),
+                password: Some("11111111".into())
             }))
         );
     }
@@ -1031,7 +1032,7 @@ mod tests {
         assert_eq!(
             s.input(Btn::Start),
             Some(WifiEffect::Connect(WifiNetwork {
-                ssid: "a".into(),
+                ssid: "1".into(),
                 password: None
             }))
         );
