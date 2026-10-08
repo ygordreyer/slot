@@ -1,0 +1,62 @@
+Upstream: libretro/glsl-shaders
+Commit: 435612f
+Files are copied byte-for-byte, with all upstream headers intact.
+MPL source remains available on the card at the paths below.
+Preset recipes have no separate upstream license header; redistribution
+is based on their trivial configuration and the licenses of their pass sources.
+
+FILE | UPSTREAM PATH | COMMIT | LICENSE
+crt/shaders/zfast_crt.glsl | crt/shaders/zfast_crt.glsl | 435612f | GPL-2.0-or-later
+crt/zfast-crt.glslp | crt/zfast-crt.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/agb001-gba-color-motionblur.glslp | handheld/agb001-gba-color-motionblur.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/ags001-gba-color-motionblur.glslp | handheld/ags001-gba-color-motionblur.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/ags001.glslp | handheld/ags001.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/dot.glslp | handheld/dot.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/gba-color.glslp | handheld/gba-color.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/lcd1x.glslp | handheld/lcd1x.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+handheld/shaders/color/gba-color.glsl | handheld/shaders/color/gba-color.glsl | 435612f | Public domain
+handheld/shaders/dot.glsl | handheld/shaders/dot.glsl | 435612f | Public domain
+handheld/shaders/lcd1x.glsl | handheld/shaders/lcd1x.glsl | 435612f | GPL-2.0-or-later
+handheld/shaders/mgba/agb001.glsl | handheld/shaders/mgba/agb001.glsl | 435612f | MPL-2.0
+handheld/shaders/mgba/ags001-light.glsl | handheld/shaders/mgba/ags001-light.glsl | 435612f | MPL-2.0
+handheld/shaders/mgba/ags001.glsl | handheld/shaders/mgba/ags001.glsl | 435612f | MPL-2.0
+handheld/shaders/zfast_lcd.glsl | handheld/shaders/zfast_lcd.glsl | 435612f | GPL-2.0-or-later
+handheld/zfast-lcd.glslp | handheld/zfast-lcd.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+interpolation/shaders/sharp-bilinear.glsl | interpolation/shaders/sharp-bilinear.glsl | 435612f | Public domain
+interpolation/sharp-bilinear.glslp | interpolation/sharp-bilinear.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+motionblur/response-time.glslp | motionblur/response-time.glslp | 435612f | Preset recipe for the licensed passes listed below (no separate header)
+motionblur/shaders/response-time.glsl | motionblur/shaders/response-time.glsl | 435612f | GPL-2.0-or-later
+
+Cost estimates, not device timings. Output is GBA 240x160 to 720x480.
+Fetches count texture sampling instructions per output pixel per pass,
+not individual texels fetched by bilinear hardware. Final explicit scales
+also require one 720x480 copy pass (one fetch per pixel), listed as +copy.
+Source history needs one retained 240x160 frame upload per source update.
+Reference budget: lcd-grid-v2-gba-color-motionblur = 8@240x160,
+4@720x480, 1@720x480, +copy = 2,380,800 sampling instructions/frame.
+Limit is approximately 4,761,600 instructions/frame. ALU-heavy effects
+need device verification even when this bandwidth estimate fits.
+
+PRESET | PASSES | OUTPUT SIZES | FETCHES/PIXEL | LICENSES
+handheld/gba-color | 1+copy | 240x160;720x480 copy | 1;1 | Public domain
+handheld/ags001 | 2+copy | 960x640;720x480;720x480 copy | 1;2;1 | MPL-2.0
+handheld/agb001-gba-color-motionblur | 3+copy | 240x160;960x640;720x480;720x480 copy | 8;1;1;1 | GPL-2.0-or-later;MPL-2.0;Public domain
+handheld/ags001-gba-color-motionblur | 4+copy | 240x160;960x640;960x640;720x480;720x480 copy | 8;1;1;2;1 | GPL-2.0-or-later;MPL-2.0;Public domain
+handheld/dot | 1 | 720x480 | 9 | Public domain
+handheld/lcd1x | 1+copy | 720x480;720x480 copy | 1;1 | GPL-2.0-or-later
+interpolation/sharp-bilinear | 1 | 720x480 | 1 (bilinear) | Public domain
+motionblur/response-time | 1 | 720x480 | 8 | GPL-2.0-or-later
+crt/zfast-crt | 1 | 720x480 | 1 (bilinear) | GPL-2.0-or-later
+handheld/zfast-lcd | 1+copy | 720x480;720x480 copy | 1 (bilinear);1 | GPL-2.0-or-later
+
+Excluded candidates:
+lcd-grid-v2-gba-color (2+copy,720x480 each,4;1;1 fetches) and
+lcd-grid-v2-gba-color-motionblur (3+copy,240x160;720x480;720x480;
+720x480 copy,8;4;1;1 fetches): lcd-grid-v2.glsl has no license header
+or accompanying license in this checkout. It also uses array constructors
+requiring newer GLSL than GLES 2. No redistribution permission inferred.
+agb001 (2+copy,960x640;720x480;720x480 copy,1;1;1 fetches): stock.glsl
+has no license header or accompanying license. The licensed color-motionblur
+variant is included instead.
+No GB/GBC-only presets are included. No candidate exceeded the stated
+sampling budget; exclusions above concern licensing and GLES 2 syntax.

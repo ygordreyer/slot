@@ -21,7 +21,7 @@ pub enum Look {
     /// The frame alone, nearest neighbour at 3x: the mask is a single white texel.
     Plain,
     /// A RetroArch shader off the card.
-    Retro(RetroShader),
+    Retro(Box<RetroShader>),
 }
 
 pub struct GamePass {
@@ -34,6 +34,7 @@ pub struct GamePass {
     /// One white texel, which turns `GAME_FRAG`'s multiply into a no-op for `Look::Plain`.
     white: gl::types::GLuint,
     look: Look,
+    shader_error: Option<String>,
     /// Frames uploaded, for a shader's `FrameCount`.
     frames: u32,
     u_rect: gl::types::GLint,
@@ -48,10 +49,16 @@ pub struct GamePass {
 impl GamePass {
     pub fn new() -> Result<Self, GfxError> {
         let prog = crate::shaders::program(RECT_VERT, GAME_FRAG)?;
-        let game = crate::gl::texture(SRC_W, SRC_H, gl::NEAREST, gl::CLAMP_TO_EDGE, gl::BGRA, None);
-        // Black to begin with, so a blending shader's first frame blends with nothing rather
-        // than with whatever the driver left in fresh memory.
+        // Both textures start black because the first upload swaps game into prev.
         let black = vec![0u8; (SRC_W * SRC_H * 4) as usize];
+        let game = crate::gl::texture(
+            SRC_W,
+            SRC_H,
+            gl::NEAREST,
+            gl::CLAMP_TO_EDGE,
+            gl::BGRA,
+            Some(&black),
+        );
         let prev = crate::gl::texture(
             SRC_W,
             SRC_H,
@@ -95,6 +102,7 @@ impl GamePass {
             mask,
             white,
             look: Look::Lcd,
+            shader_error: None,
             frames: 0,
             u_rect,
             u_bright,
@@ -127,9 +135,27 @@ impl GamePass {
         self.look = look;
     }
 
+    pub fn parameters(&self) -> &[crate::preset::Parameter] {
+        match &self.look {
+            Look::Retro(s) => s.parameters(),
+            _ => &[],
+        }
+    }
+    pub fn set_parameter(&mut self, name: &str, value: f32) {
+        if let Look::Retro(s) = &mut self.look {
+            s.set_parameter(name, value);
+        }
+    }
+    pub fn take_shader_error(&mut self) -> Option<String> {
+        self.shader_error.take()
+    }
+
     pub fn upload(&mut self, xrgb8888: &[u8]) {
         if xrgb8888.len() < (SRC_W * SRC_H * 4) as usize {
             return;
+        }
+        if let Look::Retro(shader) = &self.look {
+            shader.capture_frame(xrgb8888, self.frames);
         }
         // Last frame becomes `prev`, and its texture takes this one.
         std::mem::swap(&mut self.game, &mut self.prev);
@@ -151,16 +177,16 @@ impl GamePass {
         }
     }
 
-    pub fn draw(&self, quad: &Quad) {
+    pub fn draw(&mut self, quad: &Quad) {
         self.draw_source(self.game, self.prev, quad, self.src, true);
     }
 
-    pub fn draw_still(&self, tex: gl::types::GLuint, quad: &Quad) {
+    pub fn draw_still(&mut self, tex: gl::types::GLuint, quad: &Quad) {
         self.draw_source(tex, tex, quad, WHOLE_TEXTURE, false);
     }
 
     fn draw_source(
-        &self,
+        &mut self,
         tex: gl::types::GLuint,
         prev: gl::types::GLuint,
         quad: &Quad,
@@ -174,8 +200,14 @@ impl GamePass {
             Look::Retro(shader) => {
                 let source = if live { self.shader_src } else { WHOLE_TEXTURE };
                 let output = shader_rect(rect, source, live && self.shader_actual);
-                shader.draw(tex, prev, output, source, self.frames);
-                return;
+                match shader.draw(tex, prev, output, source, self.frames) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        self.shader_error = Some(e.to_string());
+                        self.look = Look::Lcd;
+                        self.mask
+                    }
+                }
             }
         };
         let (x, y, w, h) = rect;
@@ -218,6 +250,136 @@ fn shader_rect(rect: (f32, f32, f32, f32), src: [f32; 4], actual: bool) -> (f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod mock_gl {
+        use gl::types::*;
+        use std::cell::RefCell;
+        use std::collections::BTreeMap;
+        use std::ffi::c_void;
+
+        #[derive(Default)]
+        struct Textures {
+            next: GLuint,
+            bound: GLuint,
+            pixels: BTreeMap<GLuint, Vec<u8>>,
+        }
+        thread_local! {
+            static TEXTURES: RefCell<Textures> = RefCell::new(Textures::default());
+        }
+
+        macro_rules! stub {
+            ($name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty, $value:expr)?) => {
+                unsafe extern "system" fn $name($($arg: $ty),*) $(-> $ret)? {
+                    $($value)?
+                }
+            };
+        }
+        stub!(create_shader(_kind: GLenum) -> GLuint, 1);
+        stub!(create_program() -> GLuint, 1);
+        stub!(shader_source(_id: GLuint, _n: GLsizei, _text: *const *const GLchar, _len: *const GLint));
+        stub!(one_id(_id: GLuint));
+        stub!(attach_shader(_program: GLuint, _shader: GLuint));
+        stub!(bind_attrib(_program: GLuint, _index: GLuint, _name: *const GLchar));
+        stub!(uniform_location(_program: GLuint, _name: *const GLchar) -> GLint, 0);
+        stub!(uniform1i(_location: GLint, _value: GLint));
+        stub!(uniform2f(_location: GLint, _x: GLfloat, _y: GLfloat));
+        stub!(pixel_store(_key: GLenum, _value: GLint));
+        stub!(tex_parameter(_target: GLenum, _key: GLenum, _value: GLint));
+        stub!(delete_textures(_n: GLsizei, _ids: *const GLuint));
+
+        unsafe extern "system" fn status(_id: GLuint, _key: GLenum, value: *mut GLint) {
+            *value = 1;
+        }
+        unsafe extern "system" fn gen_textures(n: GLsizei, ids: *mut GLuint) {
+            TEXTURES.with_borrow_mut(|textures| {
+                for i in 0..n as usize {
+                    textures.next += 1;
+                    *ids.add(i) = textures.next;
+                }
+            });
+        }
+        unsafe extern "system" fn bind_texture(_target: GLenum, id: GLuint) {
+            TEXTURES.with_borrow_mut(|textures| textures.bound = id);
+        }
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "system" fn tex_image(
+            _target: GLenum,
+            _level: GLint,
+            _internal: GLint,
+            w: GLsizei,
+            h: GLsizei,
+            _border: GLint,
+            _format: GLenum,
+            _kind: GLenum,
+            pixels: *const c_void,
+        ) {
+            // Poison unspecified allocations so zero-filled driver memory cannot hide the bug.
+            let len = (w * h * 4) as usize;
+            let data = if pixels.is_null() {
+                vec![0xcd; len]
+            } else {
+                std::slice::from_raw_parts(pixels.cast::<u8>(), len).to_vec()
+            };
+            TEXTURES.with_borrow_mut(|textures| textures.pixels.insert(textures.bound, data));
+        }
+        #[allow(clippy::too_many_arguments)]
+        unsafe extern "system" fn tex_sub_image(
+            _target: GLenum,
+            _level: GLint,
+            _x: GLint,
+            _y: GLint,
+            w: GLsizei,
+            h: GLsizei,
+            _format: GLenum,
+            _kind: GLenum,
+            pixels: *const c_void,
+        ) {
+            let data =
+                std::slice::from_raw_parts(pixels.cast::<u8>(), (w * h * 4) as usize).to_vec();
+            TEXTURES.with_borrow_mut(|textures| textures.pixels.insert(textures.bound, data));
+        }
+
+        pub fn load() {
+            gl::load_with(|name| match name {
+                "glCreateShader" => create_shader as *const c_void,
+                "glCreateProgram" => create_program as *const c_void,
+                "glShaderSource" => shader_source as *const c_void,
+                "glCompileShader" | "glDeleteShader" | "glLinkProgram" | "glUseProgram"
+                | "glDeleteProgram" => one_id as *const c_void,
+                "glGetShaderiv" | "glGetProgramiv" => status as *const c_void,
+                "glAttachShader" => attach_shader as *const c_void,
+                "glBindAttribLocation" => bind_attrib as *const c_void,
+                "glGetUniformLocation" => uniform_location as *const c_void,
+                "glUniform1i" => uniform1i as *const c_void,
+                "glUniform2f" => uniform2f as *const c_void,
+                "glGenTextures" => gen_textures as *const c_void,
+                "glBindTexture" => bind_texture as *const c_void,
+                "glPixelStorei" => pixel_store as *const c_void,
+                "glTexImage2D" => tex_image as *const c_void,
+                "glTexSubImage2D" => tex_sub_image as *const c_void,
+                "glTexParameteri" => tex_parameter as *const c_void,
+                "glDeleteTextures" => delete_textures as *const c_void,
+                _ => std::ptr::null(),
+            });
+        }
+        pub fn pixels(id: GLuint) -> Vec<u8> {
+            TEXTURES.with_borrow(|textures| textures.pixels[&id].clone())
+        }
+    }
+
+    #[test]
+    fn first_upload_leaves_previous_texture_black() {
+        mock_gl::load();
+        let mut pass = GamePass::new().unwrap();
+        let frame = vec![128; (SRC_W * SRC_H * 4) as usize];
+        pass.upload(&frame);
+        assert_eq!(mock_gl::pixels(pass.game), frame);
+        assert!(mock_gl::pixels(pass.prev).iter().all(|&byte| byte == 0));
+        let next = vec![64; frame.len()];
+        pass.upload(&next);
+        assert_eq!(mock_gl::pixels(pass.prev), frame);
+        assert_eq!(mock_gl::pixels(pass.game), next);
+    }
 
     #[test]
     fn custom_shader_preserves_actual_and_stretched_game_bounds() {

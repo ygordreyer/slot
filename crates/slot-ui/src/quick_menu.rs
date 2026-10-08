@@ -274,7 +274,11 @@ impl QuickMenu<'_> {
             push(out, left_tex, vx + pad - CARET_GAP - lw as f32, y, lw, lh);
         }
         let [back, change, open] = faces.legend;
-        let other = if self.row.opens() { open } else { change };
+        let other = if self.row.opens() || self.row == QuickRow::Shader {
+            open
+        } else {
+            change
+        };
         for (tex, w, x) in centred_hints(&[back, other], LEGEND_GAP) {
             push(out, tex, x, LEGEND_Y, w, HINT_H);
         }

@@ -23,10 +23,11 @@ pub enum Toast {
     NoCheats,
     /// A shader from `Shaders/` that the driver would not compile. The LCD look is back.
     ShaderFailed,
+    NoShaderParams,
 }
 
 impl Toast {
-    pub const ALL: [Toast; 13] = [
+    pub const ALL: [Toast; 14] = [
         Toast::StateSaved,
         Toast::StateLoaded,
         Toast::NeedsGpsp,
@@ -40,6 +41,7 @@ impl Toast {
         Toast::CheatsOff,
         Toast::NoCheats,
         Toast::ShaderFailed,
+        Toast::NoShaderParams,
     ];
 
     pub fn index(self) -> usize {
@@ -61,6 +63,7 @@ impl Toast {
             Toast::CheatsOff => "Cheats Off",
             Toast::NoCheats => "No cheats found",
             Toast::ShaderFailed => "Shader failed",
+            Toast::NoShaderParams => "No shader parameters",
         }
     }
 }
