@@ -1,3 +1,5 @@
+//! Ordered Home preferences and Link radio commands.
+
 #[cfg(feature = "device")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "device")]
@@ -54,6 +56,13 @@ pub enum RadioJob {
 pub trait RadioJobs: Send {
     fn ask(&mut self, job: RadioJob);
 
+    fn home_on(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (done, ready) = std::sync::mpsc::channel();
+        self.ask(RadioJob::Home(true));
+        let _ = done.send(());
+        ready
+    }
+
     fn warmed(&self) -> bool;
 
     /// Observed home association plus a LAN address, never the desired menu flag.
@@ -74,7 +83,13 @@ impl RadioJobs for RadioQueue {
         if job == RadioJob::Home(false) {
             HOME_CONNECTED.store(false, Ordering::SeqCst);
         }
-        let _ = queue().send(job);
+        let _ = queue().send((job, None));
+    }
+
+    fn home_on(&mut self) -> std::sync::mpsc::Receiver<()> {
+        let (done, ready) = channel();
+        let _ = queue().send((RadioJob::Home(true), Some(done)));
+        ready
     }
 
     fn warmed(&self) -> bool {
@@ -91,12 +106,15 @@ static WARM: AtomicBool = AtomicBool::new(false);
 static HOME_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "device")]
-fn queue() -> &'static Sender<RadioJob> {
-    static Q: OnceLock<Sender<RadioJob>> = OnceLock::new();
+type QueuedRadioJob = (RadioJob, Option<Sender<()>>);
+
+#[cfg(feature = "device")]
+fn queue() -> &'static Sender<QueuedRadioJob> {
+    static Q: OnceLock<Sender<QueuedRadioJob>> = OnceLock::new();
     Q.get_or_init(|| {
-        let (tx, rx) = channel::<RadioJob>();
+        let (tx, rx) = channel::<QueuedRadioJob>();
         std::thread::spawn(move || loop {
-            let job = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            let (job, done) = match rx.recv_timeout(std::time::Duration::from_secs(3)) {
                 Ok(job) => job,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -129,6 +147,9 @@ fn queue() -> &'static Sender<RadioJob> {
                     WARM.store(false, Ordering::SeqCst);
                     down();
                 }
+            }
+            if let Some(done) = done {
+                let _ = done.send(());
             }
         });
         tx

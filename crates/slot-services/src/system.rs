@@ -5,6 +5,7 @@ use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub fn private_write(path: &Path, text: &str) -> io::Result<()> {
@@ -50,6 +51,18 @@ pub fn output_timeout_details(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, CommandError> {
+    output_timeout_cancellable(program, args, timeout, &AtomicBool::new(false))
+}
+
+pub fn output_timeout_cancellable(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    cancelled: &AtomicBool,
+) -> Result<String, CommandError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CommandError::new("SCAN_CANCELLED"));
+    }
     let deadline = Instant::now() + timeout;
     let bundled = std::env::var_os("SLOT_ROOT")
         .map(PathBuf::from)
@@ -85,6 +98,13 @@ pub fn output_timeout_details(
         bytes
     });
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            let _ = errors.join();
+            return Err(CommandError::new("SCAN_CANCELLED"));
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 let bytes = reader.join().unwrap_or_default();
@@ -234,6 +254,27 @@ pub fn external_radio_owner(ours: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_scan_kills_and_reaps_its_process() {
+        use std::sync::Arc;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let worker = std::thread::spawn(move || {
+            output_timeout_cancellable(
+                "sh",
+                &["-c", "exec sleep 5"],
+                Duration::from_secs(10),
+                &signal,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let at = Instant::now();
+        cancelled.store(true, Ordering::Release);
+        let error = worker.join().unwrap().err().unwrap();
+        assert_eq!(error.code, "SCAN_CANCELLED");
+        assert!(at.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn status_matches_complete_keys_only() {
         let s = "old_freq=123\nfreq=2412\nwpa_state=COMPLETED\n";

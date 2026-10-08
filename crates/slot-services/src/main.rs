@@ -1,6 +1,7 @@
 //! Slot-owned home and Link networking. No commands run on the render thread.
 mod config;
 mod radio;
+mod scan;
 mod system;
 
 use radio::{connected, Home, Interface};
@@ -274,6 +275,7 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
     let mut ntp_at = Instant::now();
     let mut tick_at = Instant::now();
     let mut powered_down = false;
+    let mut scan = scan::Scan::default();
     unsafe {
         libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
@@ -312,15 +314,29 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
                 }
                 match (domain, action) {
                     ("home", "on" | "off") => {
+                        if action == "off" {
+                            scan.cancel();
+                        }
                         home.enable(action == "on", root);
                         respond(&mut stream, 0, "ACCEPTED");
                     }
                     ("home", "scan") => {
                         let mut ours = home.interface.pids();
                         ours.extend(link.interface.pids());
-                        match home.scan(link.busy(), &ours) {
-                            Ok(scan) => respond(&mut stream, 0, &scan),
-                            Err(error) => respond(&mut stream, 1, error),
+                        if scan.busy() {
+                            respond(&mut stream, 1, "SCAN_BUSY");
+                        } else {
+                            match home.prepare_scan(link.busy(), &ours, &mut powered_down) {
+                                Ok(()) => {
+                                    let _ = scan.start(move |cancelled| {
+                                        match radio::scan(&cancelled) {
+                                            Ok(result) => respond(&mut stream, 0, &result),
+                                            Err(error) => respond(&mut stream, 1, error),
+                                        }
+                                    });
+                                }
+                                Err(error) => respond(&mut stream, 1, error),
+                            }
                         }
                     }
                     ("home", action) if action.starts_with("connect:") => {
@@ -370,6 +386,7 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
                         respond(&mut stream, 0, "STOPPING");
                     }
                     ("link", "warm") => {
+                        scan.cancel();
                         warm = Some((owner.into(), Instant::now() + Duration::from_secs(60)));
                         let ready = radio::net_exists("wlan1");
                         if ready {
@@ -399,11 +416,15 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
                     }
                     // Link over the home network needs no radio of its own, so this verb takes
                     // no lease: it only says whether Home Wi-Fi is up and on which address.
-                    ("link", "lan") => match home_lan_address(&home) {
-                        Some(ip) => respond(&mut stream, 0, &ip.to_string()),
-                        None => respond(&mut stream, 1, "NO_HOME_LAN"),
-                    },
+                    ("link", "lan") => {
+                        scan.cancel();
+                        match home_lan_address(&home) {
+                            Some(ip) => respond(&mut stream, 0, &ip.to_string()),
+                            None => respond(&mut stream, 1, "NO_HOME_LAN"),
+                        }
+                    }
                     ("link", "host" | "join") => {
+                        scan.cancel();
                         if let Err((mut reply, error)) =
                             link.start(action, owner, stream, &mut home)
                         {
@@ -417,6 +438,7 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }
+        scan.reap();
         let now = Instant::now();
         if now >= ntp_at {
             ensure_time();
@@ -426,7 +448,7 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
             link.tick();
             let mut ours = home.interface.pids();
             ours.extend(link.interface.pids());
-            home.tick(root, link.busy(), link.freq, &ours);
+            home.tick(root, link.busy(), link.freq, &ours, &mut powered_down);
             if home.interface.wpa.is_some() {
                 powered_down = false;
             }
@@ -451,8 +473,14 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    scan.cancel();
     link.clear(1, "STOPPING");
     home.enable(false, root);
+    let mut ours = home.interface.pids();
+    ours.extend(link.interface.pids());
+    if !system::external_radio_owner(&ours) {
+        let _ = output("rfkill", &["block", "wifi"]);
+    }
     let _ = fs::remove_file(socket);
     Ok(())
 }

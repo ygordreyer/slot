@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
 use slot_input::Btn;
 use slot_store::{forget_wifi, read_wifi, save_wifi, WifiNetwork};
@@ -19,7 +21,22 @@ pub struct NearbyNetwork {
 /// Parse `iw dev wlan0 scan`, retaining the strongest BSS for each visible SSID.
 pub fn parse_scan(text: &str) -> Vec<NearbyNetwork> {
     let mut networks = BTreeMap::<String, NearbyNetwork>::new();
-    for block in text.split("BSS ").skip(1) {
+    let mut blocks = Vec::new();
+    let mut start = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if bss_header(line) {
+            if let Some(start) = start {
+                blocks.push(&text[start..offset]);
+            }
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    if let Some(start) = start {
+        blocks.push(&text[start..]);
+    }
+    for block in blocks {
         let mut ssid = None;
         let mut signal = None;
         let mut privacy = false;
@@ -73,6 +90,23 @@ pub fn parse_scan(text: &str) -> Vec<NearbyNetwork> {
     let mut networks: Vec<_> = networks.into_values().collect();
     networks.sort_by(|a, b| b.signal.cmp(&a.signal).then_with(|| a.ssid.cmp(&b.ssid)));
     networks
+}
+
+fn bss_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("BSS ") else {
+        return false;
+    };
+    let Some(mac) = rest.as_bytes().get(..17) else {
+        return false;
+    };
+    mac.iter().enumerate().all(|(i, b)| {
+        if i % 3 == 2 {
+            *b == b':'
+        } else {
+            b.is_ascii_hexdigit()
+        }
+    // iw prints "(on <dev>)" only when the reply carries an interface index.
+    }) && matches!(rest.as_bytes().get(17), None | Some(b'(' | b' ' | b'\r' | b'\n'))
 }
 
 /// iw escapes non-printable bytes and literal backslashes as hexadecimal bytes.
@@ -165,7 +199,6 @@ impl WifiRadio for DeviceWifi {
         self.command("home", "on").map(|_| ())
     }
     fn scan(&mut self) -> Result<Vec<NearbyNetwork>, String> {
-        self.enable()?;
         self.command("home", "scan").map(|text| parse_scan(&text))
     }
     fn reload(&mut self) -> Result<(), String> {
@@ -210,6 +243,8 @@ fn wifi_error(error: &str) -> String {
         "CONFIG_TOO_MANY_NETWORKS" => "32 networks saved. Forget one first",
         "CONFIG_WRITE" | "CONFIG_SERIALIZE" => "Could not save Wi-Fi networks",
         code if code.starts_with("CONFIG_") => "Saved Wi-Fi networks could not be read",
+        "SCAN_BUSY" => "A Wi-Fi scan is already running",
+        "SCAN_CANCELLED" => "Wi-Fi scan cancelled",
         "LINK_BUSY" => "Wi-Fi is in use by Link",
         "EXTERNAL_OWNER" => "Wi-Fi is in use by another app",
         "HOME_DISABLED" => "Home Wi-Fi is Off",
@@ -241,17 +276,33 @@ pub enum WifiReply {
     Status(Result<WifiStatus, String>),
 }
 
+type WifiJob = (u64, WifiEffect, Option<Receiver<()>>);
+
 pub struct WifiWorker {
-    jobs: Sender<(u64, WifiEffect)>,
+    jobs: Sender<WifiJob>,
     replies: Receiver<(u64, WifiReply)>,
+    generation: Arc<AtomicU64>,
 }
 
 impl WifiWorker {
     pub fn new(root: PathBuf, mut radio: Box<dyn WifiRadio>) -> Self {
-        let (jobs, receive) = mpsc::channel();
+        let (jobs, receive) = mpsc::channel::<WifiJob>();
         let (send, replies) = mpsc::channel();
+        let current = Arc::new(AtomicU64::new(0));
+        let generation = current.clone();
         std::thread::spawn(move || {
-            while let Ok((generation, job)) = receive.recv() {
+            while let Ok((generation, job, ready)) = receive.recv() {
+                if current.load(Ordering::Acquire) != generation {
+                    continue;
+                }
+                if let Some(ready) = ready {
+                    if ready.recv().is_err() {
+                        continue;
+                    }
+                }
+                if current.load(Ordering::Acquire) != generation {
+                    continue;
+                }
                 let reply = match job {
                     WifiEffect::Scan | WifiEffect::Enable => WifiReply::Scan((|| {
                         if job == WifiEffect::Enable {
@@ -280,7 +331,11 @@ impl WifiWorker {
                 }
             }
         });
-        Self { jobs, replies }
+        Self {
+            jobs,
+            replies,
+            generation,
+        }
     }
 
     pub fn device_or_host(root: &Path) -> Self {
@@ -292,10 +347,26 @@ impl WifiWorker {
     }
 
     pub fn ask(&self, generation: u64, effect: WifiEffect) {
-        let _ = self.jobs.send((generation, effect));
+        self.generation.store(generation, Ordering::Release);
+        let _ = self.jobs.send((generation, effect, None));
     }
+    pub fn scan_after_enable(&self, generation: u64, ready: Receiver<()>) {
+        self.generation.store(generation, Ordering::Release);
+        let _ = self.jobs.send((generation, WifiEffect::Scan, Some(ready)));
+    }
+
+    pub fn cancel(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Release);
+    }
+
     pub fn take(&self) -> Option<(u64, WifiReply)> {
         self.replies.try_recv().ok()
+    }
+}
+
+impl Drop for WifiWorker {
+    fn drop(&mut self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -535,6 +606,9 @@ impl WifiScreen {
                 self.busy = false;
                 self.connecting = None;
                 self.status = wifi_error(&error);
+                if self.status == "Home Wi-Fi is Off" {
+                    self.enabled = false;
+                }
             }
             WifiReply::Changed(Ok(saved)) => {
                 self.saved = saved;
@@ -586,6 +660,94 @@ mod tests {
         assert_eq!(decode_ssid("a\\x5cb\\xc3\\xa9"), Some("a\\bé".into()));
         assert_eq!(decode_ssid("\\x00"), Some("\0".into()));
         assert!(parse_scan("BSS 00\nsignal: -20 dBm\nSSID: \\x00\n").is_empty());
+    }
+
+    #[test]
+    fn iw_headers_do_not_split_ssids_or_information_elements() {
+        let text = "BSS aa:bb:cc:dd:ee:01(on wlan0)\n\tcapability: ESS\n\tsignal: -30.00 dBm\n\tSSID: Cafe BSS Lounge\nBSS aa:bb:cc:dd:ee:02(on wlan0) -- associated\n\tcapability: ESS Privacy\n\tsignal: -40.00 dBm\n\tSSID: Home\n\tBSS Load:\n\t\t * station count: 2\n\tRSN:\n\t\t * Authentication suites: PSK\n";
+        let networks = parse_scan(text);
+        assert_eq!(networks.len(), 2);
+        assert_eq!(networks[0].ssid, "Cafe BSS Lounge");
+        assert!(!networks[0].secured);
+        assert_eq!(networks[1].ssid, "Home");
+        assert!(networks[1].secured && networks[1].supported);
+        assert!(!bss_header("\tBSS aa:bb:cc:dd:ee:03(on wlan0)"));
+        assert!(!bss_header("BSS Load:"));
+        assert!(!bss_header("BSS aa:bb:cc:dd:ee:gg(on wlan0)"));
+        assert_eq!(
+            wifi_error("slot-services: 1 SCAN_BUSY"),
+            "A Wi-Fi scan is already running"
+        );
+    }
+
+    #[test]
+    fn stale_jobs_are_skipped_before_radio_or_storage_changes() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        struct Radio {
+            calls: Arc<Mutex<Vec<&'static str>>>,
+            started: Sender<()>,
+            release: Receiver<()>,
+        }
+        impl WifiRadio for Radio {
+            fn enable(&mut self) -> Result<(), String> {
+                self.calls.lock().unwrap().push("home on");
+                Ok(())
+            }
+            fn scan(&mut self) -> Result<Vec<NearbyNetwork>, String> {
+                self.calls.lock().unwrap().push("scan");
+                self.started.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                Err("HOME_DISABLED".into())
+            }
+            fn reload(&mut self) -> Result<(), String> {
+                self.calls.lock().unwrap().push("reload");
+                Ok(())
+            }
+            fn connect(&mut self, _: &str) -> Result<(), String> {
+                self.calls.lock().unwrap().push("connect");
+                Ok(())
+            }
+            fn status(&mut self) -> Result<WifiStatus, String> {
+                self.calls.lock().unwrap().push("status");
+                Ok(WifiStatus::default())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (started, start) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let worker = WifiWorker::new(
+            root.path().into(),
+            Box::new(Radio {
+                calls: calls.clone(),
+                started,
+                release: wait,
+            }),
+        );
+        worker.ask(1, WifiEffect::Scan);
+        start.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.ask(2, WifiEffect::Enable);
+        worker.ask(
+            2,
+            WifiEffect::Connect(WifiNetwork {
+                ssid: "Stale".into(),
+                password: None,
+            }),
+        );
+        worker.cancel(3);
+        worker.ask(3, WifiEffect::Status);
+        release.send(()).unwrap();
+        let (_, reply) = worker.replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(reply, WifiReply::Scan(Err(ref e)) if e == "HOME_DISABLED"));
+        let (generation, _) = worker.replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(generation, 3);
+        assert_eq!(*calls.lock().unwrap(), vec!["scan", "status"]);
+        assert!(read_wifi(root.path()).unwrap().is_empty());
+        let mut screen = WifiScreen::new(true);
+        screen.reply(reply);
+        assert!(!screen.enabled);
+        assert_eq!(screen.status, "Home Wi-Fi is Off");
     }
 
     fn screen(saved: Vec<WifiNetwork>) -> WifiScreen {

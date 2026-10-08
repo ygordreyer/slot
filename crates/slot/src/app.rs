@@ -754,9 +754,10 @@ impl App {
         else {
             return;
         };
-        if effect != WifiEffect::Back {
-            self.wifi_generation = self.wifi_generation.wrapping_add(1);
-            self.wifi_status_pending = false;
+        self.wifi_generation = self.wifi_generation.wrapping_add(1);
+        self.wifi_status_pending = false;
+        if let Some(worker) = &self.wifi_worker {
+            worker.cancel(self.wifi_generation);
         }
         match effect {
             WifiEffect::Back => {
@@ -768,7 +769,10 @@ impl App {
             WifiEffect::Enable => {
                 self.state.home_wifi_enabled = true;
                 self.persist();
-                self.wifi_ask(effect);
+                let ready = self.radio.home_on();
+                if let Some(worker) = &self.wifi_worker {
+                    worker.scan_after_enable(self.wifi_generation, ready);
+                }
             }
             _ => self.wifi_ask(effect),
         }
@@ -1657,6 +1661,10 @@ impl App {
             }
             QuickRow::Rumble => s.rumble = !s.rumble,
             QuickRow::HomeWifi => {
+                self.wifi_generation = self.wifi_generation.wrapping_add(1);
+                if let Some(worker) = &self.wifi_worker {
+                    worker.cancel(self.wifi_generation);
+                }
                 s.home_wifi_enabled = !s.home_wifi_enabled;
                 self.radio.ask(RadioJob::Home(s.home_wifi_enabled));
             }
@@ -2707,6 +2715,10 @@ impl App {
     /// The one function every doze actually goes through: `LidClose` and
     /// `PowerTap` by way of `power_press` both return
     fn doze(&mut self) {
+        self.wifi_generation = self.wifi_generation.wrapping_add(1);
+        if let Some(worker) = &self.wifi_worker {
+            worker.cancel(self.wifi_generation);
+        }
         self.wifi_screen = None;
         if self.link_active() {
             self.end_link();

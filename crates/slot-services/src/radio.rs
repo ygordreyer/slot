@@ -4,6 +4,7 @@ use crate::config::{self, Network};
 use crate::system::{self, field, output, Process};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,31 @@ fn scan_with(
         }
         Err(e) => Err(e.code),
     }
+}
+
+fn prepare_scan_with(
+    powered_down: &mut bool,
+    mut command: impl FnMut(&str, &[&str]) -> Result<String, &'static str>,
+) -> Result<(), &'static str> {
+    // Even a failed unblock may have changed the radio before reporting failure.
+    *powered_down = false;
+    command("rfkill", &["unblock", "wifi"])?;
+    command("ip", &["link", "set", "wlan0", "up"])?;
+    Ok(())
+}
+
+pub fn scan(cancelled: &AtomicBool) -> Result<String, &'static str> {
+    scan_with(
+        Instant::now() + Duration::from_secs(10),
+        |cached, timeout| {
+            let args = if cached {
+                &["dev", "wlan0", "scan", "dump"][..]
+            } else {
+                &["dev", "wlan0", "scan"][..]
+            };
+            system::output_timeout_cancellable("iw", args, timeout, cancelled)
+        },
+    )
 }
 
 pub fn net_exists(name: &str) -> bool {
@@ -400,7 +426,12 @@ impl Home {
         Ok(())
     }
 
-    pub fn scan(&mut self, link_busy: bool, ours: &[u32]) -> Result<String, &'static str> {
+    pub fn prepare_scan(
+        &self,
+        link_busy: bool,
+        ours: &[u32],
+        powered_down: &mut bool,
+    ) -> Result<(), &'static str> {
         if !self.enabled {
             return Err("HOME_DISABLED");
         }
@@ -413,25 +444,17 @@ impl Home {
         if !net_exists("wlan0") {
             return Err("RADIO_UNAVAILABLE");
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let remaining = || {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(2))
-        };
-        system::output_timeout("rfkill", &["unblock", "wifi"], remaining())?;
-        system::output_timeout("ip", &["link", "set", "wlan0", "up"], remaining())?;
-        scan_with(deadline, |cached, timeout| {
-            let args = if cached {
-                &["dev", "wlan0", "scan", "dump"][..]
-            } else {
-                &["dev", "wlan0", "scan"][..]
-            };
-            system::output_timeout_details("iw", args, timeout)
-        })
+        prepare_scan_with(powered_down, output)
     }
 
-    pub fn tick(&mut self, root: &Path, link_busy: bool, link_freq: Option<u32>, ours: &[u32]) {
+    pub fn tick(
+        &mut self,
+        root: &Path,
+        link_busy: bool,
+        link_freq: Option<u32>,
+        ours: &[u32],
+        powered_down: &mut bool,
+    ) {
         if !self.enabled {
             return;
         }
@@ -499,6 +522,7 @@ impl Home {
             self.retry = now + Duration::from_secs(5);
             return;
         }
+        *powered_down = false;
         if let Err(e) = output("rfkill", &["unblock", "wifi"]) {
             self.error = e;
             self.retry = now + Duration::from_secs(3);
@@ -522,6 +546,28 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scan_preparation_clears_power_down_even_when_a_command_fails() {
+        for fail_at in [0, 1, 2] {
+            let mut powered_down = true;
+            let mut calls = Vec::new();
+            let result = prepare_scan_with(&mut powered_down, |program, _| {
+                calls.push(program.to_owned());
+                if calls.len() == fail_at {
+                    Err("COMMAND_FAILED")
+                } else {
+                    Ok(String::new())
+                }
+            });
+            assert!(!powered_down);
+            assert_eq!(result.is_err(), fail_at != 0);
+            assert_eq!(calls[0], "rfkill");
+            if fail_at != 1 {
+                assert_eq!(calls[1], "ip");
+            }
+        }
+    }
+
     #[test]
     fn file_logging_requires_the_compiled_help_option() {
         let without = "usage:\n  wpa_supplicant [-BddhKLqqtvW] [-P<pid file>] \\\n        -i<ifname> -c<config file> [-D<driver>] [-e<entropy file>]\noptions:\n  -e = entropy file\n  -g = global ctrl_interface\n  -h = show this help text\n";
