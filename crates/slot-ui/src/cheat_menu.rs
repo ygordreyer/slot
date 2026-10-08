@@ -37,6 +37,10 @@ pub fn cheat_label_width() -> u32 {
 /// One cheat's description on a line of menu type. Shrunk toward `MIN_PX` if it needs to be,
 /// and cut with an ellipsis if even that is not enough: a list has to stay one line a row.
 pub fn cheat_label_face(desc: &str) -> UndoFace {
+    list_label_face(desc, cheat_label_width())
+}
+
+pub(crate) fn list_label_face(desc: &str, width: u32) -> UndoFace {
     let Some(font) = text::label_font() else {
         return UndoFace {
             rgba: Vec::new(),
@@ -44,7 +48,7 @@ pub fn cheat_label_face(desc: &str) -> UndoFace {
             h: 0,
         };
     };
-    let max_w = cheat_label_width() as f32;
+    let max_w = width as f32;
     let mut layout = text::fit(font, desc, max_w, 1, MENU_PX, MIN_PX);
     let whole = desc
         .to_uppercase()

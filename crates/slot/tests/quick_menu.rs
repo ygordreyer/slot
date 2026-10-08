@@ -417,8 +417,16 @@ fn the_legend_says_change_on_a_value_row_and_open_on_a_row_that_opens() {
         assert_eq!(a.quick_menu(), Some(row));
         let out = frame(&a);
         assert!(drawn(&out, 400), "no B BACK on {row:?}");
-        assert_eq!(drawn(&out, 401), !row.opens(), "CHANGE on {row:?}");
-        assert_eq!(drawn(&out, 402), row.opens(), "OPEN on {row:?}");
+        assert_eq!(
+            drawn(&out, 401),
+            !(row.opens() || row == QuickRow::Shader),
+            "CHANGE on {row:?}"
+        );
+        assert_eq!(
+            drawn(&out, 402),
+            row.opens() || row == QuickRow::Shader,
+            "OPEN on {row:?}"
+        );
         press(&mut a, Btn::Down);
     }
 }
@@ -688,4 +696,27 @@ fn scrolling_draws_only_window_rows_and_keeps_the_selection_visible_in_both_dire
             press(&mut app, direction);
         }
     }
+}
+
+#[test]
+fn shader_a_opens_parameters_and_b_returns_with_edits_applied() {
+    let (_d, mut app, _clock) = on_carousel();
+    open_at(&mut app, QuickRow::Shader);
+    app.set_shader_parameters(vec![slot_gfx::preset::Parameter {
+        name: "P".into(),
+        label: "Amount".into(),
+        default: 0.5,
+        min: 0.0,
+        max: 1.0,
+        step: 0.1,
+        value: 0.5,
+    }]);
+    app.apply(Action::GbaDown(Btn::A));
+    assert!(app.shader_params_open());
+    app.apply(Action::GbaDown(Btn::Right));
+    assert!((app.shader_parameters()[0].value - 0.6).abs() < 0.000001);
+    assert!(app.take_parameter_changes().is_some());
+    app.apply(Action::GbaDown(Btn::B));
+    assert!(!app.shader_params_open());
+    assert_eq!(app.quick_menu(), Some(QuickRow::Shader));
 }

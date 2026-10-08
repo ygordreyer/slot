@@ -56,10 +56,17 @@ pub struct Frontend {
     account_tex: Option<TexId>,
     account_shown: Option<u64>,
     cheats: CheatFaces,
+    shader_params: ParameterFaces,
 }
 
 /// The cheat list's faces: one texture per window row, reused as the list scrolls, with which
 /// list and which cheat each was last built for; and the count over the rows.
+#[derive(Default)]
+struct ParameterFaces {
+    rows: Vec<[Option<TexId>; 2]>,
+    shown: Vec<String>,
+}
+
 #[derive(Default)]
 struct CheatFaces {
     rows: Vec<Option<TexId>>,
@@ -135,6 +142,10 @@ impl Frontend {
             account_shown: None,
             wifi_shown: None,
             wifi_tex: None,
+            shader_params: ParameterFaces {
+                rows: vec![[None; 2]; CHEAT_ROWS],
+                shown: vec![String::new(); CHEAT_ROWS],
+            },
             cheats: CheatFaces {
                 rows: vec![None; CHEAT_ROWS],
                 built: vec![None; CHEAT_ROWS],
@@ -203,6 +214,13 @@ impl Frontend {
             carets,
             legend,
         });
+        let parameter_legend = slot_ui::parameter_legend_faces().map(|f| {
+            let (tex, w, _) = up(f);
+            (tex, w)
+        });
+        self.session
+            .app_mut()
+            .set_parameter_legend(parameter_legend);
         let cheat_legend = cheat_legend_faces().map(|f| {
             let (tex, w, _) = up(f);
             (tex, w)
@@ -354,6 +372,7 @@ impl Frontend {
         } else {
             self.wifi_shown = None;
         }
+        sync_shader_params(&mut self.session, compositor, &mut self.shader_params);
         sync_core_picker(
             self.session.app_mut(),
             compositor,
@@ -648,6 +667,12 @@ fn shader_display(name: &str) -> String {
     if name.chars().count() <= SHADER_NAME_MAX {
         return name.to_string();
     }
+    if let Some((stem, folder)) = name.rsplit_once(" (") {
+        let folder: String = folder.trim_end_matches(')').chars().take(9).collect();
+        let room = SHADER_NAME_MAX.saturating_sub(folder.chars().count() + 5);
+        let kept: String = stem.chars().take(room).collect();
+        return format!("{kept}... ({folder})");
+    }
     let kept: String = name.chars().take(SHADER_NAME_MAX - 3).collect();
     format!("{kept}...")
 }
@@ -658,7 +683,7 @@ fn sync_quick_shader(app: &mut App, compositor: &mut Compositor, state: &mut Qui
     if app.quick_menu().is_none() {
         return;
     }
-    let text = shader_display(app.shader());
+    let text = shader_display(&slot_store::shader_label(app.shader(), app.shaders()));
     if text == state.shown {
         return;
     }
@@ -681,6 +706,12 @@ fn sync_quick_shader(app: &mut App, compositor: &mut Compositor, state: &mut Qui
 /// LCD look on the panel and says so. The driver's log goes to stderr, which on the device is
 /// the log on the card, and names the line.
 fn sync_shader(session: &mut Session, compositor: &mut Compositor) {
+    if let Some(error) = compositor.take_shader_error() {
+        eprintln!("slot: shader: {error}");
+        session.set_custom_shader(false);
+        session.app_mut().set_shader_parameters(Vec::new());
+        session.app_mut().shader_failed();
+    }
     let Some(name) = session.app_mut().take_shader() else {
         return;
     };
@@ -688,24 +719,82 @@ fn sync_shader(session: &mut Session, compositor: &mut Compositor) {
         SHADER_LCD => compositor.set_shader(ShaderChoice::Lcd),
         SHADER_OFF => compositor.set_shader(ShaderChoice::Plain),
         file => {
-            let src = slot_store::shader_path(session.root(), file)
-                .and_then(|p| std::fs::read_to_string(p).ok());
-            match src {
-                Some(src) => compositor.set_shader(ShaderChoice::RetroArch(&src)),
+            let path = slot_store::shader_path(session.root(), file);
+            let saved = slot_store::read_shader_params(session.root(), file);
+            match path {
+                Some(path) => compositor.set_shader(ShaderChoice::Preset(&path, &saved)),
                 None => {
                     let _ = compositor.set_shader(ShaderChoice::Lcd);
                     eprintln!("slot: shader: {file}.glsl could not be read");
                     session.set_custom_shader(false);
+                    session.app_mut().set_shader_parameters(Vec::new());
                     session.app_mut().shader_failed();
                     return;
                 }
             }
         }
     };
+    session
+        .app_mut()
+        .set_shader_parameters(compositor.shader_parameters().to_vec());
     session.set_custom_shader(result.is_ok() && !matches!(name.as_str(), SHADER_LCD | SHADER_OFF));
     if let Err(e) = result {
         eprintln!("slot: shader: {name}: {e}");
         session.app_mut().shader_failed();
+    }
+}
+
+fn sync_shader_params(
+    session: &mut Session,
+    compositor: &mut Compositor,
+    faces: &mut ParameterFaces,
+) {
+    if let Some(parameters) = session.app_mut().take_parameter_changes() {
+        for p in &parameters {
+            compositor.set_shader_parameter(&p.name, p.value);
+        }
+        let values = parameters
+            .iter()
+            .filter(|p| p.value != p.default)
+            .map(|p| (p.name.clone(), p.value))
+            .collect();
+        if let Err(e) =
+            slot_store::write_shader_params(session.root(), session.app().shader(), &values)
+        {
+            eprintln!("slot: shader parameters: {e}");
+        }
+    }
+    let app = session.app_mut();
+    if !app.shader_params_open() {
+        faces.shown.fill(String::new());
+        return;
+    }
+    let (_, top) = app.shader_params_window();
+    for slot in 0..CHEAT_ROWS {
+        let Some(p) = app.shader_parameters().get(top + slot).cloned() else {
+            continue;
+        };
+        let value = slot_ui::parameter_value_text(p.value, p.step, p.default);
+        let text = format!("{} {value}", p.label);
+        if faces.shown[slot] == text {
+            continue;
+        }
+        let label = slot_ui::parameter_label_face(&p.label);
+        let value = quick_value_face(&value, true);
+        let sizes = [(label.w, label.h), (value.w, value.h)];
+        if sizes.iter().any(|s| s.0 == 0) {
+            continue;
+        }
+        let label_id = upload(compositor, &mut faces.rows[slot][0], label);
+        let value_id = upload(compositor, &mut faces.rows[slot][1], value);
+        app.set_parameter_face(
+            slot,
+            [
+                (label_id, sizes[0].0, sizes[0].1),
+                (value_id, sizes[1].0, sizes[1].1),
+            ],
+        );
+        faces.shown[slot] = text;
     }
 }
 

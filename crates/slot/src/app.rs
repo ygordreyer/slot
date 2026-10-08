@@ -1,3 +1,5 @@
+#[path = "shader_params.rs"]
+mod shader_params;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -344,6 +346,7 @@ pub struct App {
     /// Every look the Shader row steps through: the two built in, then `Shaders/` by name.
     /// Read once at boot, as the carts are.
     shaders: Vec<String>,
+    shader_screen: shader_params::ParameterScreen,
     /// A look for the binary to put on the game layer, and `None` the rest of the time. Set at
     /// boot and by the row. `App` never touches GL, so this is the same set-here, drained-there
     /// shape as `colour_pending`; the binary is what compiles it.
@@ -486,6 +489,7 @@ impl App {
             snapshot: None,
             core: Core::default(),
             colour_pending: None,
+            shader_screen: shader_params::ParameterScreen::default(),
             shaders: vec![SHADER_LCD.to_string(), SHADER_OFF.to_string()],
             shader_pending: None,
             cheats_pending: false,
@@ -1559,6 +1563,9 @@ impl App {
         }
         // The same place and for the same reasons as the in-game menu: over a game, with the
         // device's own keys still answered above.
+        if self.shader_params_open() {
+            return self.shader_params_input(action);
+        }
         if self.cheat_menu.is_some() {
             return self.cheat_menu_input(action);
         }
@@ -1669,12 +1676,12 @@ impl App {
                 self.account_face = None;
                 self.account_screen = Some(AccountScreen::new(self.account_snapshot.clone()));
             }
+            QuickRow::Shader => self.open_shader_params(),
             QuickRow::FastForward
             | QuickRow::FastForwardSound
             | QuickRow::ColourCorrection
             | QuickRow::Rumble
             | QuickRow::HomeWifi
-            | QuickRow::Shader
             | QuickRow::TwelveHour => {}
         }
     }
@@ -2320,6 +2327,7 @@ impl App {
         if self.cheat_menu.is_some() {
             self.draw_cheat_menu(out);
         }
+        self.draw_shader_params(out);
         // Over everything, in every phase. The bar is never what the user is looking at.
         if self.wifi_screen.is_some() && !matches!(self.phase, Phase::Doze { .. }) {
             out.push(Draw::Rect {

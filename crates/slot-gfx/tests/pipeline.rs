@@ -632,3 +632,140 @@ void main() {{
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn two_pass_viewport_scale_preserves_pixels_orientation_and_gl_state() {
+    use slot_gfx::ShaderChoice;
+    let Some((_guard, _surface, mut c)) = compositor() else {
+        eprintln!("shader render test skipped: no host GL context");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("slot-shader-render-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shader = r#"
+#if defined(VERTEX)
+in vec4 VertexCoord; in vec4 TexCoord; uniform mat4 MVPMatrix; out vec2 uv;
+void main() {gl_Position=MVPMatrix*VertexCoord;uv=TexCoord.xy;}
+#elif defined(FRAGMENT)
+in vec2 uv; out vec4 colour; uniform sampler2D Texture; uniform vec2 InputSize; uniform vec2 OutputSize;
+void main() {colour=texture(Texture,uv);}
+#endif
+"#;
+    let first = shader.replace("colour=texture(Texture,uv);", "colour=(distance(InputSize,vec2(240,160))<0.1 && distance(OutputSize,vec2(360,240))<0.1) ? texture(Texture,uv) : vec4(1,0,1,1);");
+    let second = shader.replace("colour=texture(Texture,uv);", "colour=(distance(InputSize,vec2(360,240))<0.1 && distance(OutputSize,vec2(720,480))<0.1) ? texture(Texture,uv) : vec4(1,0,1,1);");
+    std::fs::write(dir.join("first.glsl"), first).unwrap();
+    std::fs::write(dir.join("copy.glsl"), second).unwrap();
+    std::fs::write(dir.join("two.glslp"), "shaders=2\nshader0=first.glsl\nscale_type0=viewport\nscale0=0.5\nshader1=copy.glsl\nfilter_linear1=false\n").unwrap();
+    c.set_shader(ShaderChoice::Preset(
+        &dir.join("two.glslp"),
+        &Default::default(),
+    ))
+    .unwrap();
+    let mut src = vec![0u8; (SRC_W * SRC_H * 4) as usize];
+    for y in 0..SRC_H as usize {
+        for x in 0..SRC_W as usize {
+            let i = (y * SRC_W as usize + x) * 4;
+            src[i..i + 4].copy_from_slice(if y < SRC_H as usize / 2 {
+                &[0, 0, 200, 255]
+            } else {
+                &[180, 0, 0, 255]
+            });
+        }
+    }
+    c.upload_game(&src);
+    c.begin_frame();
+    let (mut before_fbo, mut before_program, mut before_active) = (0, 0, 0);
+    let mut before_viewport = [0; 4];
+    unsafe {
+        gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut before_fbo);
+        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut before_program);
+        gl::GetIntegerv(gl::ACTIVE_TEXTURE, &mut before_active);
+        gl::GetIntegerv(gl::VIEWPORT, before_viewport.as_mut_ptr());
+        gl::Enable(gl::BLEND);
+    }
+    c.draw_game();
+    unsafe {
+        for (key, want) in [
+            (gl::FRAMEBUFFER_BINDING, before_fbo),
+            (gl::CURRENT_PROGRAM, before_program),
+            (gl::ACTIVE_TEXTURE, before_active),
+        ] {
+            let mut got = 0;
+            gl::GetIntegerv(key, &mut got);
+            assert_eq!(got, want);
+        }
+        let mut viewport = [0; 4];
+        gl::GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+        assert_eq!(viewport, before_viewport);
+        assert_ne!(gl::IsEnabled(gl::BLEND), 0);
+    }
+    let frame = c.read_frame();
+    assert_eq!(px(&frame, 360, 60), [200, 0, 0]);
+    assert_eq!(px(&frame, 360, 420), [0, 0, 180]);
+    std::fs::remove_file(dir.join("first.glsl")).unwrap();
+    std::fs::remove_file(dir.join("copy.glsl")).unwrap();
+    std::fs::remove_file(dir.join("two.glslp")).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn broken_preset_restores_lcd_pixels() {
+    use slot_gfx::ShaderChoice;
+    let Some((_guard, _surface, mut c)) = compositor() else {
+        eprintln!("shader render test skipped: no host GL context");
+        return;
+    };
+    c.upload_game(&vec![128u8; (SRC_W * SRC_H * 4) as usize]);
+    c.begin_frame();
+    c.draw_game();
+    let expected = c.read_frame();
+    let missing = std::env::temp_dir().join("slot-nonexistent-shader-preset.glslp");
+    assert!(c
+        .set_shader(ShaderChoice::Preset(&missing, &Default::default()))
+        .is_err());
+    c.begin_frame();
+    c.draw_game();
+    assert_eq!(c.read_frame(), expected);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn every_bundled_preset_loads_compiles_links_and_draws() {
+    use slot_gfx::ShaderChoice;
+    let Some((_guard, _surface, mut c)) = compositor() else {
+        eprintln!("shader render test skipped: no host GL context");
+        return;
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../card/Shaders");
+    fn presets(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                presets(&p, out);
+            } else if p.extension().is_some_and(|e| e == "glslp") {
+                out.push(p);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    presets(&root, &mut paths);
+    assert_eq!(paths.len(), 10);
+    for path in paths {
+        c.set_shader(ShaderChoice::Preset(&path, &Default::default()))
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        c.upload_game(&vec![128u8; (SRC_W * SRC_H * 4) as usize]);
+        c.begin_frame();
+        c.draw_game();
+        assert!(c.take_shader_error().is_none(), "{}", path.display());
+        let frame = c.read_frame();
+        assert!(
+            frame
+                .chunks_exact(4)
+                .any(|p| p[0] > 0 || p[1] > 0 || p[2] > 0),
+            "{} is black",
+            path.display()
+        );
+    }
+}

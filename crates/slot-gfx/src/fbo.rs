@@ -17,6 +17,10 @@ pub enum ShaderChoice<'a> {
     Plain,
     /// The text of a single-pass RetroArch `.glsl` file.
     RetroArch(&'a str),
+    Preset(
+        &'a std::path::Path,
+        &'a std::collections::BTreeMap<String, f32>,
+    ),
 }
 
 pub struct Compositor {
@@ -80,8 +84,15 @@ impl Compositor {
         let look = match choice {
             ShaderChoice::Lcd => Look::Lcd,
             ShaderChoice::Plain => Look::Plain,
+            ShaderChoice::Preset(path, saved) => match RetroShader::load(path, saved) {
+                Ok(shader) => Look::Retro(Box::new(shader)),
+                Err(e) => {
+                    self.game.set_look(Look::Lcd);
+                    return Err(e);
+                }
+            },
             ShaderChoice::RetroArch(src) => match RetroShader::new(src) {
-                Ok(shader) => Look::Retro(shader),
+                Ok(shader) => Look::Retro(Box::new(shader)),
                 Err(e) => {
                     self.game.set_look(Look::Lcd);
                     return Err(e);
@@ -90,6 +101,16 @@ impl Compositor {
         };
         self.game.set_look(look);
         Ok(())
+    }
+
+    pub fn shader_parameters(&self) -> &[crate::preset::Parameter] {
+        self.game.parameters()
+    }
+    pub fn set_shader_parameter(&mut self, name: &str, value: f32) {
+        self.game.set_parameter(name, value);
+    }
+    pub fn take_shader_error(&mut self) -> Option<String> {
+        self.game.take_shader_error()
     }
 
     pub fn upload_game(&mut self, xrgb8888: &[u8]) {

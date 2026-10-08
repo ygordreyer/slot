@@ -2649,6 +2649,7 @@ dependencies = [
  "glutin",
  "glutin-winit",
  "libloading",
+ "png 0.17.16",
  "raw-window-handle",
  "winit",
 ]

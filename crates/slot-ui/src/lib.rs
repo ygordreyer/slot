@@ -17,6 +17,11 @@ mod plate;
 mod polaroids;
 mod power_menu;
 mod quick_menu;
+mod shader_params;
+pub use shader_params::{
+    parameter_label_face, parameter_legend_faces, parameter_value_text, ParameterFaces,
+    ShaderParams,
+};
 mod refusal;
 mod shelf;
 mod shell;

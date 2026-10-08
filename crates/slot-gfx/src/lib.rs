@@ -11,6 +11,7 @@ mod host;
 mod lcd3x;
 mod pipeline;
 mod power;
+pub mod preset;
 mod quad;
 mod retroshader;
 mod shaders;
