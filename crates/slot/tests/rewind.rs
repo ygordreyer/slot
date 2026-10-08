@@ -158,6 +158,72 @@ fn the_rewind_bar_is_up_while_l2_is_held_and_gone_once_it_is_let_go() {
 }
 
 #[test]
+fn raw_l2_release_inside_a_screen_stops_a_hold_started_before_it_opened() {
+    for row in [QuickRow::WifiNetworks, QuickRow::RetroAchievements] {
+        for hold_in_quick_menu in [false, true] {
+            let d = common::tmp_root_with_carts(&["Emerald", "Fusion"]);
+            common::clocked(d.path());
+            let mut s = Session::boot(d.path().into());
+            let mut now = 0;
+            if hold_in_quick_menu {
+                s.app_mut().apply(Action::QuickMenu);
+            }
+            now += 16;
+            s.feed([RawEvent::Down(Btn::L2)], now);
+            if !hold_in_quick_menu {
+                s.app_mut().apply(Action::QuickMenu);
+            }
+            for _ in 0..row.index() {
+                s.app_mut().apply(Action::GbaDown(Btn::Down));
+            }
+            s.app_mut().apply(Action::GbaDown(Btn::A));
+            assert_eq!(
+                s.app().wifi_screen().is_some(),
+                row == QuickRow::WifiNetworks
+            );
+            assert_eq!(
+                s.app().account_screen().is_some(),
+                row == QuickRow::RetroAchievements
+            );
+            now += 16;
+            s.feed([RawEvent::Up(Btn::L2)], now);
+            for _ in 0..2 {
+                now += 16;
+                s.feed([RawEvent::Down(Btn::B), RawEvent::Up(Btn::B)], now);
+            }
+            assert!(s.app().wifi_screen().is_none());
+            assert!(s.app().account_screen().is_none());
+            assert!(matches!(s.app().phase(), Phase::Shelf));
+            s.app_mut().apply(Action::Insert);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !matches!(s.app().phase(), Phase::Playing { .. }) || !s.game_visible() {
+                assert!(Instant::now() < deadline, "the game never came up");
+                step(&mut s, &mut now, None);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for _ in 0..200 {
+                step(&mut s, &mut now, None);
+            }
+            assert!(
+                drawn(&s).is_empty(),
+                "{row:?} leaked a rewind hold (quick menu: {hold_in_quick_menu})"
+            );
+            step(&mut s, &mut now, Some(RawEvent::Down(Btn::R2)));
+            assert!(
+                s.app().ff_badge().is_some(),
+                "{row:?} refused fast forward after L2 was released"
+            );
+            step(&mut s, &mut now, Some(RawEvent::Up(Btn::R2)));
+            assert!(
+                s.app().ff_badge().is_none(),
+                "fast forward outlived its hold"
+            );
+            assert!(drawn(&s).is_empty());
+        }
+    }
+}
+
+#[test]
 fn raw_l2_without_a_keyboard_leaves_screens_unchanged_and_does_not_leak_rewind() {
     for row in [QuickRow::WifiNetworks, QuickRow::RetroAchievements] {
         let d = common::tmp_root_with_carts(&["Emerald", "Fusion"]);
@@ -234,6 +300,10 @@ fn raw_l2_without_a_keyboard_leaves_screens_unchanged_and_does_not_leak_rewind()
         assert!(drawn(&s).is_empty(), "{row:?} leaked a rewind hold");
         step(&mut s, &mut now, Some(RawEvent::Up(Btn::L2)));
         assert!(drawn(&s).is_empty());
+        step(&mut s, &mut now, Some(RawEvent::Down(Btn::R2)));
+        assert!(s.app().ff_badge().is_some(), "{row:?} refused fast forward");
+        step(&mut s, &mut now, Some(RawEvent::Up(Btn::R2)));
+        assert!(s.app().ff_badge().is_none());
     }
 }
 

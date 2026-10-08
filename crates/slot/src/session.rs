@@ -200,22 +200,24 @@ impl Session {
                 let button = match ev {
                     RawEvent::Down(button) | RawEvent::Up(button) => button,
                 };
-                if matches!(
-                    button,
-                    Btn::Up
-                        | Btn::Down
-                        | Btn::Left
-                        | Btn::Right
-                        | Btn::A
-                        | Btn::B
-                        | Btn::X
-                        | Btn::Y
-                        | Btn::L1
-                        | Btn::L2
-                        | Btn::R1
-                        | Btn::Start
-                        | Btn::Select
-                ) {
+                // L2 presses cancel the keyboard; releases must stop any earlier rewind hold.
+                if matches!(ev, RawEvent::Down(Btn::L2))
+                    || matches!(
+                        button,
+                        Btn::Up
+                            | Btn::Down
+                            | Btn::Left
+                            | Btn::Right
+                            | Btn::A
+                            | Btn::B
+                            | Btn::X
+                            | Btn::Y
+                            | Btn::L1
+                            | Btn::R1
+                            | Btn::Start
+                            | Btn::Select
+                    )
+                {
                     actions.push(match ev {
                         RawEvent::Down(button) => Action::GbaDown(button),
                         RawEvent::Up(button) => Action::GbaUp(button),
