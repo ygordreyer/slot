@@ -83,6 +83,23 @@ fn network_forgotten_message_survives_idle_status_polls() {
 }
 
 #[test]
+fn forgetting_a_connected_network_preserves_confirmation_on_idle() {
+    let mut screen = WifiScreen::new(true);
+    screen.reply(WifiReply::Status(Ok(parse_status(
+        "0 home_enabled=true home_phase=CONNECTED home_ssid=486f6d65 home_ip=192.168.1.2",
+    ))));
+    assert_eq!(screen.status, "Connected: 192.168.1.2 (Home)");
+    screen.reply(WifiReply::Changed(Ok(Vec::new())));
+    assert_eq!(screen.status, "Network forgotten");
+    for _ in 0..2 {
+        screen.reply(WifiReply::Status(Ok(parse_status(
+            "0 home_enabled=true home_phase=IDLE",
+        ))));
+        assert_eq!(screen.status, "Network forgotten");
+    }
+}
+
+#[test]
 fn unsupported_network_message_survives_idle_status_polls() {
     let mut screen = WifiScreen::new(true);
     let idle = parse_status("0 home_enabled=true home_phase=IDLE");

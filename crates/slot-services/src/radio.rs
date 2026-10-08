@@ -414,6 +414,12 @@ pub fn subnet_conflict(routes: &str) -> bool {
     })
 }
 
+struct HomeLink {
+    status: String,
+    dhcp: Result<(), &'static str>,
+    has_ip: bool,
+}
+
 pub struct Home {
     pub interface: Interface,
     pub enabled: bool,
@@ -426,6 +432,7 @@ pub struct Home {
     requested: bool,
     pub active_ssid: String,
     signal: SignalCache,
+    signal_command: fn(&str, &[&str]) -> Result<String, &'static str>,
 }
 impl Home {
     pub fn new(run: &Path) -> Self {
@@ -446,6 +453,9 @@ impl Home {
             requested: false,
             connected,
             signal: SignalCache::new(),
+            signal_command: |program, args| {
+                system::output_timeout(program, args, Duration::from_millis(300))
+            },
         }
     }
     pub fn enable(&mut self, enabled: bool, root: &Path) {
@@ -456,7 +466,7 @@ impl Home {
         if !enabled {
             self.interface.stop();
             self.connected = false;
-            self.signal.value = None;
+            self.reset_signal();
         } else {
             self.reload(root);
         }
@@ -467,7 +477,7 @@ impl Home {
         if self.interface.wpa.is_some() {
             self.interface.stop();
             self.connected = false;
-            self.signal.value = None;
+            self.reset_signal();
         }
     }
     pub fn reload(&mut self, root: &Path) {
@@ -477,6 +487,7 @@ impl Home {
                 if self.profiles != p && !self.profiles.is_empty() || p.is_empty() {
                     self.interface.stop();
                     self.connected = false;
+                    self.reset_signal();
                 }
                 if self.profiles.is_empty() && self.interface.wpa.is_some() && !p.is_empty() {
                     let conf = fs::read_to_string(self.interface.run.join("wlan0.conf"))
@@ -488,6 +499,7 @@ impl Home {
                     } else {
                         self.interface.stop();
                         self.connected = false;
+                        self.reset_signal();
                     }
                 }
                 self.profiles = p;
@@ -513,7 +525,7 @@ impl Home {
         self.interface.stop();
         self.connected = false;
         self.active_ssid.clear();
-        self.signal.value = None;
+        self.reset_signal();
         self.profiles = vec![profile];
         self.next = 0;
         self.requested = true;
@@ -522,22 +534,42 @@ impl Home {
         Ok(())
     }
 
+    fn reset_signal(&mut self) {
+        self.signal.value = None;
+        self.signal.refresh_at = Instant::now();
+    }
+
     fn refresh_signal(&mut self, linked: bool) {
         let path = std::env::var_os("SLOT_PROC_WIRELESS")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/proc/net/wireless"));
-        self.signal
-            .refresh_with(Instant::now(), linked, self.interface.name, &path, output);
+        self.signal.refresh_with(
+            Instant::now(),
+            linked,
+            self.interface.name,
+            &path,
+            self.signal_command,
+        );
     }
 
     pub fn status(&mut self) -> WifiStatus {
-        let supplicant = if self.enabled {
-            self.interface.status()
+        self.status_with(|interface| {
+            let supplicant = interface.status();
+            let ip = connected(&supplicant).then(|| interface.ipv4()).flatten();
+            (supplicant, ip)
+        })
+    }
+
+    fn status_with(
+        &mut self,
+        observe: impl FnOnce(&Interface) -> (String, Option<std::net::Ipv4Addr>),
+    ) -> WifiStatus {
+        let (supplicant, ip) = if self.enabled {
+            observe(&self.interface)
         } else {
-            String::new()
+            (String::new(), None)
         };
         let linked = self.enabled && connected(&supplicant);
-        let ip = linked.then(|| self.interface.ipv4()).flatten();
         self.refresh_signal(linked);
         let phase = if self.enabled {
             connection_phase(
@@ -588,25 +620,62 @@ impl Home {
         ours: &[u32],
         powered_down: &mut bool,
     ) {
+        self.tick_with(
+            root,
+            link_busy,
+            link_freq,
+            (ours, powered_down),
+            |interface| {
+                interface.wpa.as_ref()?;
+                let status = interface.status();
+                let (dhcp, has_ip) = if connected(&status) {
+                    (interface.dhcp(), interface.has_ip())
+                } else {
+                    (Ok(()), false)
+                };
+                Some(HomeLink {
+                    status,
+                    dhcp,
+                    has_ip,
+                })
+            },
+        );
+    }
+
+    fn tick_with(
+        &mut self,
+        root: &Path,
+        link_busy: bool,
+        link_freq: Option<u32>,
+        radio: (&[u32], &mut bool),
+        poll: impl FnOnce(&mut Interface) -> Option<HomeLink>,
+    ) {
+        let (ours, powered_down) = radio;
         if !self.enabled {
             return;
         }
         let now = Instant::now();
-        if self.interface.wpa.is_some() {
-            let status = self.interface.status();
-            self.refresh_signal(connected(&status));
+        if let Some(HomeLink {
+            status,
+            dhcp,
+            has_ip,
+        }) = poll(&mut self.interface)
+        {
             if connected(&status) {
                 // Also reap/restart a renewal worker that died after the first lease.
-                if let Err(e) = self.interface.dhcp() {
+                if let Err(e) = dhcp {
                     self.error = e;
                 }
-                if self.interface.has_ip() {
+                if has_ip {
                     self.connected = true;
                     self.error = "";
                     return;
                 }
-            } else if self.connected {
-                self.deadline = now; // Lost a working association: select again, with backoff.
+            } else {
+                self.reset_signal();
+                if self.connected {
+                    self.deadline = now; // Lost a working association: select again, with backoff.
+                }
             }
             if now < self.deadline {
                 return;
@@ -615,8 +684,10 @@ impl Home {
             self.error = connection_error(&status, &auth_log);
             self.interface.stop();
             self.connected = false;
-            self.signal.value = None;
+            self.reset_signal();
             self.retry = now + Duration::from_secs(2);
+        } else {
+            self.reset_signal();
         }
         if now < self.retry {
             return;
@@ -669,6 +740,7 @@ impl Home {
                 self.next += 1;
                 self.error = "";
                 self.deadline = now + Duration::from_secs(25);
+                self.reset_signal();
             }
             Err(e) => {
                 self.error = e;
@@ -684,6 +756,115 @@ mod tests {
 
     const IW_LINK: &str = "Connected to 00:11:22:33:44:55 (on wlan0)\n\tSSID: Home\n\tfreq: 2412\n\tRX: 26010 bytes (158 packets)\n\tsignal: -54 dBm\n\ttx bitrate: 72.2 MBit/s MCS 7 short GI\n";
     const WIRELESS: &str = "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n wlan1: 0000   20.  -80.  -256        0      0      0      0      0        0\n wlan0: 0000   50.  -54.  -256        0      0      0      0      0        0\n";
+
+    fn linked_observation(_: &Interface) -> (String, Option<std::net::Ipv4Addr>) {
+        ("wpa_state=COMPLETED".into(), Some([192, 168, 1, 2].into()))
+    }
+
+    fn signal_fixture(program: &str, args: &[&str]) -> Result<String, &'static str> {
+        assert_eq!(program, "iw");
+        assert_eq!(args, ["dev", "wlan0", "link"]);
+        Ok(IW_LINK.into())
+    }
+
+    #[test]
+    fn linked_ticks_never_sample_signal_but_status_does() {
+        let root = tempfile::tempdir().unwrap();
+        let mut home = Home::new(root.path());
+        home.enabled = true;
+        home.signal_command = |_, _| panic!("tick must not sample signal");
+        let mut powered_down = false;
+        for has_ip in [false, true] {
+            home.tick_with(root.path(), false, None, (&[], &mut powered_down), |_| {
+                Some(HomeLink {
+                    status: "wpa_state=COMPLETED".into(),
+                    dhcp: Ok(()),
+                    has_ip,
+                })
+            });
+            assert_eq!(home.signal.value, None);
+        }
+        home.signal_command = signal_fixture;
+        assert_eq!(
+            home.status_with(linked_observation).signal,
+            Some(WifiSignal::Dbm(-54))
+        );
+        home.signal_command = |_, _| panic!("status sample must be rate limited");
+        assert_eq!(
+            home.status_with(linked_observation).signal,
+            Some(WifiSignal::Dbm(-54))
+        );
+    }
+
+    #[test]
+    fn a_signal_reset_clears_the_value_and_allows_an_immediate_status_sample() {
+        let root = tempfile::tempdir().unwrap();
+        let mut home = Home::new(root.path());
+        home.enabled = true;
+        home.signal_command = signal_fixture;
+        home.status_with(linked_observation);
+        let before_reset = Instant::now();
+        assert!(home.signal.refresh_at > before_reset);
+        home.reset_signal();
+        assert_eq!(home.signal.value, None);
+        assert!(home.signal.refresh_at >= before_reset);
+        assert!(home.signal.refresh_at <= Instant::now());
+        home.signal_command = |_, _| Ok(IW_LINK.replace("-54", "-65"));
+        assert_eq!(
+            home.status_with(linked_observation).signal,
+            Some(WifiSignal::Dbm(-65))
+        );
+    }
+
+    #[test]
+    fn reloading_changed_profiles_resets_the_signal_before_the_next_status() {
+        let root = tempfile::tempdir().unwrap();
+        let mut home = Home::new(root.path());
+        home.enabled = true;
+        home.profiles = vec![Network {
+            ssid: "Old".into(),
+            password: None,
+        }];
+        slot_store::write_wifi(
+            root.path(),
+            &[Network {
+                ssid: "New".into(),
+                password: None,
+            }],
+        )
+        .unwrap();
+        home.signal_command = signal_fixture;
+        home.status_with(linked_observation);
+        assert_eq!(home.signal.value, Some(WifiSignal::Dbm(-54)));
+        home.reload(root.path());
+        assert_eq!(home.signal.value, None);
+        assert!(home.signal.refresh_at <= Instant::now());
+        home.signal_command = |_, _| Ok(IW_LINK.replace("-54", "-65"));
+        assert_eq!(
+            home.status_with(linked_observation).signal,
+            Some(WifiSignal::Dbm(-65))
+        );
+    }
+
+    #[test]
+    fn a_tick_with_a_down_link_clears_signal_without_sampling() {
+        let root = tempfile::tempdir().unwrap();
+        let mut home = Home::new(root.path());
+        home.enabled = true;
+        home.signal.value = Some(WifiSignal::Dbm(-54));
+        home.signal.refresh_at = Instant::now() + Duration::from_secs(3);
+        home.signal_command = |_, _| panic!("down link must not sample signal");
+        let mut powered_down = false;
+        home.tick_with(root.path(), false, None, (&[], &mut powered_down), |_| {
+            Some(HomeLink {
+                status: "wpa_state=SCANNING".into(),
+                dhcp: Ok(()),
+                has_ip: false,
+            })
+        });
+        assert_eq!(home.signal.value, None);
+        assert!(home.signal.refresh_at <= Instant::now());
+    }
 
     #[test]
     fn phases_follow_supplicant_lease_and_service_errors() {

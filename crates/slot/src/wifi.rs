@@ -704,6 +704,7 @@ impl WifiScreen {
             }
         } else if status.phase == Some(WifiPhase::Idle)
             && self.connecting.is_none()
+            && WifiMenu::status_text(&self.observed).as_deref() == Some(self.status.as_str())
             && matches!(
                 self.observed.phase,
                 Some(
