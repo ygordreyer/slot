@@ -20,6 +20,26 @@ const FRAME_MS: Millis = 16;
 const DT: f32 = 1.0 / 60.0;
 
 #[test]
+fn doze_closes_cheats_and_commits_only_the_visible_edits() {
+    for doze in [Action::LidClose, Action::PowerTap] {
+        let d = tmp_root_with_carts(&["Emerald"]);
+        let mut app = app_playing_in(d.path(), "Emerald");
+        app.open_cheat_menu(vec![("Cheat".into(), false)]);
+        app.apply(Action::GbaDown(Btn::Right));
+        assert_eq!(app.cheat_enabled(0), Some(true));
+
+        app.apply(doze);
+        assert!(matches!(app.phase(), Phase::Doze { .. }));
+        assert!(!app.cheat_menu_open());
+        app.apply(Action::GbaDown(Btn::Left));
+        app.apply(Action::GbaDown(Btn::A));
+        assert!(!app.cheat_menu_open());
+        assert_eq!(app.take_cheat_commit(), Some(vec![true]));
+        assert!(app.take_cheat_commit().is_none());
+    }
+}
+
+#[test]
 fn lid_close_flushes_resume_before_dozing() {
     let d = tmp_root_with_carts(&["Emerald"]);
     let mut a = app_playing_in(d.path(), "Emerald");

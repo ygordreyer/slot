@@ -13,6 +13,7 @@ pub(super) struct ParameterScreen {
     row: usize,
     top: usize,
     open: bool,
+    generation: u64,
     changed: bool,
     faces: Vec<Option<ParameterFaces>>,
     legend: Option<[(slot_ui::TexId, u32); 4]>,
@@ -28,6 +29,9 @@ impl App {
     }
     pub fn shader_params_open(&self) -> bool {
         self.shader_screen.open
+    }
+    pub fn shader_params_generation(&self) -> u64 {
+        self.shader_screen.generation
     }
     pub fn shader_params_window(&self) -> (usize, usize) {
         (self.shader_screen.row, self.shader_screen.top)
@@ -50,9 +54,13 @@ impl App {
             return;
         }
         self.shader_screen.open = true;
+        self.shader_screen.generation = self.shader_screen.generation.wrapping_add(1);
         self.shader_screen.row = 0;
         self.shader_screen.top = 0;
         self.shader_screen.faces = vec![None; CHEAT_ROWS];
+    }
+    pub(super) fn close_shader_params(&mut self) {
+        self.shader_screen.open = false;
     }
     pub(super) fn shader_params_input(&mut self, action: Action) {
         let s = &mut self.shader_screen;
@@ -140,6 +148,26 @@ mod tests {
             max,
             step,
             default,
+        }
+    }
+
+    #[test]
+    fn doze_closes_parameters_without_losing_pending_edits() {
+        for doze in [Action::LidClose, Action::PowerTap] {
+            let mut app = App::new(Vec::new());
+            app.set_shader_parameters(vec![parameter(0.5, 0.0, 1.0, 0.1, 0.5)]);
+            app.open_shader_params();
+            app.apply(Action::GbaDown(Btn::Right));
+            let edited = app.shader_parameters()[0].value;
+            assert_eq!(edited, 0.6);
+
+            app.apply(doze);
+            assert!(matches!(app.phase(), super::super::Phase::Doze { .. }));
+            assert!(!app.shader_params_open());
+            app.apply(Action::GbaDown(Btn::Right));
+            assert_eq!(app.shader_parameters()[0].value, edited);
+            assert_eq!(app.take_parameter_changes().unwrap()[0].value, edited);
+            assert!(app.take_parameter_changes().is_none());
         }
     }
 

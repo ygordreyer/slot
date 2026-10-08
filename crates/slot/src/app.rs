@@ -2805,6 +2805,8 @@ impl App {
     /// `PowerTap` by way of `power_press` both return
     fn doze(&mut self) {
         self.account_screen = None;
+        self.close_shader_params();
+        self.close_cheat_menu();
         self.wifi_generation = self.wifi_generation.wrapping_add(1);
         if let Some(worker) = &self.wifi_worker {
             worker.cancel(self.wifi_generation);

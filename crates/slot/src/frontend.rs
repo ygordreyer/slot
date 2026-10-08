@@ -65,6 +65,22 @@ pub struct Frontend {
 struct ParameterFaces {
     rows: Vec<[Option<TexId>; 2]>,
     shown: Vec<String>,
+    generation: Option<u64>,
+}
+
+impl ParameterFaces {
+    fn prepare(&mut self, app: &App) -> bool {
+        if !app.shader_params_open() {
+            self.shown.fill(String::new());
+            return false;
+        }
+        let generation = app.shader_params_generation();
+        if self.generation != Some(generation) {
+            self.shown.fill(String::new());
+            self.generation = Some(generation);
+        }
+        true
+    }
 }
 
 #[derive(Default)]
@@ -145,6 +161,7 @@ impl Frontend {
             shader_params: ParameterFaces {
                 rows: vec![[None; 2]; CHEAT_ROWS],
                 shown: vec![String::new(); CHEAT_ROWS],
+                ..ParameterFaces::default()
             },
             cheats: CheatFaces {
                 rows: vec![None; CHEAT_ROWS],
@@ -765,8 +782,7 @@ fn sync_shader_params(
         }
     }
     let app = session.app_mut();
-    if !app.shader_params_open() {
-        faces.shown.fill(String::new());
+    if !faces.prepare(app) {
         return;
     }
     let (_, top) = app.shader_params_window();
@@ -880,5 +896,68 @@ fn upload_rgba(
             *slot = Some(id);
             id
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slot_input::{Action, Btn, RawEvent};
+    use slot_ui::QuickRow;
+
+    #[test]
+    fn parameter_faces_refresh_after_close_and_reopen_in_one_batch() {
+        let root = tempfile::tempdir().unwrap();
+        crate::root::ensure(root.path());
+        slot_store::write_slot_state(
+            root.path(),
+            &slot_store::SlotState {
+                clock_set: true,
+                ..slot_store::SlotState::default()
+            },
+        )
+        .unwrap();
+        let mut session = Session::boot(root.path().to_path_buf());
+        let app = session.app_mut();
+        app.set_shader_parameters(vec![slot_gfx::preset::Parameter {
+            name: "P".into(),
+            label: "Amount".into(),
+            default: 0.5,
+            min: 0.0,
+            max: 1.0,
+            step: 0.1,
+            value: 0.5,
+        }]);
+        app.apply(Action::QuickMenu);
+        for _ in 0..QuickRow::Shader.index() {
+            app.apply(Action::GbaDown(Btn::Down));
+        }
+        app.apply(Action::GbaDown(Btn::A));
+        assert!(app.shader_params_open());
+        let mut faces = ParameterFaces {
+            shown: vec![String::new(); CHEAT_ROWS],
+            ..ParameterFaces::default()
+        };
+        assert!(faces.prepare(session.app()));
+        faces.shown.fill("Amount 0.5".into());
+        let generation = faces.generation;
+
+        session.feed(
+            [
+                RawEvent::Down(Btn::B),
+                RawEvent::Up(Btn::B),
+                RawEvent::Down(Btn::A),
+                RawEvent::Up(Btn::A),
+            ],
+            100,
+        );
+        assert!(session.app().shader_params_open());
+        assert_ne!(Some(session.app().shader_params_generation()), generation);
+        assert!(faces.prepare(session.app()));
+        assert!(faces.shown.iter().all(String::is_empty));
+
+        faces.shown.fill("Amount 0.5".into());
+        assert!(faces.prepare(session.app()));
+        assert!(faces.shown.iter().all(|text| text == "Amount 0.5"));
     }
 }
