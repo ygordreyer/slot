@@ -1,0 +1,5 @@
+shaders = "1"
+shader0 = "shaders/crt-lite.glsl"
+filter_linear0 = "false"
+parameters = "GLOW"
+GLOW = "0.0"

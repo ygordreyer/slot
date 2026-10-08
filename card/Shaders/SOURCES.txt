@@ -51,6 +51,15 @@ interpolation/sharp-bilinear | 1 | 720x480 | 1 (bilinear) | Public domain
 motionblur/response-time | 1 | 720x480 | 8 | GPL-2.0-or-later
 crt/zfast-crt | 1 | 720x480 | 1 (bilinear) | GPL-2.0-or-later
 handheld/zfast-lcd | 1+copy | 720x480;720x480 copy | 1 (bilinear);1 | GPL-2.0-or-later
+crt/crt-lite | 1 | 720x480 | 4 (5 with optional glow) | GPL-3.0-or-later
+crt/crt-lite-glow | 2 | 240x160;720x480 | 5 (bilinear);5 | GPL-3.0-or-later
+
+Original to this repository
+FILE | LICENSE
+crt/shaders/crt-lite.glsl | GPL-3.0-or-later
+crt/shaders/crt-lite-glow.glsl | GPL-3.0-or-later
+crt/crt-lite.glslp | GPL-3.0-or-later
+crt/crt-lite-glow.glslp | GPL-3.0-or-later
 
 Excluded candidates:
 lcd-grid-v2-gba-color (2+copy,720x480 each,4;1;1 fetches) and

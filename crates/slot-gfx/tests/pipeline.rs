@@ -751,7 +751,7 @@ fn every_bundled_preset_loads_compiles_links_and_draws() {
     }
     let mut paths = Vec::new();
     presets(&root, &mut paths);
-    assert_eq!(paths.len(), 11);
+    assert_eq!(paths.len(), 13);
     for path in paths {
         c.set_shader(ShaderChoice::Preset(&path, &Default::default()))
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
