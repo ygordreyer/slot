@@ -209,10 +209,14 @@ pub fn motor_change(strength: u16, running: bool) -> Option<bool> {
 }
 
 struct Motor {
-    node: fs::File,
+    backend: MotorBackend,
     name: String,
-    id: i16,
     running: bool,
+}
+
+enum MotorBackend {
+    Evdev { node: fs::File, id: i16 },
+    Sysfs { path: PathBuf, warned: bool },
 }
 
 #[repr(C)]
@@ -263,7 +267,9 @@ extern "C" {
 
 impl Motor {
     fn open(sysfs: &Path) -> Option<Motor> {
-        let name = rumble_node(sysfs)?;
+        let Some(name) = rumble_node(sysfs) else {
+            return Self::open_sysfs(sysfs);
+        };
         let node = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -295,28 +301,67 @@ impl Motor {
             return None;
         }
         Some(Motor {
-            node,
+            backend: MotorBackend::Evdev {
+                node,
+                id: effect.id,
+            },
             name,
-            id: effect.id,
+            running: false,
+        })
+    }
+
+    fn open_sysfs(sysfs: &Path) -> Option<Motor> {
+        let dir = first_dir(&sysfs.join("class/power_supply"), |dir| {
+            let path = dir.join("moto");
+            path.is_file() && fs::OpenOptions::new().write(true).open(path).is_ok()
+        })?;
+        let path = dir.join("moto");
+        Some(Motor {
+            name: format!("{}/moto", dir.file_name()?.to_string_lossy()),
+            backend: MotorBackend::Sysfs {
+                path,
+                warned: false,
+            },
             running: false,
         })
     }
 
     fn play(&mut self, on: bool) {
+        match &mut self.backend {
+            MotorBackend::Evdev { node, id } => match Self::play_evdev(node, *id, on) {
+                Ok(()) => self.running = on,
+                Err(e) => eprintln!("slot: rumble: {e}"),
+            },
+            MotorBackend::Sysfs { path, warned } => {
+                let result = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&*path)
+                    .and_then(|mut node| node.write_all(if on { b"1" } else { b"0" }));
+                match result {
+                    Ok(()) => self.running = on,
+                    Err(e) if !*warned => {
+                        eprintln!("slot: rumble {}: {e}", path.display());
+                        *warned = true;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    fn play_evdev(mut node: &fs::File, id: i16, on: bool) -> std::io::Result<()> {
         let ev = FfEvent {
             sec: 0,
             usec: 0,
             kind: EV_FF,
-            code: self.id as u16,
+            code: id as u16,
             value: i32::from(on),
         };
         let bytes = unsafe {
             std::slice::from_raw_parts(&ev as *const FfEvent as *const u8, size_of::<FfEvent>())
         };
-        match (&self.node).write_all(bytes) {
-            Ok(()) => self.running = on,
-            Err(e) => eprintln!("slot: rumble: {e}"),
-        }
+        node.write_all(bytes)
     }
 }
 
@@ -347,15 +392,24 @@ fn read_number(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn charge_at(dir: &Path) -> Charge {
-    let Ok(text) = fs::read_to_string(dir.join("status")) else {
-        return Charge::Unknown;
-    };
-    match text.trim() {
-        "Charging" => Charge::Charging,
+fn charge_at(dir: &Path, sysfs: &Path) -> Charge {
+    let text = fs::read_to_string(dir.join("status")).unwrap_or_default();
+    let charge = match text.trim() {
+        "Charging" => return Charge::Charging,
+        "Full" => return Charge::Full,
         "Discharging" => Charge::Discharging,
-        "Full" => Charge::Full,
         _ => Charge::Unknown,
+    };
+    // Some PMICs report "Not charging" even while external power is online.
+    if first_dir(&sysfs.join("class/power_supply"), |supply| {
+        fs::read_to_string(supply.join("type")).is_ok_and(|t| t.trim() != "Battery")
+            && read_number(&supply.join("online")) == Some(1)
+    })
+    .is_some()
+    {
+        Charge::Charging
+    } else {
+        charge
     }
 }
 
@@ -398,14 +452,14 @@ impl Platform for DevicePlatform {
         let percent = read_number(&dir.join("capacity"))?;
         Some(Battery {
             percent: percent.min(100) as u8,
-            charge: charge_at(dir),
+            charge: charge_at(dir, &self.sysfs),
         })
     }
 
     fn charge(&self) -> Charge {
         self.battery
             .as_ref()
-            .map_or(Charge::Unknown, |dir| charge_at(dir))
+            .map_or(Charge::Unknown, |dir| charge_at(dir, &self.sysfs))
     }
 
     fn set_led(&mut self, state: LedState) {
@@ -432,6 +486,7 @@ impl Platform for DevicePlatform {
     }
 
     fn restart(&mut self) -> ! {
+        self.set_rumble(0);
         self.breadcrumb("restart: reached slot, about to sync");
         let _ = Command::new("sync").status();
         self.breadcrumb("restart: sync returned, about to signal init");
@@ -441,6 +496,7 @@ impl Platform for DevicePlatform {
     }
 
     fn poweroff(&mut self) -> ! {
+        self.set_rumble(0);
         self.breadcrumb("poweroff: reached slot, about to sync");
         let _ = Command::new("sync").status();
         self.breadcrumb("poweroff: sync returned, about to signal init");

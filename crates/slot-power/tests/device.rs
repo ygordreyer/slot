@@ -102,6 +102,84 @@ fn everything_else_is_unknown_rather_than_a_guess() {
     assert_eq!(charge_of(None), Charge::Unknown);
 }
 
+fn supply(d: &TempDir, name: &str, kind: &str, online: &str) {
+    let dir = d.path().join("class/power_supply").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("type"), format!("{kind}\n")).unwrap();
+    fs::write(dir.join("online"), format!("{online}\n")).unwrap();
+}
+
+#[test]
+fn an_online_charger_overrides_inactive_or_unreadable_battery_status() {
+    for kind in ["Mains", "USB"] {
+        for status in [
+            Some("Not charging"),
+            Some("Discharging"),
+            Some("Unknown"),
+            None,
+        ] {
+            let d = sysfs_with("255", "87", status);
+            supply(&d, "ac", kind, "1");
+            let p = platform(&d);
+            assert_eq!(p.charge(), Charge::Charging, "{kind}: {status:?}");
+            assert_eq!(p.battery().unwrap().charge, Charge::Charging);
+        }
+    }
+}
+
+#[test]
+fn an_offline_charger_preserves_the_battery_status_mapping() {
+    for (status, expected) in [
+        (Some("Not charging"), Charge::Unknown),
+        (Some("Discharging"), Charge::Discharging),
+        (Some("Unknown"), Charge::Unknown),
+        (None, Charge::Unknown),
+    ] {
+        let d = sysfs_with("255", "87", status);
+        supply(&d, "ac", "Mains", "0");
+        let p = platform(&d);
+        assert_eq!(p.charge(), expected);
+        assert_eq!(p.battery().unwrap().charge, expected);
+    }
+}
+
+#[test]
+fn full_and_charging_keep_their_meaning_with_an_online_charger() {
+    for (status, expected) in [("Full", Charge::Full), ("Charging", Charge::Charging)] {
+        let d = sysfs_with("255", "87", Some(status));
+        supply(&d, "ac", "Mains", "1");
+        let p = platform(&d);
+        assert_eq!(p.charge(), expected);
+        assert_eq!(p.battery().unwrap().charge, expected);
+    }
+}
+
+#[test]
+fn only_a_known_non_battery_supply_with_online_one_counts_as_a_charger() {
+    let d = sysfs_with("255", "87", Some("Not charging"));
+    supply(&d, "axp2202-battery", "Battery", "1");
+    supply(&d, "ac", "Mains", "10");
+    supply(&d, "unknown", "USB", "1");
+    fs::remove_file(d.path().join("class/power_supply/unknown/type")).unwrap();
+    assert_eq!(platform(&d).charge(), Charge::Unknown);
+    fs::write(d.path().join("class/power_supply/ac/online"), "invalid").unwrap();
+    assert_eq!(platform(&d).charge(), Charge::Unknown);
+    fs::remove_file(d.path().join("class/power_supply/ac/online")).unwrap();
+    assert_eq!(platform(&d).charge(), Charge::Unknown);
+}
+
+#[test]
+fn charger_online_is_read_again_after_the_platform_is_probed() {
+    let d = sysfs_with("255", "87", Some("Not charging"));
+    supply(&d, "ac", "Mains", "0");
+    let p = platform(&d);
+    assert_eq!(p.charge(), Charge::Unknown);
+    supply(&d, "ac", "Mains", "1");
+    assert_eq!(p.charge(), Charge::Charging);
+    supply(&d, "ac", "Mains", "0");
+    assert_eq!(p.battery().unwrap().charge, Charge::Unknown);
+}
+
 #[test]
 fn the_gauge_and_the_charge_state_come_back_together() {
     let d = sysfs_with("255", "87", Some("Charging"));
@@ -223,6 +301,103 @@ fn only_the_edge_between_still_and_moving_reaches_the_motor() {
     assert_eq!(motor_change(65_535, true), None);
     assert_eq!(motor_change(1, true), None);
     assert_eq!(motor_change(0, true), Some(false));
+}
+
+fn moto(d: &TempDir, name: &str) -> PathBuf {
+    let dir = d.path().join("class/power_supply").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("moto");
+    fs::write(&path, "untouched").unwrap();
+    path
+}
+
+#[test]
+fn the_sysfs_motor_fallback_writes_only_on_state_changes() {
+    let d = tempfile::tempdir().unwrap();
+    let path = moto(&d, "axp2202-battery");
+    assert!(rumble_node(d.path()).is_none());
+    let mut p = platform(&d);
+    assert!(p.report().contains("motor axp2202-battery/moto"));
+    p.set_rumble(0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "untouched");
+    p.set_rumble(1);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "1");
+    fs::write(&path, "running sentinel").unwrap();
+    p.set_rumble(u16::MAX);
+    p.set_rumble(1);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "running sentinel");
+    p.set_rumble(0);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "0");
+    fs::write(&path, "stopped sentinel").unwrap();
+    p.set_rumble(0);
+    drop(p);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "stopped sentinel");
+}
+
+#[test]
+fn dropping_a_running_sysfs_motor_stops_it() {
+    let d = tempfile::tempdir().unwrap();
+    let path = moto(&d, "axp2202-battery");
+    let mut p = platform(&d);
+    p.set_rumble(100);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "1");
+    drop(p);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "0");
+}
+
+#[test]
+fn the_first_writable_sysfs_motor_in_sorted_order_is_selected() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let d = tempfile::tempdir().unwrap();
+    let later = moto(&d, "z-battery");
+    let first = moto(&d, "axp2202-battery");
+    let readonly = moto(&d, "a-readonly");
+    fs::set_permissions(&readonly, fs::Permissions::from_mode(0o444)).unwrap();
+    let readonly_writable = fs::OpenOptions::new().write(true).open(&readonly).is_ok();
+    let directory = d.path().join("class/power_supply/a-directory/moto");
+    fs::create_dir_all(directory).unwrap();
+    let mut p = platform(&d);
+    p.set_rumble(1);
+    assert_eq!(
+        fs::read_to_string(&first).unwrap(),
+        if readonly_writable { "untouched" } else { "1" }
+    );
+    assert_eq!(fs::read_to_string(later).unwrap(), "untouched");
+    assert_eq!(
+        fs::read_to_string(readonly).unwrap(),
+        if readonly_writable { "1" } else { "untouched" }
+    );
+}
+
+#[test]
+fn an_evdev_rumble_node_still_wins_over_the_sysfs_motor() {
+    let d = tempfile::tempdir().unwrap();
+    let path = moto(&d, "axp2202-battery");
+    let caps = d.path().join("class/input/event1/device/capabilities");
+    fs::create_dir_all(&caps).unwrap();
+    fs::write(caps.join("ff"), "107030000 0\n").unwrap();
+    assert_eq!(rumble_node(d.path()).as_deref(), Some("event1"));
+    let mut p = platform(&d);
+    assert!(!p.report().contains("axp2202-battery/moto"));
+    p.set_rumble(1);
+    drop(p);
+    assert_eq!(fs::read_to_string(path).unwrap(), "untouched");
+}
+
+#[test]
+fn a_failed_sysfs_motor_write_does_not_panic_or_recreate_the_node() {
+    let d = tempfile::tempdir().unwrap();
+    let path = moto(&d, "axp2202-battery");
+    let mut p = platform(&d);
+    p.set_rumble(1);
+    fs::remove_file(&path).unwrap();
+    p.set_rumble(0);
+    p.set_rumble(0);
+    assert!(!path.exists());
+    fs::write(&path, "restored").unwrap();
+    p.set_rumble(0);
+    assert_eq!(fs::read_to_string(path).unwrap(), "0");
 }
 
 fn leds(d: &TempDir, name: &str, attrs: &[(&str, &str)]) {
