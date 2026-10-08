@@ -3,6 +3,7 @@
 use crate::keyboard::{panel_blit, panel_face, panel_legend, panel_rect, panel_text};
 use crate::plate::UndoFace;
 use crate::power_menu::MENU_PX;
+use slot_store::wifi_status::{WifiFailure, WifiPhase, WifiStatus};
 
 pub const WIFI_ROWS: usize = 6;
 
@@ -24,6 +25,31 @@ pub struct WifiMenu<'a> {
 }
 
 impl WifiMenu<'_> {
+    pub fn status_text(status: &WifiStatus) -> Option<String> {
+        let phase = status.phase.or_else(|| {
+            (status.ssid.is_some() && status.ip.is_some()).then_some(WifiPhase::Connected)
+        })?;
+        Some(match phase {
+            WifiPhase::Idle => return None,
+            WifiPhase::Associating => "Associating...".into(),
+            WifiPhase::Authenticating => "Authenticating...".into(),
+            WifiPhase::ObtainingAddress => "Obtaining an address...".into(),
+            WifiPhase::Failed(reason) => match reason {
+                WifiFailure::WrongPassword => "Wrong password",
+                WifiFailure::NetworkNotFound => "Network not found",
+                WifiFailure::NoAddress => "No DHCP lease",
+                WifiFailure::Other => "Could not connect to network",
+            }
+            .into(),
+            WifiPhase::Connected => match (status.signal, &status.ip, &status.ssid) {
+                (Some(signal), Some(ip), _) => format!("Connected: {signal} ({ip})"),
+                (Some(signal), _, _) => format!("Connected: {signal}"),
+                (None, Some(ip), Some(ssid)) => format!("Connected: {ip} ({ssid})"),
+                _ => "Connected".into(),
+            },
+        })
+    }
+
     pub fn face(&self) -> UndoFace {
         let mut face = panel_face();
         panel_text(&mut face, "Wi-Fi Networks", 24, 10, 672, MENU_PX);
@@ -93,4 +119,57 @@ fn lock(face: &mut UndoFace, x: u32, y: u32) {
         x,
         y,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slot_store::wifi_status::WifiSignal;
+
+    #[test]
+    fn phase_and_live_signal_status_text() {
+        for (phase, signal, expected) in [
+            (WifiPhase::Associating, None, "Associating..."),
+            (WifiPhase::Authenticating, None, "Authenticating..."),
+            (WifiPhase::ObtainingAddress, None, "Obtaining an address..."),
+            (
+                WifiPhase::Failed(WifiFailure::WrongPassword),
+                None,
+                "Wrong password",
+            ),
+            (
+                WifiPhase::Failed(WifiFailure::NetworkNotFound),
+                None,
+                "Network not found",
+            ),
+            (
+                WifiPhase::Failed(WifiFailure::NoAddress),
+                None,
+                "No DHCP lease",
+            ),
+            (
+                WifiPhase::Failed(WifiFailure::Other),
+                None,
+                "Could not connect to network",
+            ),
+            (
+                WifiPhase::Connected,
+                Some(WifiSignal::Dbm(-54)),
+                "Connected: -54 dBm (192.168.1.2)",
+            ),
+            (
+                WifiPhase::Connected,
+                Some(WifiSignal::Quality(71)),
+                "Connected: 71% (192.168.1.2)",
+            ),
+        ] {
+            let status = WifiStatus {
+                phase: Some(phase),
+                signal,
+                ip: Some("192.168.1.2".into()),
+                ..Default::default()
+            };
+            assert_eq!(WifiMenu::status_text(&status).as_deref(), Some(expected));
+        }
+    }
 }

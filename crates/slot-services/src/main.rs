@@ -364,20 +364,15 @@ fn serve(root: &Path, run: &Path) -> std::io::Result<()> {
                         );
                     }
                     ("service", "status") => {
+                        let status = home.status();
                         respond(
                             &mut stream,
                             0,
                             &format!(
-                                "home_enabled={} home_connected={} home_error={} link={} freq={:?} home_ssid={} home_ip={}",
-                                home.enabled,
-                                home.enabled
-                                    && connected(&home.interface.status())
-                                    && home.interface.has_ip(),
-                                home.error,
+                                "{} link={} freq={:?}",
+                                status.to_wire(),
                                 link.role,
                                 link.freq,
-                                if home.enabled && connected(&home.interface.status()) { config::hex(&home.active_ssid) } else { String::new() },
-                                home_lan_address(&home).map(|ip| ip.to_string()).unwrap_or_default()
                             ),
                         );
                     }

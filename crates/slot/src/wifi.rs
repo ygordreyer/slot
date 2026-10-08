@@ -130,13 +130,7 @@ pub fn decode_ssid(text: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WifiStatus {
-    pub enabled: Option<bool>,
-    pub ssid: Option<String>,
-    pub ip: Option<String>,
-    pub error: String,
-}
+pub use slot_store::wifi_status::{WifiFailure, WifiPhase, WifiSignal, WifiStatus};
 
 /// Radio access is isolated from screen state, storage and host builds.
 pub trait WifiRadio: Send {
@@ -169,6 +163,8 @@ impl WifiRadio for HostWifi {
             ssid: Some(ssid.into()),
             ip: Some("192.0.2.2".into()),
             error: String::new(),
+            phase: Some(WifiPhase::Connected),
+            signal: None,
         };
         Ok(())
     }
@@ -233,25 +229,7 @@ pub fn hex(text: &str) -> String {
 }
 
 pub fn parse_status(text: &str) -> WifiStatus {
-    let value = |key| text.split_whitespace().find_map(|s| s.strip_prefix(key));
-    let ssid = value("home_ssid=").and_then(|s| {
-        if s.len() % 2 != 0 || !s.is_ascii() {
-            return None;
-        }
-        let bytes: Option<Vec<_>> = (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-            .collect();
-        String::from_utf8(bytes?).ok().filter(|s| !s.is_empty())
-    });
-    WifiStatus {
-        enabled: value("home_enabled=").and_then(|s| s.parse().ok()),
-        ssid,
-        ip: value("home_ip=")
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned),
-        error: value("home_error=").unwrap_or("").into(),
-    }
+    WifiStatus::parse(text)
 }
 
 fn wifi_error(error: &str) -> String {
@@ -269,6 +247,7 @@ fn wifi_error(error: &str) -> String {
         "COMMAND_TIMEOUT" | "COMMAND_FAILED" => "Wi-Fi request failed. Try again",
         "NETWORK_NOT_SAVED" => "Network is no longer saved. Rescan",
         "WRONG_PASSWORD" => "Wrong password",
+        "NETWORK_NOT_FOUND" => "Network not found",
         "NO_DHCP_LEASE" => "No DHCP lease",
         "HOME_CONNECT_FAILED" => "Could not connect to network",
         _ => return error.to_owned(),
@@ -702,14 +681,40 @@ impl WifiScreen {
             self.enabled = false;
             self.connecting = None;
             self.status = wifi_error("HOME_DISABLED");
-        } else if let (Some(ssid), Some(ip)) = (&status.ssid, &status.ip) {
-            if self.connecting.as_ref().is_none_or(|target| target == ssid) {
-                self.status = format!("Connected: {ip} ({ssid})");
+        } else if status.phase == Some(WifiPhase::Connected)
+            || (status.phase.is_none() && status.ssid.is_some() && status.ip.is_some())
+        {
+            if self
+                .connecting
+                .as_ref()
+                .is_none_or(|target| status.ssid.as_ref() == Some(target))
+            {
+                if let Some(text) = WifiMenu::status_text(&status) {
+                    self.status = text;
+                }
                 self.connecting = None;
             }
         } else if !status.error.is_empty() && status.error != "NO_NETWORKS" {
             self.status = wifi_error(&status.error);
             self.connecting = None;
+        } else if let Some(text) = WifiMenu::status_text(&status) {
+            self.status = text;
+            if matches!(status.phase, Some(WifiPhase::Failed(_))) {
+                self.connecting = None;
+            }
+        } else if status.phase == Some(WifiPhase::Idle)
+            && self.connecting.is_none()
+            && matches!(
+                self.observed.phase,
+                Some(
+                    WifiPhase::Associating
+                        | WifiPhase::Authenticating
+                        | WifiPhase::ObtainingAddress
+                        | WifiPhase::Connected
+                )
+            )
+        {
+            self.status = "Choose a network".into();
         }
         self.observed = status;
     }
@@ -1174,6 +1179,7 @@ mod tests {
                 ssid: Some("Home".into()),
                 ip: Some("192.168.1.2".into()),
                 error: String::new(),
+                ..Default::default()
             };
             let mut keyboard = Keyboard::new("Password for MyNetwork", 8, 63, true);
             keyboard.input(KeyboardInput::Type);

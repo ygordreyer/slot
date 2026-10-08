@@ -6,7 +6,9 @@ use common::{clocked, tmp_root_with_carts};
 use slot::app::{App, Phase};
 use slot::link_radio::{RadioJob, RadioJobs};
 use slot::session::Session;
-use slot::wifi::{HostWifi, NearbyNetwork, WifiRadio, WifiStatus};
+use slot::wifi::{
+    parse_status, HostWifi, NearbyNetwork, WifiRadio, WifiReply, WifiScreen, WifiStatus,
+};
 use slot_input::{Action, Btn, RawEvent};
 use slot_store::{read_slot_state, read_wifi};
 use slot_ui::QuickRow;
@@ -28,6 +30,143 @@ fn await_scan(app: &mut App) {
         app.tick_ms(1000);
         assert!(Instant::now() < deadline, "scan worker did not finish");
         std::thread::yield_now();
+    }
+}
+
+#[test]
+fn network_screen_displays_service_phases_and_refreshes_live_signal() {
+    let mut screen = WifiScreen::new(true);
+    for (fields, expected) in [
+        ("home_phase=ASSOCIATING", "Associating..."),
+        ("home_phase=OBTAINING_ADDRESS", "Obtaining an address..."),
+        (
+            "home_phase=FAILED home_failure=WRONG_PASSWORD",
+            "Wrong password",
+        ),
+        (
+            "home_phase=CONNECTED home_ssid=486f6d65 home_ip=192.168.1.2 home_signal_dbm=-54",
+            "Connected: -54 dBm (192.168.1.2)",
+        ),
+        (
+            "home_phase=CONNECTED home_ssid=486f6d65 home_ip=192.168.1.2 home_signal_dbm=-65",
+            "Connected: -65 dBm (192.168.1.2)",
+        ),
+        (
+            "home_phase=CONNECTED home_ssid=486f6d65 home_ip=192.168.1.2 home_signal_quality=71",
+            "Connected: 71% (192.168.1.2)",
+        ),
+    ] {
+        screen.reply(WifiReply::Status(Ok(parse_status(&format!(
+            "0 home_enabled=true {fields}"
+        )))));
+        assert_eq!(screen.status, expected);
+    }
+    let legacy = "0 home_enabled=true home_ssid=486f6d65 home_ip=192.168.1.2 home_error=";
+    let status = parse_status(legacy);
+    assert_eq!(parse_status(&status.to_wire()), status);
+    assert!(status.phase.is_none() && status.signal.is_none());
+    screen.reply(WifiReply::Status(Ok(status)));
+    assert_eq!(screen.status, "Connected: 192.168.1.2 (Home)");
+}
+
+#[test]
+fn network_forgotten_message_survives_idle_status_polls() {
+    let mut screen = WifiScreen::new(true);
+    let idle = parse_status("0 home_enabled=true home_phase=IDLE");
+    screen.reply(WifiReply::Scan(Ok((Vec::new(), Vec::new(), idle.clone()))));
+    screen.reply(WifiReply::Changed(Ok(Vec::new())));
+    assert_eq!(screen.status, "Network forgotten");
+    for _ in 0..2 {
+        screen.reply(WifiReply::Status(Ok(idle.clone())));
+        assert_eq!(screen.status, "Network forgotten");
+    }
+}
+
+#[test]
+fn unsupported_network_message_survives_idle_status_polls() {
+    let mut screen = WifiScreen::new(true);
+    let idle = parse_status("0 home_enabled=true home_phase=IDLE");
+    screen.reply(WifiReply::Scan(Ok((
+        vec![NearbyNetwork {
+            ssid: "Office".into(),
+            signal: -40,
+            secured: true,
+            supported: false,
+        }],
+        Vec::new(),
+        idle.clone(),
+    ))));
+    assert!(screen.input(Btn::A).is_none());
+    let expected = "Only WPA2 personal or open networks are supported";
+    assert_eq!(screen.status, expected);
+    for _ in 0..2 {
+        screen.reply(WifiReply::Status(Ok(idle.clone())));
+        assert_eq!(screen.status, expected);
+    }
+}
+
+#[test]
+fn idle_status_clears_stale_connection_phase_messages() {
+    for (phase, expected) in [
+        ("ASSOCIATING", "Associating..."),
+        ("AUTHENTICATING", "Authenticating..."),
+        ("OBTAINING_ADDRESS", "Obtaining an address..."),
+    ] {
+        let mut screen = WifiScreen::new(true);
+        screen.reply(WifiReply::Status(Ok(parse_status(&format!(
+            "0 home_enabled=true home_phase={phase}"
+        )))));
+        assert_eq!(screen.status, expected);
+        screen.reply(WifiReply::Status(Ok(parse_status(
+            "0 home_enabled=true home_phase=IDLE",
+        ))));
+        assert_eq!(screen.status, "Choose a network");
+    }
+}
+
+#[test]
+fn idle_status_clears_a_dropped_connection_message() {
+    let mut screen = WifiScreen::new(true);
+    screen.reply(WifiReply::Status(Ok(parse_status(
+        "0 home_enabled=true home_phase=CONNECTED home_ssid=486f6d65 home_ip=192.168.1.2",
+    ))));
+    assert_eq!(screen.status, "Connected: 192.168.1.2 (Home)");
+    screen.reply(WifiReply::Status(Ok(parse_status(
+        "0 home_enabled=true home_phase=IDLE",
+    ))));
+    assert_eq!(screen.status, "Choose a network");
+}
+
+#[test]
+fn initial_idle_status_preserves_scan_messages() {
+    let mut screen = WifiScreen::new(true);
+    let idle = parse_status("0 home_enabled=true home_phase=IDLE");
+    assert!(screen.observed.phase.is_none());
+    assert_eq!(screen.status, "Scanning...");
+    screen.reply(WifiReply::Status(Ok(idle.clone())));
+    assert_eq!(screen.status, "Scanning...");
+    screen.reply(WifiReply::Scan(Ok((Vec::new(), Vec::new(), idle.clone()))));
+    assert_eq!(screen.status, "Choose a network");
+    screen.reply(WifiReply::Status(Ok(idle)));
+    assert_eq!(screen.status, "Choose a network");
+}
+
+#[test]
+fn request_error_messages_survive_idle_status_polls() {
+    for reply in [
+        WifiReply::Scan(Err("COMMAND_FAILED".into())),
+        WifiReply::Changed(Err("COMMAND_FAILED".into())),
+    ] {
+        let mut screen = WifiScreen::new(true);
+        let idle = parse_status("0 home_enabled=true home_phase=IDLE");
+        screen.reply(WifiReply::Status(Ok(idle.clone())));
+        screen.reply(reply);
+        let expected = "Wi-Fi request failed. Try again";
+        assert_eq!(screen.status, expected);
+        for _ in 0..2 {
+            screen.reply(WifiReply::Status(Ok(idle.clone())));
+            assert_eq!(screen.status, expected);
+        }
     }
 }
 

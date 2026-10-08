@@ -2,6 +2,7 @@
 
 use crate::config::{self, Network};
 use crate::system::{self, field, output, Process};
+use slot_store::wifi_status::{WifiFailure, WifiPhase, WifiSignal, WifiStatus};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -274,6 +275,96 @@ pub fn connected(status: &str) -> bool {
     field(status, "wpa_state") == Some("COMPLETED")
 }
 
+fn connection_phase(status: &str, has_ip: bool, attempting: bool, error: &str) -> WifiPhase {
+    if connected(status) && has_ip {
+        return WifiPhase::Connected;
+    }
+    if !error.is_empty() && error != "NO_NETWORKS" {
+        return WifiPhase::Failed(WifiFailure::from_error(error));
+    }
+    match field(status, "wpa_state") {
+        Some("COMPLETED") => WifiPhase::ObtainingAddress,
+        Some("AUTHENTICATING" | "4WAY_HANDSHAKE" | "GROUP_HANDSHAKE") => WifiPhase::Authenticating,
+        Some("SCANNING" | "ASSOCIATING" | "ASSOCIATED") => WifiPhase::Associating,
+        _ if attempting => WifiPhase::Associating,
+        _ => WifiPhase::Idle,
+    }
+}
+
+fn iw_signal(text: &str) -> Option<i32> {
+    if !text.lines().any(|line| line.starts_with("Connected to ")) {
+        return None;
+    }
+    text.lines().find_map(|line| {
+        let mut words = line.trim().strip_prefix("signal:")?.split_whitespace();
+        let dbm = words.next()?.parse::<i32>().ok()?;
+        (words.next()? == "dBm" && (-127..=0).contains(&dbm)).then_some(dbm)
+    })
+}
+
+fn wireless_quality(text: &str, interface: &str) -> Option<u8> {
+    text.lines().find_map(|line| {
+        let (name, values) = line.split_once(':')?;
+        if name.trim() != interface {
+            return None;
+        }
+        let quality = values
+            .split_whitespace()
+            .nth(1)?
+            .trim_end_matches('.')
+            .parse::<u32>()
+            .ok()?;
+        // Wireless extensions conventionally report link quality on a scale of 70.
+        Some((quality.min(70) * 100 / 70) as u8)
+    })
+}
+
+fn read_signal_with(
+    interface: &str,
+    proc_path: &Path,
+    mut command: impl FnMut(&str, &[&str]) -> Result<String, &'static str>,
+) -> Option<WifiSignal> {
+    if let Ok(text) = command("iw", &["dev", interface, "link"]) {
+        if text.trim() == "Not connected." {
+            return None;
+        }
+        if let Some(dbm) = iw_signal(&text) {
+            return Some(WifiSignal::Dbm(dbm));
+        }
+    }
+    wireless_quality(&fs::read_to_string(proc_path).ok()?, interface).map(WifiSignal::Quality)
+}
+
+struct SignalCache {
+    value: Option<WifiSignal>,
+    refresh_at: Instant,
+}
+
+impl SignalCache {
+    fn new() -> Self {
+        Self {
+            value: None,
+            refresh_at: Instant::now(),
+        }
+    }
+
+    fn refresh_with(
+        &mut self,
+        now: Instant,
+        linked: bool,
+        interface: &str,
+        proc_path: &Path,
+        command: impl FnMut(&str, &[&str]) -> Result<String, &'static str>,
+    ) {
+        if !linked {
+            self.value = None;
+        } else if now >= self.refresh_at {
+            self.refresh_at = now + Duration::from_secs(3);
+            self.value = read_signal_with(interface, proc_path, command);
+        }
+    }
+}
+
 // Do not infer a safe transmit channel from a configured frequency. Read regulatory flags.
 pub fn permitted(info: &str, freq: u32) -> bool {
     info.lines().any(|l| {
@@ -334,6 +425,7 @@ pub struct Home {
     connected: bool,
     requested: bool,
     pub active_ssid: String,
+    signal: SignalCache,
 }
 impl Home {
     pub fn new(run: &Path) -> Self {
@@ -353,6 +445,7 @@ impl Home {
             active_ssid,
             requested: false,
             connected,
+            signal: SignalCache::new(),
         }
     }
     pub fn enable(&mut self, enabled: bool, root: &Path) {
@@ -363,6 +456,7 @@ impl Home {
         if !enabled {
             self.interface.stop();
             self.connected = false;
+            self.signal.value = None;
         } else {
             self.reload(root);
         }
@@ -373,6 +467,7 @@ impl Home {
         if self.interface.wpa.is_some() {
             self.interface.stop();
             self.connected = false;
+            self.signal.value = None;
         }
     }
     pub fn reload(&mut self, root: &Path) {
@@ -418,12 +513,50 @@ impl Home {
         self.interface.stop();
         self.connected = false;
         self.active_ssid.clear();
+        self.signal.value = None;
         self.profiles = vec![profile];
         self.next = 0;
         self.requested = true;
         self.error = "";
         self.retry = Instant::now();
         Ok(())
+    }
+
+    fn refresh_signal(&mut self, linked: bool) {
+        let path = std::env::var_os("SLOT_PROC_WIRELESS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/proc/net/wireless"));
+        self.signal
+            .refresh_with(Instant::now(), linked, self.interface.name, &path, output);
+    }
+
+    pub fn status(&mut self) -> WifiStatus {
+        let supplicant = if self.enabled {
+            self.interface.status()
+        } else {
+            String::new()
+        };
+        let linked = self.enabled && connected(&supplicant);
+        let ip = linked.then(|| self.interface.ipv4()).flatten();
+        self.refresh_signal(linked);
+        let phase = if self.enabled {
+            connection_phase(
+                &supplicant,
+                ip.is_some(),
+                self.interface.wpa.is_some() || self.requested,
+                self.error,
+            )
+        } else {
+            WifiPhase::Idle
+        };
+        WifiStatus {
+            enabled: Some(self.enabled),
+            ssid: linked.then(|| self.active_ssid.clone()),
+            ip: ip.map(|ip| ip.to_string()),
+            error: self.error.into(),
+            phase: Some(phase),
+            signal: linked.then_some(self.signal.value).flatten(),
+        }
     }
 
     pub fn prepare_scan(
@@ -461,6 +594,7 @@ impl Home {
         let now = Instant::now();
         if self.interface.wpa.is_some() {
             let status = self.interface.status();
+            self.refresh_signal(connected(&status));
             if connected(&status) {
                 // Also reap/restart a renewal worker that died after the first lease.
                 if let Err(e) = self.interface.dhcp() {
@@ -481,6 +615,7 @@ impl Home {
             self.error = connection_error(&status, &auth_log);
             self.interface.stop();
             self.connected = false;
+            self.signal.value = None;
             self.retry = now + Duration::from_secs(2);
         }
         if now < self.retry {
@@ -546,6 +681,162 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IW_LINK: &str = "Connected to 00:11:22:33:44:55 (on wlan0)\n\tSSID: Home\n\tfreq: 2412\n\tRX: 26010 bytes (158 packets)\n\tsignal: -54 dBm\n\ttx bitrate: 72.2 MBit/s MCS 7 short GI\n";
+    const WIRELESS: &str = "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n wlan1: 0000   20.  -80.  -256        0      0      0      0      0        0\n wlan0: 0000   50.  -54.  -256        0      0      0      0      0        0\n";
+
+    #[test]
+    fn phases_follow_supplicant_lease_and_service_errors() {
+        for state in ["SCANNING", "ASSOCIATING", "ASSOCIATED"] {
+            assert_eq!(
+                connection_phase(&format!("wpa_state={state}"), false, true, ""),
+                WifiPhase::Associating
+            );
+        }
+        for state in ["AUTHENTICATING", "4WAY_HANDSHAKE", "GROUP_HANDSHAKE"] {
+            assert_eq!(
+                connection_phase(&format!("wpa_state={state}"), false, true, ""),
+                WifiPhase::Authenticating
+            );
+        }
+        for state in [
+            "DISCONNECTED",
+            "INACTIVE",
+            "INTERFACE_DISABLED",
+            "UNKNOWN",
+            "",
+        ] {
+            let status = format!("wpa_state={state}");
+            assert_eq!(connection_phase(&status, false, false, ""), WifiPhase::Idle);
+            assert_eq!(
+                connection_phase(&status, false, true, ""),
+                WifiPhase::Associating
+            );
+        }
+        assert_eq!(
+            connection_phase("wpa_state=COMPLETED", false, true, ""),
+            WifiPhase::ObtainingAddress
+        );
+        assert_eq!(
+            connection_phase("wpa_state=COMPLETED", true, true, ""),
+            WifiPhase::Connected
+        );
+        assert_eq!(
+            connection_phase("wpa_state=COMPLETED", true, true, "CONFIG_PARSE"),
+            WifiPhase::Connected
+        );
+        assert_eq!(
+            connection_phase("", false, false, "NO_NETWORKS"),
+            WifiPhase::Idle
+        );
+        for (error, reason) in [
+            ("WRONG_PASSWORD", WifiFailure::WrongPassword),
+            ("NETWORK_NOT_FOUND", WifiFailure::NetworkNotFound),
+            ("NO_DHCP_LEASE", WifiFailure::NoAddress),
+            ("HOME_CONNECT_FAILED", WifiFailure::Other),
+            ("RADIO_UNAVAILABLE", WifiFailure::Other),
+            ("COMMAND_FAILED", WifiFailure::Other),
+        ] {
+            assert_eq!(
+                connection_phase("", false, false, error),
+                WifiPhase::Failed(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn link_signal_parsing_is_bounded_and_tolerates_missing_output() {
+        assert_eq!(iw_signal(IW_LINK), Some(-54));
+        for text in [
+            "Not connected.",
+            "garbage",
+            "",
+            "signal: -54 dBm",
+            "Connected to aa\n signal: NaN dBm",
+            "Connected to aa\n signal: -999 dBm",
+            "Connected to aa\n signal: -54 unknown",
+        ] {
+            assert_eq!(iw_signal(text), None, "{text}");
+        }
+        assert_eq!(wireless_quality(WIRELESS, "wlan0"), Some(71));
+        assert_eq!(wireless_quality(WIRELESS, "wlan1"), Some(28));
+        assert_eq!(wireless_quality(WIRELESS, "wlan2"), None);
+        assert_eq!(wireless_quality("wlan0: 0000 garbage", "wlan0"), None);
+        assert_eq!(wireless_quality("wlan0: 0000 100.", "wlan0"), Some(100));
+    }
+
+    #[test]
+    fn signal_reader_uses_injected_commands_and_proc_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("wireless");
+        fs::write(&path, WIRELESS).unwrap();
+        assert_eq!(
+            read_signal_with("wlan0", &path, |program, args| {
+                assert_eq!(program, "iw");
+                assert_eq!(args, ["dev", "wlan0", "link"]);
+                Ok(IW_LINK.into())
+            }),
+            Some(WifiSignal::Dbm(-54))
+        );
+        for result in [Ok("garbage".into()), Err("TOOL_UNAVAILABLE")] {
+            assert_eq!(
+                read_signal_with("wlan0", &path, |_, _| result.clone()),
+                Some(WifiSignal::Quality(71))
+            );
+        }
+        assert_eq!(
+            read_signal_with("wlan0", &path, |_, _| Ok("Not connected.\n".into())),
+            None
+        );
+        fs::write(&path, "garbage").unwrap();
+        assert_eq!(
+            read_signal_with("wlan0", &path, |_, _| Err("COMMAND_FAILED")),
+            None
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_signal_with("wlan0", &path, |_, _| Err("COMMAND_FAILED")),
+            None
+        );
+    }
+
+    #[test]
+    fn signal_refresh_is_limited_to_three_seconds_and_only_an_up_link() {
+        let mut cache = SignalCache::new();
+        let now = cache.refresh_at;
+        let path = Path::new("/missing-fixture");
+        cache.refresh_with(now, false, "wlan0", path, |_, _| {
+            panic!("disconnected poll")
+        });
+        cache.refresh_with(now, true, "wlan0", path, |_, _| Ok(IW_LINK.into()));
+        assert_eq!(cache.value, Some(WifiSignal::Dbm(-54)));
+        cache.refresh_with(
+            now + Duration::from_millis(2999),
+            true,
+            "wlan0",
+            path,
+            |_, _| panic!("early poll"),
+        );
+        cache.refresh_with(now + Duration::from_secs(3), true, "wlan0", path, |_, _| {
+            Ok(IW_LINK.replace("-54", "-65"))
+        });
+        assert_eq!(cache.value, Some(WifiSignal::Dbm(-65)));
+        cache.refresh_with(
+            now + Duration::from_secs(4),
+            false,
+            "wlan0",
+            path,
+            |_, _| panic!("disconnected poll"),
+        );
+        assert_eq!(cache.value, None);
+        cache.refresh_with(now + Duration::from_secs(4), true, "wlan0", path, |_, _| {
+            panic!("reconnect early poll")
+        });
+        cache.refresh_with(now + Duration::from_secs(6), true, "wlan0", path, |_, _| {
+            Ok("garbage".into())
+        });
+        assert_eq!(cache.value, None);
+    }
     #[test]
     fn scan_preparation_clears_power_down_even_when_a_command_fails() {
         for fail_at in [0, 1, 2] {
@@ -706,6 +997,10 @@ pub fn connection_error(status: &str, log: &str) -> &'static str {
         "NO_DHCP_LEASE"
     } else if log.contains("reason=WRONG_KEY") || log.contains("pre-shared key may be incorrect") {
         "WRONG_PASSWORD"
+    } else if field(status, "wpa_state") == Some("SCANNING")
+        || log.contains("CTRL-EVENT-NETWORK-NOT-FOUND")
+    {
+        "NETWORK_NOT_FOUND"
     } else {
         "HOME_CONNECT_FAILED"
     }
@@ -778,11 +1073,15 @@ mod home_error_tests {
         );
         assert_eq!(
             connection_error("wpa_state=SCANNING\n", ""),
-            "HOME_CONNECT_FAILED"
+            "NETWORK_NOT_FOUND"
         );
         assert_eq!(
             connection_error("wpa_state=DISCONNECTED\n", ""),
             "HOME_CONNECT_FAILED"
+        );
+        assert_eq!(
+            connection_error("wpa_state=DISCONNECTED\n", "CTRL-EVENT-NETWORK-NOT-FOUND"),
+            "NETWORK_NOT_FOUND"
         );
     }
 }

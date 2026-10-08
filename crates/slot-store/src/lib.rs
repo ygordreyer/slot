@@ -14,6 +14,7 @@ mod slot_state;
 mod stamp;
 mod theme;
 mod wifi;
+pub mod wifi_status;
 
 pub use atomic::atomic_write;
 pub use cart_shell::{Outline, ShellChoice, ShellFinish, CART_SHELL_FILE, LABELS_SHELL_FILE};
