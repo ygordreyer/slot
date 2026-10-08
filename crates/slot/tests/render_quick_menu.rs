@@ -118,7 +118,10 @@ fn the_quick_menu_renders_full_screen() {
                 (32..=36).contains(&first),
                 "{name}: {row:?}'s label starts at x {first}"
             );
-            if matches!(row, QuickRow::About | QuickRow::WifiNetworks) {
+            if matches!(
+                row,
+                QuickRow::About | QuickRow::WifiNetworks | QuickRow::RetroAchievements
+            ) {
                 continue;
             }
             let value = inked(&px, 360..OUT_W as usize, top);

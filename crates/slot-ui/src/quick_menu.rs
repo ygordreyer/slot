@@ -18,6 +18,7 @@ pub enum QuickRow {
     Rumble,
     HomeWifi,
     WifiNetworks,
+    RetroAchievements,
     /// Whether every clock slot draws reads 3:07 PM rather than 15:07. Last of the rows the
     /// arrows change, right above the Date & Time it changes the look of.
     TwelveHour,
@@ -26,7 +27,7 @@ pub enum QuickRow {
 }
 
 impl QuickRow {
-    pub const ALL: [QuickRow; 10] = [
+    pub const ALL: [QuickRow; 11] = [
         QuickRow::FastForward,
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
@@ -34,6 +35,7 @@ impl QuickRow {
         QuickRow::Rumble,
         QuickRow::HomeWifi,
         QuickRow::WifiNetworks,
+        QuickRow::RetroAchievements,
         QuickRow::TwelveHour,
         QuickRow::DateTime,
         QuickRow::About,
@@ -51,6 +53,7 @@ impl QuickRow {
             QuickRow::Shader => "Shader",
             QuickRow::Rumble => "Rumble",
             QuickRow::HomeWifi => "Home Wi-Fi",
+            QuickRow::RetroAchievements => "RetroAchievements",
             QuickRow::WifiNetworks => "Wi-Fi Networks",
             QuickRow::TwelveHour => "12-Hour Clock",
             QuickRow::DateTime => "Date & Time",
@@ -61,7 +64,10 @@ impl QuickRow {
     pub fn opens(self) -> bool {
         matches!(
             self,
-            QuickRow::WifiNetworks | QuickRow::DateTime | QuickRow::About
+            QuickRow::WifiNetworks
+                | QuickRow::RetroAchievements
+                | QuickRow::DateTime
+                | QuickRow::About
         )
     }
 

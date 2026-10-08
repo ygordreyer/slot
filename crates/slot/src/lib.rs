@@ -32,4 +32,5 @@ pub mod thumb;
 pub mod video_mode;
 pub mod wallpaper;
 
+pub mod achievement_account;
 pub mod wifi;

@@ -18,6 +18,25 @@ use std::time::{Duration, Instant};
 pub use badges::{load_badge, BadgeImage};
 use slot_retro::RetroCore;
 use storage::{Config, Store, Unlock};
+use zeroize::Zeroizing;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AccountState {
+    pub enabled: bool,
+    pub username: String,
+    pub signed_in: bool,
+    pub busy: bool,
+    pub message: String,
+}
+
+pub enum AccountControl {
+    SignIn {
+        username: String,
+        password: Zeroizing<String>,
+    },
+    SignOut,
+    SetEnabled(bool),
+}
 
 const RAM_SIZE: usize = 0x58000;
 const QUEUE_SIZE: usize = 8;
@@ -35,6 +54,7 @@ pub enum SyncStatus {
 
 #[derive(Default)]
 struct Status {
+    account: Mutex<AccountState>,
     network: AtomicU8,
     unsaved: AtomicBool,
     reconnect: AtomicBool,
@@ -95,6 +115,7 @@ impl Notice {
 }
 
 enum Control {
+    Account(AccountControl),
     Load(network::Load),
     Unload(u64),
     Flush(Arc<AtomicBool>),
@@ -170,6 +191,29 @@ impl Service {
         }
     }
 
+    pub fn account_state(&self) -> AccountState {
+        self.status.account.lock().unwrap().clone()
+    }
+
+    pub fn account_control(&self, control: AccountControl) {
+        let mut account = self.status.account.lock().unwrap();
+        if account.busy {
+            return;
+        }
+        account.busy = true;
+        account.message = match &control {
+            AccountControl::SignIn { .. } => "Signing in...",
+            AccountControl::SignOut => "Signing out...",
+            AccountControl::SetEnabled(_) => "Saving...",
+        }
+        .into();
+        self.enabled.store(false, Ordering::Release);
+        if self.controls.send(Control::Account(control)).is_err() {
+            account.busy = false;
+            account.message = "Achievements worker unavailable".into();
+        }
+    }
+
     pub fn sync_progress(&self) -> Option<u8> {
         self.status.progress.load(Ordering::Acquire).checked_sub(1)
     }
@@ -238,40 +282,53 @@ fn run(
     transport: impl network::Transport + Send + 'static,
 ) {
     let config_path = root.join("Config/retroachievements.toml");
-    if !config_path.exists() {
-        return;
-    }
-    let config = match Config::read(&config_path) {
-        Ok(config) => config,
-        Err(_) => {
-            status.set(SyncStatus::Attention);
-            let _ = notices.send(Notice::status(0, "Invalid RetroAchievements config"));
-            return;
+    let mut config = if config_path.exists() {
+        match Config::read(&config_path) {
+            Ok(config) => config,
+            Err(error) => {
+                status.set(SyncStatus::Attention);
+                status.account.lock().unwrap().message = error.into();
+                Config::default()
+            }
+        }
+    } else {
+        Config::default()
+    };
+    let initial_store = if config.username.is_empty() {
+        Store {
+            dir: root.join("Saves/RetroAchievements/idle"),
+            unlocks: BTreeMap::new(),
+        }
+    } else {
+        match Store::open(&root, &config.username) {
+            Ok(store) => store,
+            Err(error) => {
+                status.set(SyncStatus::Attention);
+                status.account.lock().unwrap().message = error;
+                let dir = storage::account_dir(&root, &config.username);
+                config.username.clear();
+                Store {
+                    dir,
+                    unlocks: BTreeMap::new(),
+                }
+            }
         }
     };
-    if !config.enabled {
-        return;
+    let ready = config.enabled && !config.username.trim().is_empty();
+    if !status.account.lock().unwrap().busy {
+        enabled.store(ready, Ordering::Release);
     }
-    if config.username.trim().is_empty() {
-        status.set(SyncStatus::Attention);
-        let _ = notices.send(Notice::status(0, "Achievements need an account"));
-        return;
-    }
-    let store = match Store::open(&root, &config.username) {
-        Ok(store) => Arc::new(Mutex::new(store)),
-        Err(error) => {
-            status.set(SyncStatus::Attention);
-            let _ = notices.send(Notice::status(0, &error));
-            return;
-        }
-    };
+    let store = Arc::new(Mutex::new(initial_store));
     let (loads, load_rx) = mpsc::channel();
     let (prepared_tx, prepared_rx) = mpsc::channel();
     let network_store = store.clone();
     let network_notices = notices.clone();
     let cached_prepared = prepared_tx.clone();
     let network_status = status.clone();
-    status.set(SyncStatus::Syncing);
+    if ready {
+        status.set(SyncStatus::Syncing);
+    }
+    let network_enabled = enabled.clone();
     if std::thread::Builder::new()
         .name("slot-ra-http".into())
         .spawn(move || {
@@ -283,6 +340,7 @@ fn run(
                 prepared_tx,
                 network_notices,
                 network_status,
+                network_enabled,
                 transport,
             );
         })
@@ -292,7 +350,6 @@ fn run(
         let _ = notices.send(Notice::status(0, "Achievements network worker failed"));
         return;
     }
-    enabled.store(true, Ordering::Release);
     let mut generation = 0;
     let mut playing: Option<Playing> = None;
     let mut unsaved = BTreeMap::new();
@@ -304,17 +361,37 @@ fn run(
             retried = Instant::now();
         }
         loop {
+            if !enabled.load(Ordering::Acquire) {
+                playing = None;
+            }
             // Frames queued before an eject/load must be evaluated before retiring that game.
             for _ in 0..QUEUE_SIZE {
                 let Ok(frame) = frames.try_recv() else {
                     break;
                 };
+                if !enabled.load(Ordering::Acquire) {
+                    playing = None;
+                }
                 evaluate(frame, &mut playing, &store, &notices, &mut unsaved);
             }
             match controls.try_recv() {
                 Ok(Control::Flush(done)) => {
                     retry_unsaved(&mut unsaved, &store, &notices);
                     done.store(true, Ordering::Release);
+                }
+                Ok(Control::Account(control)) => {
+                    retry_unsaved(&mut unsaved, &store, &notices);
+                    if !unsaved.is_empty() && !matches!(&control, AccountControl::SetEnabled(_)) {
+                        let mut account = status.account.lock().unwrap();
+                        account.busy = false;
+                        account.message = "Cannot change account until unlocks are saved".into();
+                        enabled.store(account.enabled && account.signed_in, Ordering::Release);
+                        continue;
+                    }
+                    generation = 0;
+                    playing = None;
+                    *status.presence.lock().unwrap() = None;
+                    let _ = loads.send(network::Command::Account(control));
                 }
                 Ok(Control::Load(load)) => {
                     generation = load.generation;
@@ -342,13 +419,15 @@ fn run(
                             }
                         }
                     }
-                    let _ = loads.send(Some(load));
+                    let _ = loads.send(network::Command::Load(
+                        enabled.load(Ordering::Acquire).then_some(load),
+                    ));
                 }
                 Ok(Control::Unload(id)) if id == generation => {
                     generation = 0;
                     playing = None;
                     *status.presence.lock().unwrap() = None;
-                    let _ = loads.send(None);
+                    let _ = loads.send(network::Command::Load(None));
                 }
                 Ok(_) => {}
                 Err(mpsc::TryRecvError::Disconnected) => return,
@@ -356,7 +435,7 @@ fn run(
             }
         }
         for prepared in prepared_rx.try_iter() {
-            if prepared.generation != generation {
+            if prepared.generation != generation || !enabled.load(Ordering::Acquire) {
                 continue;
             }
             if let Some(game) = playing.as_mut() {
@@ -443,8 +522,14 @@ fn run(
                 warned_gap: false,
             });
         }
+        if !enabled.load(Ordering::Acquire) {
+            playing = None;
+        }
         match frames.recv_timeout(Duration::from_millis(5)) {
             Ok(frame) => {
+                if !enabled.load(Ordering::Acquire) {
+                    playing = None;
+                }
                 evaluate(frame, &mut playing, &store, &notices, &mut unsaved);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,

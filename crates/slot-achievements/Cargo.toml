@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+zeroize = "1"
 slot-retro = { path = "../slot-retro" }
 slot-store = { path = "../slot-store" }
 serde = { version = "1", features = ["derive"] }

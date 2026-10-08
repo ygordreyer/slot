@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+zeroize = "1"
 fontdue = { workspace = true }
 png = { workspace = true }
 resvg = { workspace = true }

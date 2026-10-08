@@ -20,6 +20,7 @@ use slot_ui::{
 };
 use slot_ui::{cheat_window, CheatMenu, CHEAT_ROWS};
 
+use crate::achievement_account::{AccountEffect, AccountScreen};
 use crate::audio::Sfx;
 use crate::core_picker::{Chip, CorePicker, Outcome, Press};
 use crate::link_kind::{link_carried, link_kind, serial_option, LinkKind};
@@ -378,6 +379,10 @@ pub struct App {
     legend_faces: Vec<TexId>,
     undo_face: Option<TexId>,
     clock_faces: Option<(TexId, TexId)>,
+    account_screen: Option<AccountScreen>,
+    account_snapshot: slot_achievements::AccountState,
+    account_control: Option<slot_achievements::AccountControl>,
+    account_face: Option<TexId>,
     wifi_screen: Option<WifiScreen>,
     wifi_worker: Option<WifiWorker>,
     wifi_generation: u64,
@@ -502,6 +507,10 @@ impl App {
             legend_faces: Vec::new(),
             undo_face: None,
             clock_faces: None,
+            account_screen: None,
+            account_snapshot: slot_achievements::AccountState::default(),
+            account_control: None,
+            account_face: None,
             wifi_screen: None,
             wifi_worker: None,
             wifi_generation: 0,
@@ -710,6 +719,42 @@ impl App {
         }
     }
 
+    pub fn account_screen(&self) -> Option<&AccountScreen> {
+        self.account_screen.as_ref()
+    }
+
+    pub fn set_account_panel_face(&mut self, tex: TexId) {
+        self.account_face = Some(tex);
+    }
+
+    pub fn observe_account(&mut self, account: slot_achievements::AccountState) {
+        if let Some(screen) = &mut self.account_screen {
+            screen.observe(account.clone());
+        }
+        self.account_snapshot = account;
+    }
+
+    pub fn take_account_control(&mut self) -> Option<slot_achievements::AccountControl> {
+        self.account_control.take()
+    }
+
+    fn account_input(&mut self, button: Btn) {
+        match self
+            .account_screen
+            .as_mut()
+            .and_then(|screen| screen.input(button))
+        {
+            Some(AccountEffect::Back) => {
+                self.account_screen = None;
+                self.phase = Phase::QuickMenu {
+                    row: QuickRow::RetroAchievements,
+                };
+            }
+            Some(AccountEffect::Control(control)) => self.account_control = Some(control),
+            None => {}
+        }
+    }
+
     pub fn wifi_screen(&self) -> Option<&WifiScreen> {
         self.wifi_screen.as_ref()
     }
@@ -819,9 +864,11 @@ impl App {
             QuickRow::HomeWifi => Some(QuickValue::flag(self.state.home_wifi_enabled)),
             QuickRow::TwelveHour => Some(QuickValue::flag(self.state.twelve_hour)),
             // A name off the card, which `QuickValue` has no face for. The binary rasters it.
-            QuickRow::Shader | QuickRow::WifiNetworks | QuickRow::DateTime | QuickRow::About => {
-                None
-            }
+            QuickRow::Shader
+            | QuickRow::WifiNetworks
+            | QuickRow::RetroAchievements
+            | QuickRow::DateTime
+            | QuickRow::About => None,
         }
     }
 
@@ -1491,6 +1538,14 @@ impl App {
             Action::GbaUp(Btn::Right) => self.shelf_mut().release_right(),
             _ => {}
         }
+        if self.account_screen.is_some() {
+            if let Action::GbaDown(button) = action {
+                self.account_input(button);
+            } else if action == Action::QuickMenu {
+                self.account_screen = None;
+            }
+            return;
+        }
         if self.wifi_screen.is_some() {
             if let Action::GbaDown(button) = action {
                 self.wifi_input(button);
@@ -1610,6 +1665,10 @@ impl App {
             }
             QuickRow::About => self.phase = Phase::About,
             QuickRow::WifiNetworks => self.open_wifi(),
+            QuickRow::RetroAchievements => {
+                self.account_face = None;
+                self.account_screen = Some(AccountScreen::new(self.account_snapshot.clone()));
+            }
             QuickRow::FastForward
             | QuickRow::FastForwardSound
             | QuickRow::ColourCorrection
@@ -1669,7 +1728,10 @@ impl App {
                 self.radio.ask(RadioJob::Home(s.home_wifi_enabled));
             }
             QuickRow::TwelveHour => s.twelve_hour = !s.twelve_hour,
-            QuickRow::WifiNetworks | QuickRow::DateTime | QuickRow::About => return,
+            QuickRow::WifiNetworks
+            | QuickRow::RetroAchievements
+            | QuickRow::DateTime
+            | QuickRow::About => return,
         }
         self.persist();
     }
@@ -2278,6 +2340,25 @@ impl App {
                 });
             }
         }
+        if self.account_screen.is_some() && !matches!(self.phase, Phase::Doze { .. }) {
+            out.push(Draw::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: OUT_W as f32,
+                h: OUT_H as f32,
+                colour: slot_ui::opening(),
+            });
+            if let Some(tex) = self.account_face {
+                out.push(Draw::Tex {
+                    x: 0.0,
+                    y: 0.0,
+                    w: OUT_W as f32,
+                    h: OUT_H as f32,
+                    tex,
+                    alpha: 1.0,
+                });
+            }
+        }
         self.hud.draw(self.now(), out);
     }
 
@@ -2715,6 +2796,7 @@ impl App {
     /// The one function every doze actually goes through: `LidClose` and
     /// `PowerTap` by way of `power_press` both return
     fn doze(&mut self) {
+        self.account_screen = None;
         self.wifi_generation = self.wifi_generation.wrapping_add(1);
         if let Some(worker) = &self.wifi_worker {
             worker.cancel(self.wifi_generation);
@@ -3154,6 +3236,7 @@ impl App {
     }
 
     fn begin_power_off(&mut self) {
+        self.account_screen = None;
         if self.powering_off {
             return;
         }

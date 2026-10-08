@@ -292,7 +292,7 @@ mod tests {
             ],
             Duration::from_secs(1),
         );
-        let error = result.err().expect("the command succeeded");
+        let error = result.expect_err("the command succeeded");
         assert_eq!(error.code, "COMMAND_FAILED");
         assert_eq!(
             error.stderr,

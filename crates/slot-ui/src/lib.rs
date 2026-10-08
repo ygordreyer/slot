@@ -1,3 +1,4 @@
+mod account_menu;
 mod art;
 mod backdrop;
 mod barcode;
@@ -25,6 +26,7 @@ mod sticker;
 pub mod text;
 mod toast;
 mod wifi_menu;
+pub use account_menu::AccountMenu;
 
 pub use backdrop::{draw_backdrop, wallpaper_face};
 pub use barcode::{code39, CODE39_NARROW, CODE39_WIDE};

@@ -1,5 +1,7 @@
 //! Reusable ASCII text entry with button-only editing and a separate raster view.
 
+use zeroize::Zeroize;
+
 use crate::plate::{hint_face, UndoFace, HINT_H, LEGEND_GAP};
 use crate::power_menu::{MENU_INK, MENU_PX};
 use crate::text::{self, Layout};
@@ -35,6 +37,7 @@ pub enum KeyboardResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keyboard {
+    secure: bool,
     pub title: String,
     text: String,
     cursor: usize,
@@ -49,10 +52,17 @@ pub struct Keyboard {
     pub hint: String,
 }
 
+impl Drop for Keyboard {
+    fn drop(&mut self) {
+        self.clear_secret();
+    }
+}
+
 impl Keyboard {
     pub fn new(title: impl Into<String>, min: usize, max: usize, password: bool) -> Self {
         assert!(min <= max);
         Self {
+            secure: false,
             title: title.into(),
             text: String::new(),
             cursor: 0,
@@ -65,6 +75,20 @@ impl Keyboard {
             allow_empty: false,
             max,
             hint: String::new(),
+        }
+    }
+
+    pub fn secret(title: impl Into<String>, min: usize, max: usize) -> Self {
+        let mut keyboard = Self::new(title, min, max, true);
+        keyboard.secure = true;
+        keyboard.text.reserve(max);
+        keyboard
+    }
+
+    pub fn clear_secret(&mut self) {
+        if self.secure {
+            self.text.zeroize();
+            self.cursor = 0;
         }
     }
 
@@ -126,7 +150,12 @@ impl Keyboard {
             KeyboardInput::Confirm
                 if self.text.len() >= self.min || (self.allow_empty && self.text.is_empty()) =>
             {
-                return KeyboardResult::Confirmed(self.text.clone())
+                return KeyboardResult::Confirmed(if self.secure {
+                    self.cursor = 0;
+                    std::mem::take(&mut self.text)
+                } else {
+                    self.text.clone()
+                })
             }
             KeyboardInput::Confirm => self.hint = format!("Enter at least {} characters", self.min),
         }
@@ -324,6 +353,20 @@ mod tests {
         k.input(Delete);
         k.input(Delete);
         assert_eq!(k.input(Delete), KeyboardResult::Cancelled);
+    }
+
+    #[test]
+    fn secret_entry_transfers_ownership_and_explicit_clear_empties_the_buffer() {
+        let mut keyboard = Keyboard::secret("Password", 1, 127);
+        keyboard.input(Type);
+        assert_eq!(
+            keyboard.input(Confirm),
+            KeyboardResult::Confirmed("a".into())
+        );
+        assert!(keyboard.text().is_empty());
+        keyboard.input(Type);
+        keyboard.clear_secret();
+        assert!(keyboard.text().is_empty());
     }
 
     #[test]

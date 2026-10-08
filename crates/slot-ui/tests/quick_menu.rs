@@ -88,6 +88,7 @@ fn the_rows_run_in_the_order_the_user_chose() {
             "Rumble",
             "Home Wi-Fi",
             "Wi-Fi Networks",
+            "RetroAchievements",
             "12-Hour Clock",
             "Date & Time",
             "About"
@@ -96,7 +97,12 @@ fn the_rows_run_in_the_order_the_user_chose() {
     let opens: Vec<QuickRow> = QuickRow::ALL.into_iter().filter(|r| r.opens()).collect();
     assert_eq!(
         opens,
-        [QuickRow::WifiNetworks, QuickRow::DateTime, QuickRow::About]
+        [
+            QuickRow::WifiNetworks,
+            QuickRow::RetroAchievements,
+            QuickRow::DateTime,
+            QuickRow::About
+        ]
     );
 }
 

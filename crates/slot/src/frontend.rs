@@ -53,6 +53,8 @@ pub struct Frontend {
     quick_shader: QuickClock,
     wifi_shown: Option<crate::wifi::WifiScreen>,
     wifi_tex: Option<TexId>,
+    account_tex: Option<TexId>,
+    account_shown: Option<u64>,
     cheats: CheatFaces,
 }
 
@@ -129,6 +131,8 @@ impl Frontend {
             about: AboutFace::default(),
             quick_clock: QuickClock::default(),
             quick_shader: QuickClock::default(),
+            account_tex: None,
+            account_shown: None,
             wifi_shown: None,
             wifi_tex: None,
             cheats: CheatFaces {
@@ -326,6 +330,18 @@ impl Frontend {
         sync_quick_shader(self.session.app_mut(), compositor, &mut self.quick_shader);
         sync_shader(&mut self.session, compositor);
         sync_cheats(self.session.app_mut(), compositor, &mut self.cheats);
+        if let Some(screen) = self.session.app().account_screen() {
+            if self.account_shown != Some(screen.revision()) {
+                let face = screen.face();
+                self.account_shown = Some(screen.revision());
+                let tex = upload(compositor, &mut self.account_tex, face);
+                self.session.app_mut().set_account_panel_face(tex);
+            } else if let Some(tex) = self.account_tex {
+                self.session.app_mut().set_account_panel_face(tex);
+            }
+        } else {
+            self.account_shown = None;
+        }
         if let Some(screen) = self.session.app().wifi_screen() {
             if self.wifi_shown.as_ref() != Some(screen) {
                 let face = screen.face();

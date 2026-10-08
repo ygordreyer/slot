@@ -2,21 +2,43 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Config {
+    #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub token: String,
+    #[serde(default)]
     pub password: String,
 }
 
 impl Config {
     pub fn read(path: &Path) -> Result<Self, &'static str> {
-        let text = std::fs::read_to_string(path).map_err(|_| "Cannot read achievement config")?;
+        let text = Zeroizing::new(
+            std::fs::read_to_string(path).map_err(|_| "Cannot read achievement config")?,
+        );
         // TOML diagnostics include source lines, which may contain credentials.
         toml::from_str(&text).map_err(|_| "Invalid achievement config")
+    }
+
+    pub fn save(&self, root: &Path) -> Result<(), String> {
+        let dir = root.join("Config");
+        std::fs::create_dir_all(&dir).map_err(|_| "Cannot create achievement settings")?;
+        let username = serde_json::to_string(&self.username).map_err(|_| "Invalid username")?;
+        let text = format!("enabled = {}\nusername = {}\n", self.enabled, username);
+        private_write(&dir.join("retroachievements.toml"), text.as_bytes())
+    }
+}
+
+impl Drop for Config {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.token.zeroize();
     }
 }
 
@@ -81,10 +103,14 @@ pub(crate) struct Store {
     pub unlocks: BTreeMap<u32, Unlock>,
 }
 
+pub(crate) fn account_dir(root: &Path, username: &str) -> PathBuf {
+    let account = format!("{:x}", md5::compute(username.to_lowercase()));
+    root.join("Saves/RetroAchievements").join(account)
+}
+
 impl Store {
     pub fn open(root: &Path, username: &str) -> Result<Self, String> {
-        let account = format!("{:x}", md5::compute(username.to_lowercase()));
-        let dir = root.join("Saves/RetroAchievements").join(account);
+        let dir = account_dir(root, username);
         std::fs::create_dir_all(&dir).map_err(|_| "Cannot create achievement cache")?;
         #[cfg(unix)]
         {
@@ -140,12 +166,38 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Str
 
 pub(crate) fn write(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|_| "Cannot encode achievement data")?;
-    slot_store::atomic_write(path, &bytes).map_err(|_| "Cannot save achievement data")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // FAT cards may not support Unix permissions. No credentials are ever logged.
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    private_write(path, &bytes)
+}
+
+fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    Ok(())
+    result.map_err(|_| "Cannot save achievement data".into())
 }

@@ -196,7 +196,7 @@ impl Session {
     pub fn feed(&mut self, events: impl IntoIterator<Item = RawEvent>, now: Millis) {
         let mut actions = Vec::new();
         for ev in events {
-            if self.app.wifi_screen().is_some() {
+            if self.app.wifi_screen().is_some() || self.app.account_screen().is_some() {
                 let button = match ev {
                     RawEvent::Down(button) | RawEvent::Up(button) => button,
                 };
@@ -262,7 +262,9 @@ impl Session {
             _ => {}
         }
         let menu = self.overlaid();
+        self.app.observe_account(self.achievements.account_state());
         self.bridge_link(|app| app.apply(action));
+        self.sync_account();
         if matches!(
             action,
             Action::VolumeUp | Action::VolumeDown | Action::MuteToggle
@@ -283,7 +285,15 @@ impl Session {
         self.sync_rumble();
     }
 
+    fn sync_account(&mut self) {
+        if let Some(control) = self.app.take_account_control() {
+            self.achievements.account_control(control);
+        }
+        self.app.observe_account(self.achievements.account_state());
+    }
+
     pub fn update(&mut self, dt: f32) {
+        self.sync_account();
         self.bridge_link(|app| app.update(dt));
         let connected = self.app.home_connected();
         if connected && !self.home_connected {

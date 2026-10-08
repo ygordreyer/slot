@@ -2621,6 +2621,7 @@ dependencies = [
  "slot-ui",
  "tempfile",
  "winit",
+ "zeroize",
 ]
 
 [[package]]
@@ -2637,6 +2638,7 @@ dependencies = [
  "tempfile",
  "toml 1.1.7+spec-1.1.0",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -2717,6 +2719,7 @@ dependencies = [
  "slot-store",
  "tempfile",
  "usvg",
+ "zeroize",
 ]
 
 [[package]]

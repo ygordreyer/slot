@@ -6,7 +6,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::storage::{self, Auth, Config, Game, Store, Unlock};
-use crate::{Notice, Status, SyncStatus};
+use crate::{AccountControl, Notice, Status, SyncStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use zeroize::Zeroize;
+
+pub(crate) enum Command {
+    Load(Option<Load>),
+    Account(AccountControl),
+}
 
 const API: &str = "https://retroachievements.org/dorequest.php";
 const VERSION: &str = "12.2.1";
@@ -36,6 +43,27 @@ pub(crate) trait Transport {
     fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure>;
     fn badge(&mut self, _name: &str) -> Result<Vec<u8>, Failure> {
         Err(Failure::Invalid)
+    }
+}
+
+struct EnabledTransport<'a, T> {
+    inner: &'a mut T,
+    enabled: &'a AtomicBool,
+}
+
+impl<T: Transport> Transport for EnabledTransport<'_, T> {
+    fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(Failure::Network);
+        }
+        self.inner.call(fields)
+    }
+
+    fn badge(&mut self, name: &str) -> Result<Vec<u8>, Failure> {
+        if !self.enabled.load(Ordering::Acquire) {
+            return Err(Failure::Network);
+        }
+        self.inner.badge(name)
     }
 }
 
@@ -112,38 +140,133 @@ fn call(
     success(http.call(&fields)?)
 }
 
-fn login(
+struct LoginError {
+    failure: Failure,
+    message: String,
+}
+
+struct LoginFields(Vec<(&'static str, String)>);
+impl Drop for LoginFields {
+    fn drop(&mut self) {
+        for (_, value) in &mut self.0 {
+            value.zeroize();
+        }
+    }
+}
+
+fn login_error(error: Failure) -> LoginError {
+    let message = if error == Failure::Network {
+        "Can't reach RetroAchievements"
+    } else {
+        "Invalid RetroAchievements response"
+    };
+    LoginError {
+        failure: error,
+        message: message.into(),
+    }
+}
+
+fn rejection(value: &Value, config: &Config) -> LoginError {
+    let text: String = value["Error"]
+        .as_str()
+        .unwrap_or("Sign in rejected")
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .collect();
+    // Check before truncation and after removing controls, so echoed secrets cannot escape.
+    let raw = value["Error"].as_str().unwrap_or("");
+    let unsafe_text = [&config.username, &config.password, &config.token]
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .any(|secret| {
+            raw.to_ascii_lowercase()
+                .contains(&secret.to_ascii_lowercase())
+                || text
+                    .to_ascii_lowercase()
+                    .contains(&secret.to_ascii_lowercase())
+        });
+    let printable: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    let exposes_secret = |message: &str| {
+        [&config.username, &config.password, &config.token]
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .any(|secret| {
+                message
+                    .to_ascii_lowercase()
+                    .contains(&secret.to_ascii_lowercase())
+            })
+    };
+    let fallback = || {
+        for message in ["Sign in rejected", "Rejected"] {
+            if !exposes_secret(message) {
+                return message.to_string();
+            }
+        }
+        (33u8..=126)
+            .map(|byte| (byte as char).to_string())
+            .find(|message| !exposes_secret(message))
+            .unwrap()
+    };
+    let message = if unsafe_text || printable.trim().is_empty() {
+        fallback()
+    } else {
+        let message: String = printable.chars().take(80).collect();
+        if exposes_secret(&message) {
+            fallback()
+        } else {
+            message
+        }
+    };
+    LoginError {
+        failure: Failure::Rejected,
+        message,
+    }
+}
+
+fn login_detailed(
     http: &mut impl Transport,
     config: &Config,
     remembered: Option<&Auth>,
-) -> Result<Auth, Failure> {
-    let mut fields = vec![("r", "login2".into()), ("u", config.username.clone())];
+) -> Result<Auth, LoginError> {
+    let mut fields = LoginFields(vec![("r", "login2".into()), ("u", config.username.clone())]);
     if !config.token.is_empty() {
-        fields.push(("t", config.token.clone()));
+        fields.0.push(("t", config.token.clone()));
     } else if let Some(auth) = remembered {
-        fields.push(("t", auth.token.clone()));
+        fields.0.push(("t", auth.token.clone()));
     } else {
-        fields.push(("p", config.password.clone()));
+        fields.0.push(("p", config.password.clone()));
     }
-    let response = match http.call(&fields).and_then(success) {
-        Err(Failure::Rejected) if config.token.is_empty() && !config.password.is_empty() => {
-            // A remembered token can expire. An explicitly supplied password can renew it.
-            success(http.call(&[
-                ("r", "login2".into()),
-                ("u", config.username.clone()),
-                ("p", config.password.clone()),
-            ])?)?
+    let mut response = http.call(&fields.0).map_err(login_error)?;
+    if response["Success"] != Value::Bool(true)
+        && remembered.is_some()
+        && config.token.is_empty()
+        && !config.password.is_empty()
+    {
+        let retry = LoginFields(vec![
+            ("r", "login2".into()),
+            ("u", config.username.clone()),
+            ("p", config.password.clone()),
+        ]);
+        response = http.call(&retry.0).map_err(login_error)?;
+    }
+    if response["Success"] != Value::Bool(true) {
+        let error = rejection(&response, config);
+        if let Some(Value::String(message)) = response.get_mut("Error") {
+            message.zeroize();
         }
-        result => result?,
-    };
+        return Err(error);
+    }
     let username = response["User"]
         .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or(Failure::Invalid)?;
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| login_error(Failure::Invalid))?;
     let token = response["Token"]
         .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or(Failure::Invalid)?;
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| login_error(Failure::Invalid))?;
     Ok(Auth {
         username: username.into(),
         token: token.into(),
@@ -270,17 +393,31 @@ fn prefetch(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     root: PathBuf,
-    config: Config,
+    mut config: Config,
     store: Arc<Mutex<Store>>,
-    loads: mpsc::Receiver<Option<Load>>,
+    loads: mpsc::Receiver<Command>,
     prepared: mpsc::Sender<Prepared>,
     notices: mpsc::Sender<Notice>,
     status: Arc<Status>,
+    enabled: Arc<AtomicBool>,
     mut http: impl Transport,
 ) {
-    let dir = store.lock().unwrap().dir.clone();
+    let mut dir = store.lock().unwrap().dir.clone();
     let mut auth: Option<Auth> = storage::read(&dir.join("auth.json")).ok();
+    {
+        let mut account = status.account.lock().unwrap();
+        account.enabled = config.enabled;
+        account.username = config.username.clone();
+        account.signed_in = auth.is_some();
+        if !account.busy && account.message.is_empty() {
+            account.message = auth.as_ref().map_or_else(
+                || "Signed out".into(),
+                |a| format!("Signed in as {}", a.username),
+            );
+        }
+    }
     let mut verified = false;
+    let mut save_settings_after_login = false;
     let mut active: Option<Active> = None;
     let mut next_attempt = Instant::now();
     let mut delay = 30;
@@ -293,10 +430,7 @@ pub(crate) fn run(
     let mut badges = crate::badges::Queue::new(&dir);
     loop {
         match loads.recv_timeout(Duration::from_millis(200)) {
-            Ok(mut load) => {
-                while let Ok(newer) = loads.try_recv() {
-                    load = newer;
-                }
+            Ok(Command::Load(load)) => {
                 active = load.and_then(|load| {
                     // GBA identification is the MD5 of the complete uncompressed ROM.
                     // File I/O and hashing happen here, never on the emulator/UI threads.
@@ -329,8 +463,135 @@ pub(crate) fn run(
                 next_attempt = Instant::now();
                 warned = false;
             }
+            Ok(Command::Account(command)) => {
+                active = None;
+                let result = (|| -> Result<(), String> {
+                    match command {
+                        AccountControl::SignIn { username, password } => {
+                            if auth.is_some() {
+                                return Err("Sign out first".into());
+                            }
+                            if username.trim().is_empty() || password.is_empty() {
+                                return Err("Enter username and password".into());
+                            }
+                            let mut credentials = Config::default();
+                            credentials.username = username;
+                            credentials.password = password.to_string();
+                            let result = login_detailed(&mut http, &credentials, None);
+                            credentials.password.zeroize();
+                            drop(password);
+                            let logged_in = result.map_err(|e| e.message)?;
+                            let new_store = Store::open(&root, &logged_in.username)?;
+                            storage::write(&new_store.dir.join("auth.json"), &logged_in)?;
+                            config.username = logged_in.username.clone();
+                            config.token.zeroize();
+                            config.password.zeroize();
+                            auth = Some(logged_in);
+                            verified = true;
+                            *store.lock().unwrap() = new_store;
+                            config.save(&root)?;
+                            save_settings_after_login = false;
+                        }
+                        AccountControl::SignOut => {
+                            match std::fs::remove_file(dir.join("auth.json")) {
+                                Ok(()) => {
+                                    if let Ok(directory) = std::fs::File::open(&dir) {
+                                        let _ = directory.sync_all();
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(_) => return Err("Cannot remove saved session".into()),
+                            }
+                            auth = None;
+                            verified = false;
+                            config.username.clear();
+                            config.password.zeroize();
+                            config.token.zeroize();
+                            config.save(&root)?;
+                            save_settings_after_login = false;
+                        }
+                        AccountControl::SetEnabled(value) => {
+                            config.enabled = value;
+                            verified = false;
+                            if auth.is_none()
+                                && (!config.password.is_empty() || !config.token.is_empty())
+                            {
+                                // Do not discard a legacy credential until its replacement is durable.
+                                save_settings_after_login = true;
+                                let logged_in = login_detailed(&mut http, &config, None)
+                                    .map_err(|error| error.message)?;
+                                let new_store = Store::open(&root, &logged_in.username)?;
+                                storage::write(&new_store.dir.join("auth.json"), &logged_in)?;
+                                config.username = logged_in.username.clone();
+                                auth = Some(logged_in);
+                                verified = true;
+                                *store.lock().unwrap() = new_store;
+                            }
+                            config.save(&root)?;
+                            if auth.is_some() {
+                                config.password.zeroize();
+                                config.token.zeroize();
+                            }
+                            save_settings_after_login = false;
+                        }
+                    }
+                    Ok(())
+                })();
+                dir = store.lock().unwrap().dir.clone();
+                library = if config.username.is_empty() {
+                    Default::default()
+                } else {
+                    crate::library::pending(&root, &dir, now())
+                };
+                library_total = library.len();
+                library_failed = false;
+                badges = crate::badges::Queue::new(&dir);
+                rescanned = Instant::now();
+                next_attempt = Instant::now();
+                warned = false;
+                delay = 30;
+                let mut account = status.account.lock().unwrap();
+                account.enabled = config.enabled;
+                account.username = config.username.clone();
+                account.signed_in = auth.is_some();
+                account.busy = false;
+                status.set(if result.is_err() {
+                    SyncStatus::Attention
+                } else if config.enabled && auth.is_some() {
+                    SyncStatus::Syncing
+                } else {
+                    SyncStatus::Disabled
+                });
+                account.message = match result {
+                    Ok(()) => auth.as_ref().map_or_else(
+                        || "Signed out".into(),
+                        |a| format!("Signed in as {}", a.username),
+                    ),
+                    Err(error) => error,
+                };
+                enabled.store(
+                    config.enabled
+                        && !config.username.is_empty()
+                        && (auth.is_some()
+                            || !config.token.is_empty()
+                            || !config.password.is_empty()),
+                    Ordering::Release,
+                );
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if !config.enabled
+            || config.username.trim().is_empty()
+            || !enabled.load(Ordering::Acquire)
+            || (auth.is_none() && config.token.is_empty() && config.password.is_empty())
+        {
+            if status.get() != SyncStatus::Attention {
+                status.set(SyncStatus::Disabled);
+            }
+            status.pending.store(false, Ordering::Release);
+            status.progress.store(0, Ordering::Release);
+            continue;
         }
         // Metadata preparation and badge downloads each occupy half of a cache refresh.
         status.pending.store(
@@ -378,17 +639,40 @@ pub(crate) fn run(
             status.set(SyncStatus::Syncing);
         }
         let result = (|| -> Result<(), Failure> {
+            let mut http = EnabledTransport {
+                inner: &mut http,
+                enabled: &enabled,
+            };
             if !verified {
-                let logged_in = login(&mut http, &config, auth.as_ref()).map_err(|e| {
-                    if e == Failure::Rejected {
-                        Failure::Authentication
-                    } else {
-                        e
-                    }
-                })?;
+                let logged_in =
+                    login_detailed(&mut http, &config, auth.as_ref()).map_err(|error| {
+                        let mut account = status.account.lock().unwrap();
+                        if !account.busy {
+                            account.message = error.message;
+                        }
+                        if error.failure == Failure::Rejected {
+                            Failure::Authentication
+                        } else {
+                            error.failure
+                        }
+                    })?;
                 storage::write(&dir.join("auth.json"), &logged_in).map_err(|_| Failure::Invalid)?;
                 auth = Some(logged_in);
                 verified = true;
+                config.password.zeroize();
+                config.token.zeroize();
+                if save_settings_after_login {
+                    config.save(&root).map_err(|_| Failure::Invalid)?;
+                    save_settings_after_login = false;
+                }
+                let mut account = status.account.lock().unwrap();
+                account.signed_in = true;
+                if !account.busy {
+                    account.message = format!("Signed in as {}", auth.as_ref().unwrap().username);
+                }
+            }
+            if !enabled.load(Ordering::Acquire) {
+                return Ok(());
             }
             let auth = auth.as_ref().ok_or(Failure::Invalid)?;
             // Rotate through pending awards so one rejected/deleted achievement does not
@@ -420,6 +704,9 @@ pub(crate) fn run(
                     Err(Failure::Network) => return Err(Failure::Network),
                     Err(error) => deferred_error = Some(error),
                 }
+            }
+            if !enabled.load(Ordering::Acquire) {
+                return Ok(());
             }
             if let Some(game) = active.as_mut() {
                 if !game.online {
@@ -474,6 +761,9 @@ pub(crate) fn run(
                     game.last_ping = Instant::now();
                 }
             }
+            if !enabled.load(Ordering::Acquire) {
+                return Ok(());
+            }
             // One ROM per pass, with a one-second gap. Prefetch uses `unlocks`, not
             // `startsession`, so preparing a library doesn't claim the user played it.
             if let Some(path) = library.front() {
@@ -498,7 +788,9 @@ pub(crate) fn run(
                     let _ = notices.send(Notice::status(0, "Offline achievement cache ready"));
                 }
             }
-            badges.step(&mut http);
+            if enabled.load(Ordering::Acquire) {
+                badges.step(&mut http);
+            }
             deferred_error.map_or(Ok(()), Err)
         })();
         status.pending.store(
@@ -519,6 +811,10 @@ pub(crate) fn run(
             .map_or(0, |percent| percent + 1),
             std::sync::atomic::Ordering::Release,
         );
+        if !enabled.load(Ordering::Acquire) {
+            status.set(SyncStatus::Disabled);
+            continue;
+        }
         match result {
             Ok(()) => {
                 status.set(if library_failed || badges.waiting {
@@ -554,7 +850,7 @@ pub(crate) fn run(
                         }
                         Failure::Network => "Achievements need internet once",
                         Failure::Rejected => "Achievement sync needs attention",
-                        Failure::Authentication => "Achievements: check account config",
+                        Failure::Authentication => "Achievements: sign in again",
                         Failure::Invalid => "Achievements: data or storage error",
                     };
                     let _ = notices.send(Notice::status(generation, title));

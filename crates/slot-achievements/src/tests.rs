@@ -729,3 +729,351 @@ fn tracked_forwards_cheats_clearing_and_the_cores_result() {
     assert!(!tracked.set_cheats(&["unsupported".into()]));
     assert_eq!(tracked.serialize().unwrap(), [1]);
 }
+
+struct AccountServer {
+    requests: mpsc::Sender<Vec<(String, String)>>,
+    reply: Result<Value, network::Failure>,
+}
+impl network::Transport for AccountServer {
+    fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+        self.requests
+            .send(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.clone()))
+                    .collect(),
+            )
+            .ok();
+        match &self.reply {
+            Ok(reply) => Ok(reply.clone()),
+            Err(_) => Err(network::Failure::Network),
+        }
+    }
+}
+fn sign_in(service: &Service) {
+    service.account_control(AccountControl::SignIn {
+        username: "Player".into(),
+        password: Zeroizing::new("private-password".into()),
+    });
+    wait_for(|| !service.account_state().busy);
+}
+fn account_service(
+    root: &Path,
+    reply: Result<Value, network::Failure>,
+) -> (Service, mpsc::Receiver<Vec<(String, String)>>) {
+    let (requests, received) = mpsc::channel();
+    (
+        Service::start_with(root.into(), AccountServer { requests, reply }),
+        received,
+    )
+}
+
+#[test]
+fn an_idle_worker_can_sign_in_save_toggle_resume_and_sign_out() {
+    let root = tempfile::tempdir().unwrap();
+    let (service, requests) = account_service(
+        root.path(),
+        Ok(json!({"Success":true,"User":"Player","Token":"saved-token"})),
+    );
+    wait_for(|| service.flush_ready());
+    assert_eq!(service.sync_status(), SyncStatus::Disabled);
+    sign_in(&service);
+    assert_eq!(service.account_state().message, "Signed in as Player");
+    assert!(service.account_state().signed_in);
+    assert!(!service.account_state().enabled);
+    let store = Store::open(root.path(), "Player").unwrap();
+    let auth: Auth = storage::read(&store.dir.join("auth.json")).unwrap();
+    assert_eq!(auth.token, "saved-token");
+    let settings = root.path().join("Config/retroachievements.toml");
+    let text = std::fs::read_to_string(&settings).unwrap();
+    let parsed: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(parsed.as_table().unwrap().len(), 2);
+    assert!(parsed.get("password").is_none());
+    assert!(parsed.get("token").is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(store.dir.join("auth.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&store.dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+    let first = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(first.contains(&("p".into(), "private-password".into())));
+    for on in [true, false, true] {
+        service.account_control(AccountControl::SetEnabled(on));
+        wait_for(|| !service.account_state().busy);
+        assert_eq!(service.account_state().enabled, on);
+        if on {
+            let fields = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(fields.contains(&("t".into(), "saved-token".into())));
+            assert!(!fields.iter().any(|(key, _)| key == "p"));
+        } else {
+            assert!(store.dir.join("auth.json").exists());
+            assert!(!service.enabled.load(Ordering::Acquire));
+            assert!(requests.recv_timeout(Duration::from_millis(250)).is_err());
+        }
+    }
+    service.account_control(AccountControl::SignOut);
+    wait_for(|| !service.account_state().busy);
+    assert!(!service.account_state().signed_in);
+    assert_eq!(service.account_state().message, "Signed out");
+    assert!(!store.dir.join("auth.json").exists());
+    assert!(Config::read(&settings).unwrap().username.is_empty());
+    assert!(!service.enabled.load(Ordering::Acquire));
+    assert!(requests.recv_timeout(Duration::from_millis(250)).is_err());
+}
+
+#[test]
+fn sign_in_errors_are_safe_and_transport_is_distinct() {
+    for (reply, expected) in [
+        (
+            Ok(json!({"Success":false,"Error":"Wrong credentials\n\u{1b}☃"})),
+            "Wrong credentials",
+        ),
+        (
+            Ok(json!({"Success":false,"Error":"No Player: private-password"})),
+            "Sign in rejected",
+        ),
+        (
+            Ok(json!({"Success":false,"Error":"pLaYeR"})),
+            "Sign in rejected",
+        ),
+        (
+            Ok(json!({"Success":false,"Error":"Pla\u{1b}yer"})),
+            "Sign in rejected",
+        ),
+        (
+            Ok(json!({"Success":true,"User":"Player","Token":""})),
+            "Invalid RetroAchievements response",
+        ),
+        (
+            Ok(json!({"Success":true,"User":"Player"})),
+            "Invalid RetroAchievements response",
+        ),
+        (
+            Err(network::Failure::Network),
+            "Can't reach RetroAchievements",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (service, _) = account_service(root.path(), reply);
+        sign_in(&service);
+        let account = service.account_state();
+        assert_eq!(account.message, expected);
+        assert!(!account.signed_in);
+        assert!(!account.message.contains("Player"));
+        assert!(!account.message.contains("private-password"));
+        assert!(!root.path().join("Config/retroachievements.toml").exists());
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (service, _) = account_service(
+        root.path(),
+        Ok(json!({"Success":false,"Error":"x".repeat(200)})),
+    );
+    sign_in(&service);
+    assert_eq!(service.account_state().message, "x".repeat(80));
+}
+
+#[test]
+fn legacy_password_logs_in_and_a_screen_save_removes_it() {
+    let root = configured();
+    let path = root.path().join("Config/retroachievements.toml");
+    std::fs::write(
+        &path,
+        "enabled = true\nusername = 'Player'\npassword = 'legacy-secret'\n",
+    )
+    .unwrap();
+    let (service, requests) = account_service(
+        root.path(),
+        Ok(json!({"Success":true,"User":"Player","Token":"saved-token"})),
+    );
+    wait_for(|| service.account_state().signed_in);
+    let fields = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(fields.contains(&("p".into(), "legacy-secret".into())));
+    assert!(std::fs::read_to_string(&path).unwrap().contains("password"));
+    service.account_control(AccountControl::SetEnabled(false));
+    wait_for(|| !service.account_state().busy);
+    let settings: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(settings.get("password").is_none());
+    assert!(settings.get("token").is_none());
+    assert!(Store::open(root.path(), "Player")
+        .unwrap()
+        .dir
+        .join("auth.json")
+        .exists());
+}
+
+#[test]
+fn account_changes_retire_current_runtime_until_the_next_load() {
+    let root = configured();
+    let rom = root.path().join("Games/GBA/Test.gba");
+    std::fs::write(&rom, b"fixture ROM").unwrap();
+    let (calls, _) = mpsc::channel();
+    let service = Service::start_with(root.path().into(), Server { calls });
+    wait_for(|| service.account_state().signed_in);
+    let mut core = service.wrap(Box::<TestCore>::default());
+    core.load(&rom).unwrap();
+    wait_for(|| {
+        service
+            .take_notice()
+            .is_some_and(|n| n.title.starts_with("Achievements ready"))
+    });
+    service.account_control(AccountControl::SetEnabled(false));
+    wait_for(|| !service.account_state().busy);
+    core.run_frame(ButtonMask(0));
+    core.run_frame(ButtonMask(1));
+    service.account_control(AccountControl::SetEnabled(true));
+    wait_for(|| !service.account_state().busy);
+    core.run_frame(ButtonMask(0));
+    core.run_frame(ButtonMask(1));
+    wait_for(|| service.flush_ready());
+    assert!(Store::open(root.path(), "Player")
+        .unwrap()
+        .unlocks
+        .is_empty());
+    drop(core);
+    let mut core = service.wrap(Box::<TestCore>::default());
+    core.load(&rom).unwrap();
+    wait_for(|| {
+        service
+            .take_notice()
+            .is_some_and(|n| n.title.starts_with("Achievements ready"))
+    });
+    core.run_frame(ButtonMask(0));
+    core.run_frame(ButtonMask(1));
+    wait_for(|| {
+        Store::open(root.path(), "Player")
+            .unwrap()
+            .unlocks
+            .contains_key(&7)
+    });
+}
+
+#[test]
+fn even_short_credentials_cannot_appear_in_rejection_fallbacks() {
+    let root = tempfile::tempdir().unwrap();
+    let (service, _) = account_service(
+        root.path(),
+        Ok(json!({"Success":false,"Error":"in Rejected"})),
+    );
+    service.account_control(AccountControl::SignIn {
+        username: "in".into(),
+        password: Zeroizing::new("Rejected".into()),
+    });
+    wait_for(|| !service.account_state().busy);
+    let message = service.account_state().message;
+    assert!(!message.to_ascii_lowercase().contains("in"));
+    assert!(!message.to_ascii_lowercase().contains("rejected"));
+    assert!(!message.is_empty());
+    assert!(message.bytes().all(|b| (32..=126).contains(&b)));
+}
+
+#[test]
+fn enabling_a_disabled_legacy_account_preserves_credentials_until_token_login_succeeds() {
+    struct Recovering(Arc<AtomicBool>);
+    impl network::Transport for Recovering {
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            assert!(fields
+                .iter()
+                .any(|(key, value)| *key == "p" && value == "legacy-secret"));
+            if self.0.load(Ordering::Acquire) {
+                Ok(json!({"Success":true,"User":"Player","Token":"saved-token"}))
+            } else {
+                Err(network::Failure::Network)
+            }
+        }
+    }
+    let root = configured();
+    let path = root.path().join("Config/retroachievements.toml");
+    std::fs::write(
+        &path,
+        "enabled = false\nusername = 'Player'\npassword = 'legacy-secret'\n",
+    )
+    .unwrap();
+    let online = Arc::new(AtomicBool::new(false));
+    let service = Service::start_with(root.path().into(), Recovering(online.clone()));
+    wait_for(|| service.account_state().username == "Player");
+    service.account_control(AccountControl::SetEnabled(true));
+    wait_for(|| !service.account_state().busy);
+    assert_eq!(
+        service.account_state().message,
+        "Can't reach RetroAchievements"
+    );
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("legacy-secret"));
+    online.store(true, Ordering::Release);
+    service.network_available();
+    wait_for(|| service.account_state().signed_in);
+    let config = Config::read(&path).unwrap();
+    assert!(config.enabled);
+    assert!(config.password.is_empty());
+    assert!(config.token.is_empty());
+    let auth: Auth = storage::read(
+        &Store::open(root.path(), "Player")
+            .unwrap()
+            .dir
+            .join("auth.json"),
+    )
+    .unwrap();
+    assert_eq!(auth.token, "saved-token");
+}
+
+#[test]
+fn turning_off_during_a_request_prevents_following_session_requests() {
+    struct StalledGame {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        server: Server,
+    }
+    impl network::Transport for StalledGame {
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            if fields
+                .iter()
+                .any(|(key, value)| *key == "r" && value == "gameid")
+            {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+            }
+            self.server.call(fields)
+        }
+    }
+    let root = configured();
+    let (calls, requests) = mpsc::channel();
+    let (entered, stalled) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let service = Service::start_with(
+        root.path().into(),
+        StalledGame {
+            entered,
+            release: released,
+            server: Server { calls },
+        },
+    );
+    wait_for(|| service.sync_status() == SyncStatus::Ready);
+    let rom = root.path().join("Games/GBA/Test.gba");
+    std::fs::write(&rom, b"fixture ROM").unwrap();
+    let mut core = service.wrap(Box::<TestCore>::default());
+    core.load(&rom).unwrap();
+    stalled.recv_timeout(Duration::from_secs(2)).unwrap();
+    service.account_control(AccountControl::SetEnabled(false));
+    release.send(()).unwrap();
+    wait_for(|| !service.account_state().busy);
+    assert_eq!(service.sync_status(), SyncStatus::Disabled);
+    assert!(!requests
+        .try_iter()
+        .any(|request| ["patch", "startsession", "ping"].contains(&request.as_str())));
+}
