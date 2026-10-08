@@ -1,3 +1,5 @@
+//! Toast messages, face ordering, and HUD layout.
+
 use slot_ui::{toast_face, toast_rect, Draw, Hud, HudKind, Toast, OUT_W, PLATE_H};
 
 #[test]
@@ -38,6 +40,7 @@ fn the_banner_says_what_happened_and_never_what_is_on_screen() {
             Toast::CheatsOff,
             Toast::NoCheats,
             Toast::ShaderFailed,
+            Toast::TurnCheatsOff,
         ],
         "a banner was added or dropped: every face is uploaded by its place in this list"
     );

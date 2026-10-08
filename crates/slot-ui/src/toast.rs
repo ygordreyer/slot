@@ -1,3 +1,5 @@
+//! Transient HUD messages and their shared banner layout.
+
 use slot_gfx::OUT_W;
 
 use crate::hud::{HUD_INK, PLATE_H};
@@ -23,10 +25,11 @@ pub enum Toast {
     NoCheats,
     /// A shader from `Shaders/` that the driver would not compile. The LCD look is back.
     ShaderFailed,
+    TurnCheatsOff,
 }
 
 impl Toast {
-    pub const ALL: [Toast; 13] = [
+    pub const ALL: [Toast; 14] = [
         Toast::StateSaved,
         Toast::StateLoaded,
         Toast::NeedsGpsp,
@@ -40,6 +43,7 @@ impl Toast {
         Toast::CheatsOff,
         Toast::NoCheats,
         Toast::ShaderFailed,
+        Toast::TurnCheatsOff,
     ];
 
     pub fn index(self) -> usize {
@@ -61,6 +65,7 @@ impl Toast {
             Toast::CheatsOff => "Cheats Off",
             Toast::NoCheats => "No cheats found",
             Toast::ShaderFailed => "Shader failed",
+            Toast::TurnCheatsOff => "Turn cheats off",
         }
     }
 }

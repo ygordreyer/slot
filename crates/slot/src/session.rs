@@ -452,6 +452,7 @@ impl Session {
         let stem = match self.app.phase() {
             Phase::Shelf => {
                 self.emu = None;
+                self.app.set_cheats_applied(false);
                 return;
             }
             Phase::Inserting { cart, .. } => cart.clone(),
@@ -522,10 +523,12 @@ impl Session {
         // Queued behind the load, which is the first thing the worker does, so they land on a
         // loaded game. Never for a cable session: both devices run both consoles from the
         // host's state, and a cheat on one is a machine the other is not simulating.
+        self.app.set_cheats_applied(false);
         if self.app.link_player().is_none() {
             let codes =
                 slot_store::enabled_codes(&slot_store::read_cheats(&self.root, platform, stem));
             if !codes.is_empty() {
+                self.app.set_cheats_applied(true);
                 slot_store::backup_save_once(&self.root, platform, stem);
                 emu.set_cheats(codes);
             }
@@ -586,6 +589,7 @@ impl Session {
             slot_store::backup_save_once(&self.root, platform, &stem);
         }
         if let Some(emu) = &self.emu {
+            self.app.set_cheats_applied(any);
             emu.set_cheats(codes);
         }
         self.app.show_toast(if any {

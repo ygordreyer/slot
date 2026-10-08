@@ -78,13 +78,16 @@ pub fn parse_cht(text: &str) -> Vec<Cheat> {
         .collect();
     let count = kv
         .get("cheats")
-        .and_then(|n| n.trim().parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            (0..)
-                .take_while(|i| kv.contains_key(&format!("cheat{i}_code")))
-                .count()
-        });
-    (0..count)
+        .and_then(|n| n.trim().parse::<usize>().ok());
+    let mut indices: Vec<usize> = kv
+        .keys()
+        .filter_map(|k| k.strip_prefix("cheat")?.strip_suffix("_code")?.parse().ok())
+        .filter(|i| count.is_none_or(|n| *i < n))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+        .into_iter()
         .filter_map(|i| {
             let code = kv.get(&format!("cheat{i}_code"))?.trim().to_string();
             if code.is_empty() {
@@ -212,6 +215,48 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert!(c[0].enabled && !c[1].enabled);
         assert_eq!(c[1].title(), "Cheat 2");
+    }
+
+    #[test]
+    fn a_missing_count_keeps_gaps_in_numeric_order() {
+        let c = parse_cht("cheat10_code = C\ncheat2_code = B\ncheat0_code = A\ncheat4_code = \"\"\ncheatx_code = X\n");
+        assert_eq!(c.iter().map(|c| c.index).collect::<Vec<_>>(), [0, 2, 10]);
+        assert_eq!(
+            c.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            ["A", "B", "C"]
+        );
+    }
+
+    #[test]
+    fn a_missing_count_can_start_at_one() {
+        let c = parse_cht("cheat1_code = A\ncheat3_code = B\n");
+        assert_eq!(c.iter().map(|c| c.index).collect::<Vec<_>>(), [1, 3]);
+    }
+
+    #[test]
+    fn a_valid_count_is_an_exclusive_upper_bound() {
+        let c = parse_cht(
+            "cheats = 2\ncheat0_code = A\ncheat1_code = B\ncheat2_code = C\ncheat10_code = D\n",
+        );
+        assert_eq!(c.iter().map(|c| c.index).collect::<Vec<_>>(), [0, 1]);
+        assert!(parse_cht("cheats = 0\ncheat0_code = A\n").is_empty());
+    }
+
+    #[test]
+    fn an_unparsable_count_keeps_every_numbered_code() {
+        let c = parse_cht("cheats = unknown\ncheat3_code = B\ncheat1_code = A\n");
+        assert_eq!(c.iter().map(|c| c.index).collect::<Vec<_>>(), [1, 3]);
+    }
+
+    #[test]
+    fn writing_back_preserves_sparse_numbers_and_the_count() {
+        let file = "cheats = 4\ncheat1_code = A\ncheat3_code = B\n";
+        let mut c = parse_cht(file);
+        c[1].enabled = true;
+        let out = set_enables(file, &c);
+        assert!(out.starts_with(file));
+        assert!(out.contains("cheat3_enable = true\n"));
+        assert_eq!(parse_cht(&out), c);
     }
 
     #[test]

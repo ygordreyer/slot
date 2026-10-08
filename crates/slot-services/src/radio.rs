@@ -1,8 +1,58 @@
+//! Home and Link radio ownership, association, and bounded scanning.
+
 use crate::config::{self, Network};
 use crate::system::{self, field, output, Process};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+fn supplicant_file_logging(help: &str) -> bool {
+    help.split_whitespace()
+        .any(|word| word == "-f" || word.starts_with("[-f<"))
+}
+
+fn file_logging_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        output("wpa_supplicant", &["-h"]).is_ok_and(|help| supplicant_file_logging(&help))
+    })
+}
+
+fn scan_busy(stderr: &str) -> bool {
+    stderr.contains("Device or resource busy") || stderr.contains("(-16)")
+}
+
+fn scan_with(
+    deadline: Instant,
+    mut command: impl FnMut(bool, Duration) -> Result<String, system::CommandError>,
+) -> Result<String, &'static str> {
+    let mut run = |cached, reserve| {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(reserve);
+        if remaining.is_zero() {
+            return Err(system::CommandError {
+                code: "COMMAND_TIMEOUT",
+                stderr: String::new(),
+            });
+        }
+        command(cached, remaining)
+    };
+    match run(false, Duration::ZERO) {
+        Ok(scan) => Ok(scan),
+        Err(e) if scan_busy(&e.stderr) => {
+            std::thread::sleep(
+                Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            // Leave time to read cached results even if the retry times out.
+            run(false, Duration::from_secs(1))
+                .or_else(|_| run(true, Duration::ZERO))
+                .map_err(|e| e.code)
+        }
+        Err(e) => Err(e.code),
+    }
+}
 
 pub fn net_exists(name: &str) -> bool {
     std::env::var_os("SLOT_NET_SYS")
@@ -85,17 +135,13 @@ impl Interface {
         output("ip", &["link", "set", self.name, "up"])?;
         let log = self.run.join(format!("{}.log", self.name));
         let _ = fs::remove_file(&log);
+        let mut args = vec!["-i", self.name, "-c", conf.to_str().unwrap(), "-Dnl80211"];
+        if file_logging_supported() {
+            args.extend(["-f", log.to_str().unwrap()]);
+        }
         self.wpa = Some(Process::spawn(
             "wpa_supplicant",
-            &[
-                "-i",
-                self.name,
-                "-c",
-                conf.to_str().unwrap(),
-                "-Dnl80211",
-                "-f",
-                log.to_str().unwrap(),
-            ],
+            &args,
             self.run.join(format!("{}.wpa.pid", self.name)),
         )?);
         Ok(())
@@ -367,9 +413,22 @@ impl Home {
         if !net_exists("wlan0") {
             return Err("RADIO_UNAVAILABLE");
         }
-        output("rfkill", &["unblock", "wifi"])?;
-        output("ip", &["link", "set", "wlan0", "up"])?;
-        system::output_timeout("iw", &["dev", "wlan0", "scan"], Duration::from_secs(10))
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let remaining = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(2))
+        };
+        system::output_timeout("rfkill", &["unblock", "wifi"], remaining())?;
+        system::output_timeout("ip", &["link", "set", "wlan0", "up"], remaining())?;
+        scan_with(deadline, |cached, timeout| {
+            let args = if cached {
+                &["dev", "wlan0", "scan", "dump"][..]
+            } else {
+                &["dev", "wlan0", "scan"][..]
+            };
+            system::output_timeout_details("iw", args, timeout)
+        })
     }
 
     pub fn tick(&mut self, root: &Path, link_busy: bool, link_freq: Option<u32>, ours: &[u32]) {
@@ -463,6 +522,81 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_logging_requires_the_compiled_help_option() {
+        let without = "usage:\n  wpa_supplicant [-BddhKLqqtvW] [-P<pid file>] \\\n        -i<ifname> -c<config file> [-D<driver>] [-e<entropy file>]\noptions:\n  -e = entropy file\n  -g = global ctrl_interface\n  -h = show this help text\n";
+        let with = without.replace("[-e<entropy file>]", "[-e<entropy file>] [-f<debug file>]");
+        assert!(!supplicant_file_logging(without));
+        assert!(supplicant_file_logging(&with));
+        assert!(supplicant_file_logging(
+            "options:\n  -f = log output to debug file instead of stdout\n"
+        ));
+        assert!(!supplicant_file_logging(""));
+        assert!(!supplicant_file_logging("  -freq = frequency\n"));
+    }
+
+    fn busy_error() -> system::CommandError {
+        system::CommandError {
+            code: "COMMAND_FAILED",
+            stderr: "command failed: Device or resource busy (-16)\n".into(),
+        }
+    }
+
+    #[test]
+    fn a_busy_scan_retries_once_and_uses_cached_results() {
+        let mut calls = Vec::new();
+        let scan = scan_with(
+            Instant::now() + Duration::from_secs(10),
+            |cached, timeout| {
+                calls.push(cached);
+                assert!(timeout <= Duration::from_secs(10));
+                if cached {
+                    Ok("BSS cached\n".into())
+                } else {
+                    Err(busy_error())
+                }
+            },
+        );
+        assert_eq!(scan, Ok("BSS cached\n".into()));
+        assert_eq!(calls, [false, false, true]);
+    }
+
+    #[test]
+    fn a_busy_scan_can_succeed_on_its_retry() {
+        let mut calls = Vec::new();
+        let scan = scan_with(Instant::now() + Duration::from_secs(10), |cached, _| {
+            calls.push(cached);
+            if calls.len() == 1 {
+                Err(busy_error())
+            } else {
+                Ok("BSS fresh\n".into())
+            }
+        });
+        assert_eq!(scan, Ok("BSS fresh\n".into()));
+        assert_eq!(calls, [false, false]);
+    }
+
+    #[test]
+    fn scan_failures_are_reported_after_the_cache_also_fails() {
+        let mut calls = Vec::new();
+        assert_eq!(
+            scan_with(Instant::now() + Duration::from_secs(10), |cached, _| {
+                calls.push(cached);
+                Err(busy_error())
+            }),
+            Err("COMMAND_FAILED")
+        );
+        assert_eq!(calls, [false, false, true]);
+        assert_eq!(
+            scan_with(Instant::now() + Duration::from_secs(10), |_, _| Err(
+                system::CommandError {
+                    code: "COMMAND_FAILED",
+                    stderr: "command failed: Operation not permitted (-1)\n".into(),
+                }
+            )),
+            Err("COMMAND_FAILED")
+        );
+    }
     #[test]
     fn routes_conflict_without_mistaking_default_or_our_interface() {
         assert!(subnet_conflict("10.0.0.0/8 dev wlan0"));
@@ -598,6 +732,10 @@ mod home_error_tests {
         );
         assert_eq!(
             connection_error("wpa_state=SCANNING\n", ""),
+            "HOME_CONNECT_FAILED"
+        );
+        assert_eq!(
+            connection_error("wpa_state=DISCONNECTED\n", ""),
             "HOME_CONNECT_FAILED"
         );
     }

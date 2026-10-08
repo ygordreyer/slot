@@ -350,6 +350,8 @@ pub struct App {
     /// SELECT+X was pressed with a game on screen. `Session` owns the card and the core, so it
     /// is what reads the cart's cheats and carries them over.
     cheats_pending: bool,
+    /// What Session handed the running core, independent of later edits to the cheat file.
+    cheats_applied: bool,
     /// The cheat list, while it is up. It pauses the game the way the in-game menu does.
     cheat_menu: Option<CheatList>,
     /// Counts the lists opened, so the binary can tell one from the next. See `CheatView`.
@@ -482,6 +484,7 @@ impl App {
             shaders: vec![SHADER_LCD.to_string(), SHADER_OFF.to_string()],
             shader_pending: None,
             cheats_pending: false,
+            cheats_applied: false,
             cheat_menu: None,
             cheat_generation: 0,
             cheat_commit: None,
@@ -861,6 +864,10 @@ impl App {
     /// SELECT+X, handed over once. See `cheats_pending`.
     pub fn take_cheats_toggle(&mut self) -> bool {
         std::mem::take(&mut self.cheats_pending)
+    }
+
+    pub fn set_cheats_applied(&mut self, applied: bool) {
+        self.cheats_applied = applied;
     }
 
     /// A line of the HUD for something `App` did not do itself: the cheats `Session` carried.
@@ -1385,6 +1392,9 @@ impl App {
         if reload.cancelled {
             return self.close_game_menu();
         }
+        if self.refuse_link_cheats() {
+            return self.close_game_menu();
+        }
         let since = match self.game_menu {
             Some(GameMenu::Working { since, .. }) => since,
             _ => self.now(),
@@ -1533,7 +1543,11 @@ impl App {
                 Action::LoadState => self.load_newest(),
                 // Not while linked: the far end runs the same game without them, and two
                 // machines that differ in memory are two games, not one.
-                Action::CheatsToggle if self.link_active() || self.link_player.is_some() => {
+                Action::CheatsToggle
+                    if self.link_active()
+                        || self.link_player.is_some()
+                        || self.reload.is_some() =>
+                {
                     self.refuse()
                 }
                 Action::CheatsToggle => self.cheats_pending = true,
@@ -2924,7 +2938,21 @@ impl App {
     }
 
     pub fn start_link(&mut self, starter: LinkStarter, client_id: u16) {
+        if self.refuse_link_cheats() {
+            let mut starter = starter;
+            starter.cancel();
+            return;
+        }
         self.start_link_from(starter, client_id, self.now());
+    }
+
+    fn refuse_link_cheats(&mut self) -> bool {
+        if !self.cheats_applied {
+            return false;
+        }
+        self.refuse();
+        self.hud.toast(Toast::TurnCheatsOff, self.now());
+        true
     }
 
     fn start_link_from(&mut self, starter: LinkStarter, client_id: u16, since: Millis) {
@@ -2964,6 +2992,9 @@ impl App {
     }
 
     fn pick_link(&mut self, role: LinkRow) {
+        if self.refuse_link_cheats() {
+            return;
+        }
         let Some(stem) = self.seated().map(str::to_string) else {
             return;
         };

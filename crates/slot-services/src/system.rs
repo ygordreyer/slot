@@ -1,3 +1,5 @@
+//! Bounded control commands and owned networking processes.
+
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -27,6 +29,28 @@ pub fn output_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, &'static str> {
+    output_timeout_details(program, args, timeout).map_err(|e| e.code)
+}
+
+pub struct CommandError {
+    pub code: &'static str,
+    pub stderr: String,
+}
+impl CommandError {
+    fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            stderr: String::new(),
+        }
+    }
+}
+
+pub fn output_timeout_details(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, CommandError> {
+    let deadline = Instant::now() + timeout;
     let bundled = std::env::var_os("SLOT_ROOT")
         .map(PathBuf::from)
         .map(|root| root.join("System/slot-net"));
@@ -42,9 +66,9 @@ pub fn output_timeout(
     let mut child = command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| "TOOL_UNAVAILABLE")?;
+        .map_err(|_| CommandError::new("TOOL_UNAVAILABLE"))?;
     // Drain concurrently: iw's capabilities can exceed a pipe buffer.
     let stdout = child.stdout.take().unwrap();
     let reader = std::thread::spawn(move || {
@@ -53,22 +77,32 @@ pub fn output_timeout(
         let _ = stdout.take(256 * 1024).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + timeout;
+    let stderr = child.stderr.take().unwrap();
+    let errors = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = stderr.take(256 * 1024).read_to_end(&mut bytes);
+        bytes
+    });
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let bytes = reader.join().unwrap_or_default();
+                let stderr = errors.join().unwrap_or_default();
                 return if status.success() {
                     Ok(String::from_utf8_lossy(&bytes).into_owned())
                 } else {
-                    Err("COMMAND_FAILED")
+                    Err(CommandError {
+                        code: "COMMAND_FAILED",
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                    })
                 };
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("COMMAND_TIMEOUT");
+                return Err(CommandError::new("COMMAND_TIMEOUT"));
             }
         }
     }
@@ -205,5 +239,23 @@ mod tests {
         let s = "old_freq=123\nfreq=2412\nwpa_state=COMPLETED\n";
         assert_eq!(field(s, "freq"), Some("2412"));
         assert_eq!(field(s, "state"), None);
+    }
+
+    #[test]
+    fn failed_commands_keep_stderr_for_scan_busy_detection() {
+        let result = output_timeout_details(
+            "sh",
+            &[
+                "-c",
+                "printf 'command failed: Device or resource busy (-16)\n' >&2; exit 1",
+            ],
+            Duration::from_secs(1),
+        );
+        let error = result.err().expect("the command succeeded");
+        assert_eq!(error.code, "COMMAND_FAILED");
+        assert_eq!(
+            error.stderr,
+            "command failed: Device or resource busy (-16)\n"
+        );
     }
 }
