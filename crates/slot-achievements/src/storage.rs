@@ -29,9 +29,43 @@ impl Config {
     pub fn save(&self, root: &Path) -> Result<(), String> {
         let dir = root.join("Config");
         std::fs::create_dir_all(&dir).map_err(|_| "Cannot create achievement settings")?;
-        let username = serde_json::to_string(&self.username).map_err(|_| "Invalid username")?;
+        // JSON and TOML basic strings share escapes, except JSON leaves DEL literal.
+        let username = serde_json::to_string(&self.username)
+            .map_err(|_| "Invalid username")?
+            .replace('\u{7f}', "\\u007F");
         let text = format!("enabled = {}\nusername = {}\n", self.enabled, username);
         private_write(&dir.join("retroachievements.toml"), text.as_bytes())
+    }
+
+    pub fn save_enabled_preserving_legacy(&self, root: &Path) -> Result<(), String> {
+        #[derive(Deserialize)]
+        struct Toggle {
+            enabled: Option<toml::Spanned<bool>>,
+        }
+        let path = root.join("Config/retroachievements.toml");
+        let source = Zeroizing::new(
+            std::fs::read_to_string(&path).map_err(|_| "Cannot read achievement config")?,
+        );
+        let toggle: Toggle = toml::from_str(&source).map_err(|_| "Invalid achievement config")?;
+        let value = if self.enabled {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        };
+        // Replace only the toggle so handwritten credentials retain their original spelling.
+        let mut text = Zeroizing::new(Vec::with_capacity(source.len() + 16));
+        if let Some(enabled) = toggle.enabled {
+            let span = enabled.span();
+            text.extend_from_slice(&source.as_bytes()[..span.start]);
+            text.extend_from_slice(value);
+            text.extend_from_slice(&source.as_bytes()[span.end..]);
+        } else {
+            text.extend_from_slice(b"enabled = ");
+            text.extend_from_slice(value);
+            text.push(b'\n');
+            text.extend_from_slice(source.as_bytes());
+        }
+        private_write(&path, &text)
     }
 }
 

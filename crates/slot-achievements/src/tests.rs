@@ -848,6 +848,10 @@ fn sign_in_errors_are_safe_and_transport_is_distinct() {
             "Sign in rejected",
         ),
         (
+            Ok(json!({"Success":false,"Error":"pRiVaTe-PaSsWoRd"})),
+            "Sign in rejected",
+        ),
+        (
             Ok(json!({"Success":false,"Error":"pLaYeR"})),
             "Sign in rejected",
         ),
@@ -1008,10 +1012,8 @@ fn enabling_a_disabled_legacy_account_preserves_credentials_until_token_login_su
     wait_for(|| service.account_state().username == "Player");
     service.account_control(AccountControl::SetEnabled(true));
     wait_for(|| !service.account_state().busy);
-    assert_eq!(
-        service.account_state().message,
-        "Can't reach RetroAchievements"
-    );
+    wait_for(|| service.account_state().message == "Can't reach RetroAchievements");
+    assert!(Config::read(&path).unwrap().enabled);
     assert!(std::fs::read_to_string(&path)
         .unwrap()
         .contains("legacy-secret"));
@@ -1076,4 +1078,161 @@ fn turning_off_during_a_request_prevents_following_session_requests() {
     assert!(!requests
         .try_iter()
         .any(|request| ["patch", "startsession", "ping"].contains(&request.as_str())));
+}
+
+fn run_account_control(root: &Path, command: AccountControl, http: impl network::Transport) {
+    let config = Config::read(&root.join("Config/retroachievements.toml")).unwrap();
+    let store = Arc::new(Mutex::new(Store::open(root, &config.username).unwrap()));
+    let (controls, commands) = mpsc::channel();
+    controls.send(network::Command::Account(command)).unwrap();
+    drop(controls);
+    let (prepared, _) = mpsc::channel();
+    let (notices, _) = mpsc::channel();
+    network::run(
+        root.into(),
+        config,
+        store,
+        commands,
+        prepared,
+        notices,
+        Arc::new(Status::default()),
+        Arc::new(AtomicBool::new(true)),
+        http,
+    );
+}
+
+#[test]
+fn off_preserves_unverified_legacy_fields_without_transport_calls() {
+    for credentials in [
+        "password = 'legacy-secret' # handwritten\n",
+        "token = 'legacy-token'\n",
+        "password = 'legacy-secret'\ntoken = ''\n",
+    ] {
+        let root = configured();
+        let path = root.path().join("Config/retroachievements.toml");
+        let original = format!("enabled = true # keep comment\nusername = 'Player'\n{credentials}");
+        std::fs::write(&path, &original).unwrap();
+        let (requests, received) = mpsc::channel();
+        run_account_control(
+            root.path(),
+            AccountControl::SetEnabled(false),
+            AccountServer {
+                requests,
+                reply: Err(network::Failure::Network),
+            },
+        );
+        assert!(!Config::read(&path).unwrap().enabled);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen("true", "false", 1)
+        );
+        assert_eq!(received.try_iter().count(), 0);
+    }
+}
+
+#[test]
+fn on_persists_before_verifying_expired_auth_and_keeps_password_fallback() {
+    struct ExpiredToken {
+        path: std::path::PathBuf,
+        calls: usize,
+    }
+    impl network::Transport for ExpiredToken {
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            let settings = Config::read(&self.path).unwrap();
+            assert!(settings.enabled);
+            assert_eq!(settings.password, "legacy-secret");
+            assert!(settings.token.is_empty());
+            self.calls += 1;
+            match self.calls {
+                1 => {
+                    assert!(fields
+                        .iter()
+                        .any(|(k, v)| *k == "t" && v == "expired-token"));
+                    Ok(json!({"Success":false,"Error":"Token expired"}))
+                }
+                2 => {
+                    assert!(fields
+                        .iter()
+                        .any(|(k, v)| *k == "p" && v == "legacy-secret"));
+                    Ok(json!({"Success":true,"User":"Player","Token":"replacement-token"}))
+                }
+                _ => panic!("unexpected request"),
+            }
+        }
+    }
+    let root = configured();
+    let path = root.path().join("Config/retroachievements.toml");
+    std::fs::write(
+        &path,
+        "enabled = false\nusername = 'Player'\npassword = 'legacy-secret'\n",
+    )
+    .unwrap();
+    let store = Store::open(root.path(), "Player").unwrap();
+    storage::write(
+        &store.dir.join("auth.json"),
+        &Auth {
+            username: "Player".into(),
+            token: "expired-token".into(),
+        },
+    )
+    .unwrap();
+    run_account_control(
+        root.path(),
+        AccountControl::SetEnabled(true),
+        ExpiredToken {
+            path: path.clone(),
+            calls: 0,
+        },
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    let saved: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(saved.as_table().unwrap().len(), 2);
+    assert!(saved["enabled"].as_bool().unwrap());
+    let auth: Auth = storage::read(&store.dir.join("auth.json")).unwrap();
+    assert_eq!(auth.token, "replacement-token");
+}
+
+#[test]
+fn settings_usernames_round_trip_toml_special_characters() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("Config/retroachievements.toml");
+    for username in [
+        "quotes\"'",
+        "back\\slash",
+        "ユニコード☃",
+        "DEL\u{7f}",
+        "\0\u{1}\u{8}\t\n\u{b}\u{c}\r\u{1f}",
+    ] {
+        let mut config = Config::default();
+        config.username = username.into();
+        config.save(root.path()).unwrap();
+        assert_eq!(Config::read(&path).unwrap().username, username);
+    }
+}
+
+#[test]
+fn account_control_debug_redacts_password() {
+    let control = AccountControl::SignIn {
+        username: "Player".into(),
+        password: Zeroizing::new("secret".into()),
+    };
+    let debug = format!("{control:?}");
+    assert!(!debug.contains("secret"));
+    assert!(debug.contains("password_length: 6"));
+}
+
+#[test]
+fn login_body_encodes_fields_without_extra_capacity_or_plaintext_temporaries() {
+    let fields = [
+        ("r", "login2".into()),
+        ("u", "a b+&=☃".into()),
+        ("p", "\"\\?/#%\0\u{7f}*-._~".into()),
+    ];
+    let body = network::login_body(&fields);
+    assert_eq!(
+        body.as_slice(),
+        b"r=login2&u=a+b%2B%26%3D%E2%98%83&p=%22%5C%3F%2F%23%25%00%7F*-._%7E"
+    );
+    assert_eq!(body.len(), body.capacity());
+    assert!(network::login_body(&[]).is_empty());
 }

@@ -38,6 +38,20 @@ pub enum AccountControl {
     SetEnabled(bool),
 }
 
+impl std::fmt::Debug for AccountControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SignIn { username, password } => f
+                .debug_struct("SignIn")
+                .field("username", username)
+                .field("password_length", &password.len())
+                .finish(),
+            Self::SignOut => f.write_str("SignOut"),
+            Self::SetEnabled(value) => f.debug_tuple("SetEnabled").field(value).finish(),
+        }
+    }
+}
+
 const RAM_SIZE: usize = 0x58000;
 const QUEUE_SIZE: usize = 8;
 

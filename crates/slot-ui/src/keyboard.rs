@@ -28,14 +28,14 @@ pub enum KeyboardInput {
     Reveal,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum KeyboardResult {
     Editing,
     Confirmed(String),
     Cancelled,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Keyboard {
     secure: bool,
     pub title: String,
@@ -50,6 +50,43 @@ pub struct Keyboard {
     allow_empty: bool,
     max: usize,
     pub hint: String,
+}
+
+impl std::fmt::Debug for KeyboardResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Editing => f.write_str("Editing"),
+            Self::Confirmed(text) => f
+                .debug_struct("Confirmed")
+                .field("length", &text.len())
+                .finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
+        }
+    }
+}
+
+impl std::fmt::Debug for Keyboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("Keyboard");
+        debug.field("title", &self.title);
+        if self.secure {
+            debug.field("text_length", &self.text.len());
+        } else {
+            debug.field("text", &self.text);
+        }
+        debug
+            .field("cursor", &self.cursor)
+            .field("focus", &self.focus)
+            .field("caps", &self.caps)
+            .field("symbols", &self.symbols)
+            .field("password", &self.password)
+            .field("masked", &self.masked)
+            .field("min", &self.min)
+            .field("allow_empty", &self.allow_empty)
+            .field("max", &self.max)
+            .field("hint", &self.hint)
+            .finish()
+    }
 }
 
 impl Drop for Keyboard {
@@ -165,24 +202,31 @@ impl Keyboard {
     pub fn display(&self) -> String {
         let start = self.cursor.saturating_sub(12);
         let end = (start + 24).min(self.text.len());
-        let chars = if self.masked {
-            "*".repeat(self.text.len())
+        let mut display = String::with_capacity(end - start + 7);
+        if start > 0 {
+            display.push_str("...");
+        }
+        if self.masked {
+            display.extend(std::iter::repeat_n('*', self.cursor - start));
         } else {
-            self.text.clone()
-        };
-        format!(
-            "{}{}|{}{}",
-            if start > 0 { "..." } else { "" },
-            &chars[start..self.cursor],
-            &chars[self.cursor..end],
-            if end < chars.len() { "..." } else { "" }
-        )
+            display.push_str(&self.text[start..self.cursor]);
+        }
+        display.push('|');
+        if self.masked {
+            display.extend(std::iter::repeat_n('*', end - self.cursor));
+        } else {
+            display.push_str(&self.text[self.cursor..end]);
+        }
+        if end < self.text.len() {
+            display.push_str("...");
+        }
+        display
     }
 
     pub fn face(&self) -> UndoFace {
         let mut face = panel_face();
         panel_text(&mut face, &self.title, 24, 14, 672, MENU_PX);
-        panel_text(&mut face, &self.display(), 24, 66, 672, MENU_PX);
+        panel_text_owned(&mut face, self.display(), 24, 66, 672, MENU_PX);
         let hint = if self.hint.is_empty() {
             format!(
                 "{} / {}    L / R: cursor    {}",
@@ -241,24 +285,30 @@ pub(crate) fn panel_rect(face: &mut UndoFace, x: u32, y: u32, w: u32, h: u32, co
 
 /// Preserve case, whitespace and punctuation when showing credentials.
 pub(crate) fn panel_text(face: &mut UndoFace, value: &str, x: u32, y: u32, w: u32, px: f32) {
+    panel_text_owned(face, value.to_owned(), x, y, w, px);
+}
+
+fn panel_text_owned(face: &mut UndoFace, mut line: String, x: u32, y: u32, w: u32, px: f32) {
     let Some(font) = text::label_font() else {
+        line.zeroize();
         return;
     };
-    let mut line = value.to_owned();
     if text::line_width(font, &line, px, 0.0) > w as f32 {
-        while !line.is_empty() && text::line_width(font, &format!("{line}..."), px, 0.0) > w as f32
+        let ellipsis_width = text::line_width(font, "...", px, 0.0);
+        while !line.is_empty() && text::line_width(font, &line, px, 0.0) + ellipsis_width > w as f32
         {
             line.pop();
         }
         line.push_str("...");
     }
-    let layout = Layout {
+    let mut layout = Layout {
         lines: vec![line],
         px,
         tracking: 0.0,
     };
     let mut rgba = vec![0; (w * 40 * 4) as usize];
     text::draw_centred(&mut rgba, w, 40, &layout, MENU_INK);
+    layout.lines.zeroize();
     panel_blit(face, &UndoFace { rgba, w, h: 40 }, x, y);
 }
 
@@ -297,6 +347,21 @@ pub(crate) fn panel_legend(face: &mut UndoFace, hints: &[(&str, &str)], y: u32) 
 mod tests {
     use super::*;
     use KeyboardInput::*;
+
+    #[test]
+    fn debug_redacts_secret_text_and_all_confirmed_payloads() {
+        let mut keyboard = Keyboard::secret("Password", 1, 127);
+        keyboard.text.push_str("secret");
+        for masked in [true, false] {
+            keyboard.masked = masked;
+            let debug = format!("{keyboard:?}");
+            assert!(!debug.contains("secret"));
+            assert!(debug.contains('6'));
+        }
+        let debug = format!("{:?}", KeyboardResult::Confirmed("secret".into()));
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains('6'));
+    }
 
     #[test]
     fn navigation_wraps_on_every_edge_and_page() {

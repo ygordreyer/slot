@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::storage::{self, Auth, Config, Game, Store, Unlock};
 use crate::{AccountControl, Notice, Status, SyncStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub(crate) enum Command {
     Load(Option<Load>),
@@ -102,12 +102,20 @@ impl Transport for Http {
             .map_err(|_| Failure::Invalid)
     }
     fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure> {
-        let form: Vec<_> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let mut response = self
-            .0
-            .post(API)
-            .send_form(form)
-            .map_err(|_| Failure::Network)?;
+        let mut response = if fields
+            .iter()
+            .any(|(key, value)| *key == "r" && value == "login2")
+        {
+            let body = login_body(fields);
+            self.0
+                .post(API)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .send(body.as_slice())
+        } else {
+            let form: Vec<_> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            self.0.post(API).send_form(form)
+        }
+        .map_err(|_| Failure::Network)?;
         response
             .body_mut()
             .with_config()
@@ -115,6 +123,55 @@ impl Transport for Http {
             .read_json()
             .map_err(|_| Failure::Invalid)
     }
+}
+
+pub(crate) fn login_body(fields: &[(&str, String)]) -> Zeroizing<Vec<u8>> {
+    fn plain(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'*' | b'-' | b'.' | b'_')
+    }
+    let capacity = fields
+        .iter()
+        .map(|(key, value)| {
+            key.bytes()
+                .chain(value.bytes())
+                .map(|byte| if plain(byte) || byte == b' ' { 1 } else { 3 })
+                .sum::<usize>()
+                + 1
+        })
+        .sum::<usize>()
+        + fields.len().saturating_sub(1);
+    let mut body = Zeroizing::new(Vec::with_capacity(capacity));
+    for (key, value) in fields {
+        if !body.is_empty() {
+            body.push(b'&');
+        }
+        for (index, part) in [*key, value.as_str()].into_iter().enumerate() {
+            if index == 1 {
+                body.push(b'=');
+            }
+            for byte in part.bytes() {
+                if plain(byte) {
+                    body.push(byte);
+                } else if byte == b' ' {
+                    body.push(b'+');
+                } else {
+                    body.push(b'%');
+                    body.push(b"0123456789ABCDEF"[(byte >> 4) as usize]);
+                    body.push(b"0123456789ABCDEF"[(byte & 15) as usize]);
+                }
+            }
+        }
+    }
+    debug_assert_eq!(body.len(), capacity);
+    body
+}
+
+fn contains_ascii_case_insensitive(text: &str, secret: &str) -> bool {
+    !secret.is_empty()
+        && text
+            .as_bytes()
+            .windows(secret.len())
+            .any(|window| window.eq_ignore_ascii_case(secret.as_bytes()))
 }
 
 fn success(value: Value) -> Result<Value, Failure> {
@@ -167,37 +224,24 @@ fn login_error(error: Failure) -> LoginError {
 }
 
 fn rejection(value: &Value, config: &Config) -> LoginError {
-    let text: String = value["Error"]
-        .as_str()
-        .unwrap_or("Sign in rejected")
-        .chars()
-        .filter(char::is_ascii_graphic)
-        .collect();
-    // Check before truncation and after removing controls, so echoed secrets cannot escape.
     let raw = value["Error"].as_str().unwrap_or("");
+    let mut text = Zeroizing::new(String::with_capacity(raw.len()));
+    text.extend(raw.chars().filter(char::is_ascii_graphic));
+    // Check before truncation and after removing controls, so echoed secrets cannot escape.
     let unsafe_text = [&config.username, &config.password, &config.token]
         .iter()
         .filter(|secret| !secret.is_empty())
         .any(|secret| {
-            raw.to_ascii_lowercase()
-                .contains(&secret.to_ascii_lowercase())
-                || text
-                    .to_ascii_lowercase()
-                    .contains(&secret.to_ascii_lowercase())
+            contains_ascii_case_insensitive(raw, secret)
+                || contains_ascii_case_insensitive(&text, secret)
         });
-    let printable: String = raw
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .collect();
+    let mut printable = Zeroizing::new(String::with_capacity(raw.len()));
+    printable.extend(raw.chars().filter(|c| c.is_ascii_graphic() || *c == ' '));
     let exposes_secret = |message: &str| {
         [&config.username, &config.password, &config.token]
             .iter()
             .filter(|secret| !secret.is_empty())
-            .any(|secret| {
-                message
-                    .to_ascii_lowercase()
-                    .contains(&secret.to_ascii_lowercase())
-            })
+            .any(|secret| contains_ascii_case_insensitive(message, secret))
     };
     let fallback = || {
         for message in ["Sign in rejected", "Rejected"] {
@@ -213,11 +257,12 @@ fn rejection(value: &Value, config: &Config) -> LoginError {
     let message = if unsafe_text || printable.trim().is_empty() {
         fallback()
     } else {
-        let message: String = printable.chars().take(80).collect();
+        let mut message = Zeroizing::new(String::with_capacity(printable.len().min(80)));
+        message.extend(printable.chars().take(80));
         if exposes_secret(&message) {
             fallback()
         } else {
-            message
+            std::mem::take(&mut *message)
         }
     };
     LoginError {
@@ -467,7 +512,10 @@ pub(crate) fn run(
                 active = None;
                 let result = (|| -> Result<(), String> {
                     match command {
-                        AccountControl::SignIn { username, password } => {
+                        AccountControl::SignIn {
+                            username,
+                            mut password,
+                        } => {
                             if auth.is_some() {
                                 return Err("Sign out first".into());
                             }
@@ -476,7 +524,7 @@ pub(crate) fn run(
                             }
                             let mut credentials = Config::default();
                             credentials.username = username;
-                            credentials.password = password.to_string();
+                            credentials.password = std::mem::take(&mut *password);
                             let result = login_detailed(&mut http, &credentials, None);
                             credentials.password.zeroize();
                             drop(password);
@@ -512,27 +560,15 @@ pub(crate) fn run(
                         }
                         AccountControl::SetEnabled(value) => {
                             config.enabled = value;
+                            let legacy = !config.password.is_empty() || !config.token.is_empty();
+                            let preserve_legacy = legacy && !verified;
+                            if preserve_legacy {
+                                config.save_enabled_preserving_legacy(&root)?;
+                            } else {
+                                config.save(&root)?;
+                            }
                             verified = false;
-                            if auth.is_none()
-                                && (!config.password.is_empty() || !config.token.is_empty())
-                            {
-                                // Do not discard a legacy credential until its replacement is durable.
-                                save_settings_after_login = true;
-                                let logged_in = login_detailed(&mut http, &config, None)
-                                    .map_err(|error| error.message)?;
-                                let new_store = Store::open(&root, &logged_in.username)?;
-                                storage::write(&new_store.dir.join("auth.json"), &logged_in)?;
-                                config.username = logged_in.username.clone();
-                                auth = Some(logged_in);
-                                verified = true;
-                                *store.lock().unwrap() = new_store;
-                            }
-                            config.save(&root)?;
-                            if auth.is_some() {
-                                config.password.zeroize();
-                                config.token.zeroize();
-                            }
-                            save_settings_after_login = false;
+                            save_settings_after_login = value && preserve_legacy;
                         }
                     }
                     Ok(())
