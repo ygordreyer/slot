@@ -105,8 +105,11 @@ fn bss_header(line: &str) -> bool {
         } else {
             b.is_ascii_hexdigit()
         }
-    // iw prints "(on <dev>)" only when the reply carries an interface index.
-    }) && matches!(rest.as_bytes().get(17), None | Some(b'(' | b' ' | b'\r' | b'\n'))
+        // iw prints "(on <dev>)" only when the reply carries an interface index.
+    }) && matches!(
+        rest.as_bytes().get(17),
+        None | Some(b'(' | b' ' | b'\r' | b'\n')
+    )
 }
 
 /// iw escapes non-printable bytes and literal backslashes as hexadecimal bytes.
@@ -129,6 +132,7 @@ pub fn decode_ssid(text: &str) -> Option<String> {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WifiStatus {
+    pub enabled: Option<bool>,
     pub ssid: Option<String>,
     pub ip: Option<String>,
     pub error: String,
@@ -161,6 +165,7 @@ impl WifiRadio for HostWifi {
     }
     fn connect(&mut self, ssid: &str) -> Result<(), String> {
         self.status = WifiStatus {
+            enabled: Some(true),
             ssid: Some(ssid.into()),
             ip: Some("192.0.2.2".into()),
             error: String::new(),
@@ -177,6 +182,16 @@ pub struct DeviceWifi {
     root: PathBuf,
 }
 
+#[cfg(any(feature = "device", test))]
+fn service_payload(text: &str) -> &str {
+    match text.split_once(' ') {
+        Some((code, payload)) if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) => {
+            payload
+        }
+        _ => text,
+    }
+}
+
 #[cfg(feature = "device")]
 impl DeviceWifi {
     fn command(&self, domain: &str, action: &str) -> Result<String, String> {
@@ -189,7 +204,7 @@ impl DeviceWifi {
             // Only fixed service error codes are shown, never configuration or credentials.
             return Err(wifi_error(&String::from_utf8_lossy(&out.stderr)));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(service_payload(&String::from_utf8_lossy(&out.stdout)).to_owned())
     }
 }
 
@@ -230,6 +245,7 @@ pub fn parse_status(text: &str) -> WifiStatus {
         String::from_utf8(bytes?).ok().filter(|s| !s.is_empty())
     });
     WifiStatus {
+        enabled: value("home_enabled=").and_then(|s| s.parse().ok()),
         ssid,
         ip: value("home_ip=")
             .filter(|s| !s.is_empty())
@@ -278,6 +294,33 @@ pub enum WifiReply {
 
 type WifiJob = (u64, WifiEffect, Option<Receiver<()>>);
 
+enum WifiWorkError {
+    Cancelled,
+    Failed(String),
+}
+
+fn wifi_step<T>(
+    current: &AtomicU64,
+    generation: u64,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, WifiWorkError> {
+    if current.load(Ordering::Acquire) != generation {
+        return Err(WifiWorkError::Cancelled);
+    }
+    action().map_err(WifiWorkError::Failed)
+}
+
+fn wifi_reply<T>(
+    result: Result<T, WifiWorkError>,
+    reply: impl FnOnce(Result<T, String>) -> WifiReply,
+) -> Option<WifiReply> {
+    match result {
+        Ok(value) => Some(reply(Ok(value))),
+        Err(WifiWorkError::Failed(error)) => Some(reply(Err(error))),
+        Err(WifiWorkError::Cancelled) => None,
+    }
+}
+
 pub struct WifiWorker {
     jobs: Sender<WifiJob>,
     replies: Receiver<(u64, WifiReply)>,
@@ -304,28 +347,57 @@ impl WifiWorker {
                     continue;
                 }
                 let reply = match job {
-                    WifiEffect::Scan | WifiEffect::Enable => WifiReply::Scan((|| {
-                        if job == WifiEffect::Enable {
-                            radio.enable()?;
-                        }
-                        let saved = read_wifi(&root).map_err(str::to_owned)?;
-                        Ok((radio.scan()?, saved, radio.status()?))
-                    })(
-                    )),
-                    WifiEffect::Connect(network) => WifiReply::Changed((|| {
-                        save_wifi(&root, network.clone()).map_err(str::to_owned)?;
-                        radio.reload()?;
-                        radio.connect(&network.ssid)?;
-                        read_wifi(&root).map_err(str::to_owned)
-                    })()),
-                    WifiEffect::Forget(ssid) => WifiReply::Changed((|| {
-                        forget_wifi(&root, &ssid).map_err(str::to_owned)?;
-                        radio.reload()?;
-                        read_wifi(&root).map_err(str::to_owned)
-                    })()),
-                    WifiEffect::Status => WifiReply::Status(radio.status()),
+                    WifiEffect::Scan | WifiEffect::Enable => wifi_reply(
+                        (|| {
+                            if job == WifiEffect::Enable {
+                                wifi_step(&current, generation, || radio.enable())?;
+                            }
+                            let saved = wifi_step(&current, generation, || {
+                                read_wifi(&root).map_err(str::to_owned)
+                            })?;
+                            let nearby = wifi_step(&current, generation, || radio.scan())?;
+                            let status = wifi_step(&current, generation, || radio.status())?;
+                            Ok((nearby, saved, status))
+                        })(),
+                        WifiReply::Scan,
+                    ),
+                    WifiEffect::Connect(network) => wifi_reply(
+                        (|| {
+                            wifi_step(&current, generation, || {
+                                save_wifi(&root, network.clone()).map_err(str::to_owned)
+                            })?;
+                            wifi_step(&current, generation, || radio.reload())?;
+                            wifi_step(&current, generation, || radio.connect(&network.ssid))?;
+                            wifi_step(&current, generation, || {
+                                read_wifi(&root).map_err(str::to_owned)
+                            })
+                        })(),
+                        WifiReply::Changed,
+                    ),
+                    WifiEffect::Forget(ssid) => wifi_reply(
+                        (|| {
+                            wifi_step(&current, generation, || {
+                                forget_wifi(&root, &ssid).map_err(str::to_owned)
+                            })?;
+                            wifi_step(&current, generation, || radio.reload())?;
+                            wifi_step(&current, generation, || {
+                                read_wifi(&root).map_err(str::to_owned)
+                            })
+                        })(),
+                        WifiReply::Changed,
+                    ),
+                    WifiEffect::Status => wifi_reply(
+                        wifi_step(&current, generation, || radio.status()),
+                        WifiReply::Status,
+                    ),
                     WifiEffect::Back => continue,
                 };
+                let Some(reply) = reply else {
+                    continue;
+                };
+                if current.load(Ordering::Acquire) != generation {
+                    continue;
+                }
                 if send.send((generation, reply)).is_err() {
                     break;
                 }
@@ -356,6 +428,7 @@ impl WifiWorker {
     }
 
     pub fn cancel(&self, generation: u64) {
+        // Cancellation never waits: a started step may finish, but later steps and replies are skipped.
         self.generation.store(generation, Ordering::Release);
     }
 
@@ -624,7 +697,11 @@ impl WifiScreen {
     }
 
     fn observe(&mut self, status: WifiStatus) {
-        if let (Some(ssid), Some(ip)) = (&status.ssid, &status.ip) {
+        if status.enabled == Some(false) {
+            self.enabled = false;
+            self.connecting = None;
+            self.status = wifi_error("HOME_DISABLED");
+        } else if let (Some(ssid), Some(ip)) = (&status.ssid, &status.ip) {
             if self.connecting.as_ref().is_none_or(|target| target == ssid) {
                 self.status = format!("Connected: {ip} ({ssid})");
                 self.connecting = None;
@@ -642,6 +719,100 @@ mod tests {
     use super::*;
 
     const SCAN: &str = "BSS 00:11:22:33:44:55(on wlan0)\n\tcapability: ESS Privacy (0x0011)\n\tsignal: -64.00 dBm\n\tSSID: Home\n\tRSN:\n\t\t * Authentication suites: PSK\nBSS 00:11:22:33:44:56(on wlan0)\n\tcapability: ESS Privacy\n\tsignal: -36.00 dBm\n\tSSID: Home\n\tRSN:\n\t\t * Authentication suites: PSK\nBSS 00:11:22:33:44:57(on wlan0)\n\tcapability: ESS\n\tsignal: -49.00 dBm\n\tSSID: Guest cafe\nBSS 00:11:22:33:44:58(on wlan0)\n\tsignal: -10.00 dBm\n\tSSID: \nBSS 00:11:22:33:44:59(on wlan0)\n\tcapability: ESS Privacy\n\tsignal: -70.00 dBm\n\tSSID: Office\n\tRSN:\n\t\t * Authentication suites: IEEE 802.1X\n";
+
+    #[test]
+    fn service_scan_keeps_the_first_bss() {
+        let text = "0 BSS aa:bb:cc:dd:ee:ff(on wlan0)\n\tfreq: 2412\n\tsignal: -40.00 dBm\n\tSSID: Home\nBSS aa:bb:cc:dd:ee:01(on wlan0)\n\tfreq: 2437\n\tsignal: -50.00 dBm\n\tSSID: Guest\n";
+        let networks = parse_scan(service_payload(text));
+        assert_eq!(
+            networks.iter().map(|n| n.ssid.as_str()).collect::<Vec<_>>(),
+            vec!["Home", "Guest"]
+        );
+        assert!(!bss_header(text.lines().next().unwrap()));
+        assert_eq!(service_payload("0 home_enabled=true"), "home_enabled=true");
+        assert_eq!(service_payload("BSS Load:"), "BSS Load:");
+    }
+
+    #[test]
+    fn cancellation_during_reload_stops_connect_and_suppresses_reply() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        struct Radio {
+            generation: Receiver<Arc<AtomicU64>>,
+            reloaded: Sender<()>,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+        impl WifiRadio for Radio {
+            fn enable(&mut self) -> Result<(), String> {
+                panic!("unexpected enable")
+            }
+            fn scan(&mut self) -> Result<Vec<NearbyNetwork>, String> {
+                panic!("unexpected scan")
+            }
+            fn reload(&mut self) -> Result<(), String> {
+                self.calls.lock().unwrap().push("reload");
+                self.generation.recv().unwrap().store(2, Ordering::Release);
+                self.reloaded.send(()).unwrap();
+                Ok(())
+            }
+            fn connect(&mut self, _: &str) -> Result<(), String> {
+                self.calls.lock().unwrap().push("connect");
+                Ok(())
+            }
+            fn status(&mut self) -> Result<WifiStatus, String> {
+                self.calls.lock().unwrap().push("status");
+                Ok(WifiStatus::default())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (generation, receive) = mpsc::channel();
+        let (reloaded, done) = mpsc::channel();
+        let worker = WifiWorker::new(
+            root.path().into(),
+            Box::new(Radio {
+                generation: receive,
+                reloaded,
+                calls: calls.clone(),
+            }),
+        );
+        generation.send(worker.generation.clone()).unwrap();
+        worker.ask(
+            1,
+            WifiEffect::Connect(WifiNetwork {
+                ssid: "Home".into(),
+                password: None,
+            }),
+        );
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.ask(2, WifiEffect::Status);
+        let (generation, reply) = worker.replies.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["reload", "status"]);
+        assert_eq!(generation, 2);
+        assert!(matches!(reply, WifiReply::Status(Ok(_))));
+        assert!(worker.take().is_none());
+        assert_eq!(read_wifi(root.path()).unwrap()[0].ssid, "Home");
+    }
+
+    #[test]
+    fn disabled_status_turns_a_connected_screen_off() {
+        let mut s = screen(Vec::new());
+        s.reply(WifiReply::Status(Ok(parse_status(
+            "0 home_enabled=true home_ssid=486f6d65 home_ip=192.168.1.2 home_error=",
+        ))));
+        assert!(s.enabled);
+        assert_eq!(s.status, "Connected: 192.168.1.2 (Home)");
+        s.connecting = Some("Home".into());
+        s.reply(WifiReply::Status(Ok(parse_status(
+            "0 home_enabled=false home_ssid=486f6d65 home_ip=192.168.1.2 home_error=",
+        ))));
+        assert!(!s.enabled);
+        assert!(s.connecting.is_none());
+        assert_eq!(s.status, "Home Wi-Fi is Off");
+        s.reply(WifiReply::Status(Ok(parse_status("home_error="))));
+        assert!(!s.enabled);
+        assert_eq!(s.status, "Home Wi-Fi is Off");
+    }
 
     #[test]
     fn iw_scan_deduplicates_sorts_skips_hidden_and_distinguishes_security() {
@@ -738,14 +909,13 @@ mod tests {
         worker.cancel(3);
         worker.ask(3, WifiEffect::Status);
         release.send(()).unwrap();
-        let (_, reply) = worker.replies.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(matches!(reply, WifiReply::Scan(Err(ref e)) if e == "HOME_DISABLED"));
         let (generation, _) = worker.replies.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(generation, 3);
+        assert!(worker.take().is_none());
         assert_eq!(*calls.lock().unwrap(), vec!["scan", "status"]);
         assert!(read_wifi(root.path()).unwrap().is_empty());
         let mut screen = WifiScreen::new(true);
-        screen.reply(reply);
+        screen.reply(WifiReply::Scan(Err("HOME_DISABLED".into())));
         assert!(!screen.enabled);
         assert_eq!(screen.status, "Home Wi-Fi is Off");
     }
@@ -999,6 +1169,7 @@ mod tests {
                 password: Some("password".into()),
             }]);
             list.observed = WifiStatus {
+                enabled: Some(true),
                 ssid: Some("Home".into()),
                 ip: Some("192.168.1.2".into()),
                 error: String::new(),
