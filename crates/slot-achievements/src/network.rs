@@ -58,16 +58,30 @@ fn failed(load: &Load, state: crate::GameAchievementState) -> Prepared {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     Network,
+    Server,
     Rejected,
     Authentication,
     Invalid,
 }
 
+impl Failure {
+    fn status(self) -> SyncStatus {
+        match self {
+            Self::Network => SyncStatus::Offline,
+            Self::Server => SyncStatus::ServerBusy,
+            _ => SyncStatus::Attention,
+        }
+    }
+}
+
 pub(crate) trait Transport {
     fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure>;
+    fn diagnostic(&self) -> Option<String> {
+        None
+    }
     fn badge(&mut self, _name: &str) -> Result<Vec<u8>, Failure> {
         Err(Failure::Invalid)
     }
@@ -76,30 +90,138 @@ pub(crate) trait Transport {
 struct EnabledTransport<'a, T> {
     inner: &'a mut T,
     enabled: &'a AtomicBool,
+    diagnostic: &'a mut String,
 }
 
 impl<T: Transport> Transport for EnabledTransport<'_, T> {
     fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure> {
         if !self.enabled.load(Ordering::Acquire) {
-            return Err(Failure::Network);
+            return Err(Failure::Invalid);
         }
-        self.inner.call(fields)
+        let operation = fields
+            .iter()
+            .find(|(key, _)| *key == "r")
+            .map_or("unknown", |(_, value)| operation_name(value));
+        let result = self.inner.call(fields);
+        let detail = self.inner.diagnostic().unwrap_or_else(|| match &result {
+            Err(error) => failure_detail(*error).into(),
+            Ok(_) => "RA rejection or invalid data".into(),
+        });
+        *self.diagnostic = format!("r={operation} failed: {detail}");
+        result
     }
 
     fn badge(&mut self, name: &str) -> Result<Vec<u8>, Failure> {
         if !self.enabled.load(Ordering::Acquire) {
-            return Err(Failure::Network);
+            return Err(Failure::Invalid);
         }
         self.inner.badge(name)
     }
 }
 
-pub(crate) struct Http(ureq::Agent);
+fn operation_name(value: &str) -> &'static str {
+    match value {
+        "login2" => "login2",
+        "gameid" => "gameid",
+        "patch" => "patch",
+        "unlocks" => "unlocks",
+        "startsession" => "startsession",
+        "ping" => "ping",
+        "awardachievement" => "awardachievement",
+        _ => "unknown",
+    }
+}
+
+fn failure_detail(error: Failure) -> &'static str {
+    match error {
+        Failure::Network => "network (connection)",
+        Failure::Server => "server busy",
+        Failure::Authentication => "authentication",
+        Failure::Rejected => "RA rejection",
+        Failure::Invalid => "invalid data or storage",
+    }
+}
+
+fn invalid_token(body: &Value) -> bool {
+    ["Code", "Error"].iter().any(|field| {
+        let text = body[*field].as_str().unwrap_or("").to_ascii_lowercase();
+        text.contains("token")
+            && ["invalid", "expired", "revoked", "not valid"]
+                .iter()
+                .any(|word| text.contains(word))
+    })
+}
+
+// Only fixed protocol labels may reach stderr; even a plausible Code can echo a credential.
+fn diagnostic_code(body: &Value) -> Option<&'static str> {
+    match body["Code"].as_str()? {
+        "invalid_token" => Some("invalid_token"),
+        "expired_token" => Some("expired_token"),
+        "invalid_credentials" => Some("invalid_credentials"),
+        "access_denied" => Some("access_denied"),
+        "invalid_parameter" => Some("invalid_parameter"),
+        "missing_parameter" => Some("missing_parameter"),
+        "not_found" => Some("not_found"),
+        "rate_limited" => Some("rate_limited"),
+        _ => None,
+    }
+}
+
+pub(crate) fn classify_response(status: u16, body: Option<Value>) -> Result<Value, Failure> {
+    if matches!(status, 401 | 403) {
+        return Err(Failure::Authentication);
+    }
+    if status == 429 || (500..600).contains(&status) {
+        return Err(Failure::Server);
+    }
+    if body.as_ref().is_some_and(invalid_token) {
+        return Err(Failure::Authentication);
+    }
+    if (200..300).contains(&status) {
+        body.ok_or(Failure::Invalid)
+    } else if (400..500).contains(&status)
+        && body
+            .as_ref()
+            .is_some_and(|body| body.get("Success").is_some() || body.get("Error").is_some())
+    {
+        Err(Failure::Rejected)
+    } else {
+        Err(Failure::Invalid)
+    }
+}
+
+fn classify_badge_status(status: u16) -> Result<(), Failure> {
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(Failure::Authentication),
+        429 | 500..=599 => Err(Failure::Server),
+        400..=499 => Err(Failure::Rejected),
+        _ => Err(Failure::Invalid),
+    }
+}
+
+fn transport_failure(error: &ureq::Error) -> (Failure, &'static str) {
+    match error {
+        ureq::Error::Timeout(_) => (Failure::Network, "network (timeout)"),
+        ureq::Error::HostNotFound => (Failure::Network, "network (DNS)"),
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => (Failure::Network, "network (TLS)"),
+        ureq::Error::Io(_) | ureq::Error::ConnectionFailed => {
+            (Failure::Network, "network (connection)")
+        }
+        _ => (Failure::Invalid, "invalid HTTP response"),
+    }
+}
+
+pub(crate) struct Http {
+    agent: ureq::Agent,
+    diagnostic: Option<String>,
+}
 
 impl Http {
     pub(crate) fn new() -> Self {
-        Self(
-            ureq::Agent::config_builder()
+        Self {
+            agent: ureq::Agent::config_builder()
+                .http_status_as_error(false)
                 .timeout_global(Some(Duration::from_secs(5)))
                 .max_redirects(0)
                 .user_agent(concat!(
@@ -109,46 +231,82 @@ impl Http {
                 ))
                 .build()
                 .into(),
-        )
+            diagnostic: None,
+        }
     }
-}
 
-impl Transport for Http {
-    fn badge(&mut self, name: &str) -> Result<Vec<u8>, Failure> {
-        crate::badges::path(std::path::Path::new(""), name).ok_or(Failure::Invalid)?;
-        self.0
-            .get(format!(
-                "https://media.retroachievements.org/Badge/{name}.png"
-            ))
-            .call()
-            .map_err(|_| Failure::Network)?
-            .body_mut()
-            .with_config()
-            .limit(crate::badges::MAX_BYTES)
-            .read_to_vec()
-            .map_err(|_| Failure::Invalid)
+    fn error(&mut self, error: ureq::Error) -> Failure {
+        let (failure, detail) = transport_failure(&error);
+        self.diagnostic = Some(detail.into());
+        failure
     }
-    fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure> {
-        let mut response = if fields
+
+    fn call_url(&mut self, url: &str, fields: &[(&str, String)]) -> Result<Value, Failure> {
+        self.diagnostic = None;
+        let result = if fields
             .iter()
             .any(|(key, value)| *key == "r" && value == "login2")
         {
             let body = login_body(fields);
-            self.0
-                .post(API)
+            self.agent
+                .post(url)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .send(body.as_slice())
         } else {
             let form: Vec<_> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            self.0.post(API).send_form(form)
-        }
-        .map_err(|_| Failure::Network)?;
-        response
+            self.agent.post(url).send_form(form)
+        };
+        let mut response = result.map_err(|error| self.error(error))?;
+        let status = response.status().as_u16();
+        let bytes = response
             .body_mut()
             .with_config()
             .limit(8 * 1024 * 1024)
-            .read_json()
-            .map_err(|_| Failure::Invalid)
+            .read_to_vec();
+        let body = match bytes {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes).ok(),
+            Err(error) => {
+                // An HTTP error status is authoritative even if its body is truncated.
+                if (200..300).contains(&status) {
+                    return Err(self.error(error));
+                }
+                None
+            }
+        };
+        self.diagnostic = Some(match body.as_ref().and_then(diagnostic_code) {
+            Some(code) => format!("http {status} ({code})"),
+            None => format!("http {status}"),
+        });
+        classify_response(status, body)
+    }
+}
+
+impl Transport for Http {
+    fn diagnostic(&self) -> Option<String> {
+        self.diagnostic.clone()
+    }
+    fn badge(&mut self, name: &str) -> Result<Vec<u8>, Failure> {
+        self.diagnostic = None;
+        crate::badges::path(std::path::Path::new(""), name).ok_or(Failure::Invalid)?;
+        let mut response = self
+            .agent
+            .get(format!(
+                "https://media.retroachievements.org/Badge/{name}.png"
+            ))
+            .call()
+            .map_err(|error| self.error(error))?;
+        let status = response.status().as_u16();
+        self.diagnostic = Some(format!("http {status}"));
+        classify_badge_status(status)?;
+        response
+            .body_mut()
+            .with_config()
+            .limit(crate::badges::MAX_BYTES)
+            .read_to_vec()
+            .map_err(|error| self.error(error))
+    }
+    fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure> {
+        self.call_url(API, fields)
     }
 }
 
@@ -204,6 +362,8 @@ fn contains_ascii_case_insensitive(text: &str, secret: &str) -> bool {
 fn success(value: Value) -> Result<Value, Failure> {
     if value.get("Success") == Some(&Value::Bool(true)) {
         Ok(value)
+    } else if invalid_token(&value) {
+        Err(Failure::Authentication)
     } else {
         Err(Failure::Rejected)
     }
@@ -239,10 +399,11 @@ impl Drop for LoginFields {
 }
 
 fn login_error(error: Failure) -> LoginError {
-    let message = if error == Failure::Network {
-        "Can't reach RetroAchievements"
-    } else {
-        "Invalid RetroAchievements response"
+    let message = match error {
+        Failure::Network => "Can't reach RetroAchievements",
+        Failure::Server => "RetroAchievements server busy, retrying",
+        Failure::Authentication => "Sign in again",
+        _ => "Invalid RetroAchievements response",
     };
     LoginError {
         failure: error,
@@ -311,19 +472,24 @@ fn login_detailed(
     } else {
         fields.0.push(("p", config.password.clone()));
     }
-    let mut response = http.call(&fields.0).map_err(login_error)?;
-    if response["Success"] != Value::Bool(true)
-        && remembered.is_some()
+    let response = http.call(&fields.0);
+    let retry_password = remembered.is_some()
         && config.token.is_empty()
         && !config.password.is_empty()
-    {
+        && match &response {
+            Ok(body) => body["Success"] != Value::Bool(true),
+            Err(error) => matches!(error, Failure::Authentication | Failure::Rejected),
+        };
+    let mut response = if retry_password {
         let retry = LoginFields(vec![
             ("r", "login2".into()),
             ("u", config.username.clone()),
             ("p", config.password.clone()),
         ]);
-        response = http.call(&retry.0).map_err(login_error)?;
-    }
+        http.call(&retry.0).map_err(login_error)?
+    } else {
+        response.map_err(login_error)?
+    };
     if response["Success"] != Value::Bool(true) {
         let error = rejection(&response, config);
         if let Some(Value::String(message)) = response.get_mut("Error") {
@@ -389,6 +555,8 @@ pub(crate) fn award(
             .is_some_and(|s| s.starts_with("User already has"))
     {
         Ok(())
+    } else if invalid_token(&response) {
+        Err(Failure::Authentication)
     } else {
         Err(Failure::Rejected)
     }
@@ -501,6 +669,7 @@ pub(crate) fn run(
     let mut library_total = library.len();
     let mut library_failed = false;
     let mut rescanned = Instant::now();
+    let mut background_reported = None;
     let mut badges = crate::badges::Queue::new(&dir);
     loop {
         match loads.recv_timeout(Duration::from_millis(200)) {
@@ -553,6 +722,8 @@ pub(crate) fn run(
             Ok(Command::Account(command)) => {
                 active = None;
                 failure_reported = false;
+                background_reported = None;
+                let mut login_failure = None;
                 let result = (|| -> Result<(), String> {
                     match command {
                         AccountControl::SignIn {
@@ -569,6 +740,13 @@ pub(crate) fn run(
                             credentials.username = username;
                             credentials.password = std::mem::take(&mut *password);
                             let result = login_detailed(&mut http, &credentials, None);
+                            if let Err(error) = &result {
+                                let detail = http
+                                    .diagnostic()
+                                    .unwrap_or_else(|| failure_detail(error.failure).into());
+                                login_failure =
+                                    Some((error.failure, format!("r=login2 failed: {detail}")));
+                            }
                             credentials.password.zeroize();
                             drop(password);
                             let logged_in = result.map_err(|e| e.message)?;
@@ -634,13 +812,17 @@ pub(crate) fn run(
                 account.username = config.username.clone();
                 account.signed_in = auth.is_some();
                 account.busy = false;
-                status.set(if result.is_err() {
-                    SyncStatus::Attention
-                } else if config.enabled && auth.is_some() {
-                    SyncStatus::Syncing
+                if let Some((failure, diagnostic)) = login_failure {
+                    status.set_diagnostic(failure.status(), &diagnostic);
                 } else {
-                    SyncStatus::Disabled
-                });
+                    status.set(if result.is_err() {
+                        SyncStatus::Attention
+                    } else if config.enabled && auth.is_some() {
+                        SyncStatus::Syncing
+                    } else {
+                        SyncStatus::Disabled
+                    });
+                }
                 account.message = match result {
                     Ok(()) => auth.as_ref().map_or_else(
                         || "Signed out".into(),
@@ -707,20 +889,14 @@ pub(crate) fn run(
             badges.scan();
             rescanned = Instant::now();
         }
-        if !verified
-            || !library.is_empty()
-            || (badges.pending() && !badges.waiting)
-            || store.lock().unwrap().unlocks.values().any(|u| !u.synced)
-            || active.as_ref().is_some_and(|game| {
-                !game.online || (game.ready && game.last_ping.elapsed() >= Duration::from_secs(120))
-            })
-        {
-            status.set(SyncStatus::Syncing);
-        }
+        let mut diagnostic = "failed: invalid data or storage".to_string();
+        let mut background_error = None;
+        let mut background_succeeded = false;
         let result = (|| -> Result<(), Failure> {
             let mut http = EnabledTransport {
                 inner: &mut http,
                 enabled: &enabled,
+                diagnostic: &mut diagnostic,
             };
             if !verified {
                 let logged_in =
@@ -781,7 +957,7 @@ pub(crate) fn run(
                         }
                     }
                     Err(Failure::Network) => return Err(Failure::Network),
-                    Err(error) => deferred_error = Some(error),
+                    Err(error) => deferred_error = Some((error, http.diagnostic.clone())),
                 }
             }
             if !enabled.load(Ordering::Acquire) {
@@ -860,20 +1036,25 @@ pub(crate) fn run(
                 if let Ok(hash) = crate::library::hash(&dir, path) {
                     match prefetch(&mut http, auth, &dir, &hash) {
                         Ok(game) => {
+                            background_succeeded = true;
                             crate::library::checked(&dir, path, now());
                             badges.enqueue(&game);
                         }
-                        Err(Failure::Network) => return Err(Failure::Network),
                         Err(error) => {
-                            library_failed = true;
-                            deferred_error = Some(error);
+                            library_failed |= !matches!(error, Failure::Network | Failure::Server);
+                            background_error = Some((error, http.diagnostic.clone()));
                         }
                     }
                 } else {
                     library_failed = true;
                 }
                 // Removed/unreadable ROMs are reconsidered on the next library scan.
-                library.pop_front();
+                if background_error
+                    .as_ref()
+                    .is_none_or(|(error, _)| !matches!(error, Failure::Network | Failure::Server))
+                {
+                    library.pop_front();
+                }
                 if library.is_empty() && !library_failed && !badges.pending() {
                     let _ = notices.send(Notice::status(0, "Offline achievement cache ready"));
                 }
@@ -881,7 +1062,12 @@ pub(crate) fn run(
             if enabled.load(Ordering::Acquire) {
                 badges.step(&mut http);
             }
-            deferred_error.map_or(Ok(()), Err)
+            if let Some((error, detail)) = deferred_error {
+                *http.diagnostic = detail;
+                Err(error)
+            } else {
+                Ok(())
+            }
         })();
         status.pending.store(
             !library.is_empty()
@@ -905,6 +1091,28 @@ pub(crate) fn run(
             status.set(SyncStatus::Disabled);
             continue;
         }
+        // Background cache requests do not describe the active game's verified session.
+        let result = if result.is_ok() {
+            if let Some((error, detail)) = background_error.as_ref() {
+                if verified && active.as_ref().is_some_and(|game| game.online) {
+                    if background_reported != Some(*error) {
+                        eprintln!("slot: achievements: background {detail}");
+                        background_reported = Some(*error);
+                    }
+                    Ok(())
+                } else {
+                    diagnostic = detail.clone();
+                    Err(*error)
+                }
+            } else {
+                if background_succeeded && background_reported.take().is_some() {
+                    eprintln!("slot: achievements: background sync ok");
+                }
+                Ok(())
+            }
+        } else {
+            result
+        };
         match result {
             Ok(()) => {
                 if failure_reported {
@@ -921,19 +1129,31 @@ pub(crate) fn run(
                         failure_reported = false;
                     }
                 }
-                status.set(if library_failed || badges.waiting {
-                    SyncStatus::Attention
-                } else if !library.is_empty()
-                    || badges.pending()
-                    || store.lock().unwrap().unlocks.values().any(|u| !u.synced)
-                {
-                    SyncStatus::Syncing
-                } else {
-                    SyncStatus::Ready
-                });
-                delay = 30;
+                status.set(
+                    if verified && active.as_ref().is_some_and(|game| game.online) {
+                        SyncStatus::Ready
+                    } else if library_failed || badges.waiting {
+                        SyncStatus::Attention
+                    } else if !library.is_empty()
+                        || badges.pending()
+                        || store.lock().unwrap().unlocks.values().any(|u| !u.synced)
+                    {
+                        SyncStatus::Syncing
+                    } else {
+                        SyncStatus::Ready
+                    },
+                );
                 warned = false;
-                next_attempt = Instant::now() + Duration::from_secs(1);
+                if background_error
+                    .as_ref()
+                    .is_some_and(|(error, _)| matches!(error, Failure::Network | Failure::Server))
+                {
+                    next_attempt = Instant::now() + Duration::from_secs(delay);
+                    delay = (delay * 2).min(300);
+                } else {
+                    delay = 30;
+                    next_attempt = Instant::now() + Duration::from_secs(1);
+                }
             }
             Err(error) => {
                 if let Some(game) = active.as_ref() {
@@ -942,6 +1162,8 @@ pub(crate) fn run(
                         crate::GameAchievementState::Offline(
                             "Cannot reach RetroAchievements".into(),
                         )
+                    } else if error == Failure::Server {
+                        crate::GameAchievementState::ServerBusy
                     } else {
                         crate::GameAchievementState::Error(
                             match error {
@@ -962,11 +1184,7 @@ pub(crate) fn run(
                         cached: false,
                     });
                 }
-                status.set(if error == Failure::Network {
-                    SyncStatus::Offline
-                } else {
-                    SyncStatus::Attention
-                });
+                status.set_diagnostic(error.status(), &diagnostic);
                 // Reauthenticate after errors. No rejected or malformed response consumes an award.
                 verified = false;
                 let quiet_offline = error == Failure::Network
@@ -979,6 +1197,7 @@ pub(crate) fn run(
                             "Achievements offline - sync later"
                         }
                         Failure::Network => "Achievements need internet once",
+                        Failure::Server => "Achievements: server busy, retrying",
                         Failure::Rejected => "Achievement sync needs attention",
                         Failure::Authentication => "Achievements: sign in again",
                         Failure::Invalid => "Achievements: data or storage error",
@@ -997,6 +1216,183 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn http_response_classification_does_not_confuse_status_with_connectivity() {
+        let ok = json!({"Success":true});
+        assert_eq!(classify_response(200, Some(ok.clone())), Ok(ok));
+        let rejected = json!({"Success":false,"Error":"Missing game","Code":"invalid_parameter"});
+        for (status, expected) in [
+            (401, Failure::Authentication),
+            (403, Failure::Authentication),
+            (422, Failure::Rejected),
+            (429, Failure::Server),
+            (500, Failure::Server),
+        ] {
+            assert_eq!(
+                classify_response(status, Some(rejected.clone())),
+                Err(expected)
+            );
+        }
+        let malformed = serde_json::from_slice::<Value>(b"not JSON").ok();
+        assert_eq!(
+            classify_response(200, malformed.clone()),
+            Err(Failure::Invalid)
+        );
+        assert_eq!(
+            classify_response(422, malformed.clone()),
+            Err(Failure::Invalid)
+        );
+        assert_eq!(
+            classify_response(401, malformed.clone()),
+            Err(Failure::Authentication)
+        );
+        assert_eq!(
+            classify_response(429, malformed.clone()),
+            Err(Failure::Server)
+        );
+        assert_eq!(classify_response(500, malformed), Err(Failure::Server));
+        for body in [
+            json!({"Success":false,"Code":"invalid_token"}),
+            json!({"Success":false,"Error":"The token has expired"}),
+        ] {
+            assert_eq!(
+                classify_response(200, Some(body.clone())),
+                Err(Failure::Authentication)
+            );
+            assert_eq!(
+                classify_response(422, Some(body.clone())),
+                Err(Failure::Authentication)
+            );
+            assert_eq!(success(body), Err(Failure::Authentication));
+        }
+        assert_eq!(
+            transport_failure(&ureq::Error::HostNotFound),
+            (Failure::Network, "network (DNS)")
+        );
+        assert_eq!(
+            transport_failure(&ureq::Error::Timeout(ureq::Timeout::Global)),
+            (Failure::Network, "network (timeout)")
+        );
+        let error = ureq::Error::Io(std::io::Error::other("https://example.com/?t=secret"));
+        assert_eq!(
+            transport_failure(&error),
+            (Failure::Network, "network (connection)")
+        );
+    }
+
+    #[test]
+    fn diagnostics_only_include_fixed_operation_and_code_labels() {
+        assert_eq!(operation_name("login2"), "login2");
+        assert_eq!(operation_name("https://example.com/?t=secret"), "unknown");
+        assert_eq!(
+            diagnostic_code(&json!({"Code":"expired_token"})),
+            Some("expired_token")
+        );
+        assert_eq!(
+            diagnostic_code(&json!({"Code":"secret","Error":"secret"})),
+            None
+        );
+        assert_eq!(
+            diagnostic_code(&json!({"Code":"https://example.com/?t=secret"})),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_badges_are_rejections_and_server_errors_are_retryable() {
+        assert_eq!(classify_badge_status(200), Ok(()));
+        assert_eq!(classify_badge_status(404), Err(Failure::Rejected));
+        assert_eq!(classify_badge_status(429), Err(Failure::Server));
+        assert_eq!(classify_badge_status(503), Err(Failure::Server));
+    }
+
+    #[test]
+    fn http_authentication_failure_keeps_the_legacy_password_fallback() {
+        struct Expired(bool);
+        impl Transport for Expired {
+            fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, Failure> {
+                if !self.0 {
+                    self.0 = true;
+                    assert!(fields.iter().any(|(key, _)| *key == "t"));
+                    Err(Failure::Authentication)
+                } else {
+                    assert!(fields.iter().any(|(key, _)| *key == "p"));
+                    Ok(json!({"Success":true,"User":"Player","Token":"new-token"}))
+                }
+            }
+        }
+        let mut config = Config::default();
+        config.username = "Player".into();
+        config.password = "legacy-password".into();
+        let remembered = Auth {
+            username: "Player".into(),
+            token: "expired-token".into(),
+        };
+        let result = login_detailed(&mut Expired(false), &config, Some(&remembered));
+        assert_eq!(result.ok().unwrap().token, "new-token");
+    }
+
+    #[test]
+    #[ignore = "requires loopback sockets; run explicitly on an unrestricted host"]
+    fn real_http_status_responses_are_not_network_failures() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        for (status, body, expected) in [
+            (
+                422,
+                r#"{"Success":false,"Error":"Missing game","Code":"invalid_parameter"}"#,
+                Failure::Rejected,
+            ),
+            (
+                401,
+                r#"{"Success":false,"Error":"Expired token","Code":"expired_token"}"#,
+                Failure::Authentication,
+            ),
+            (
+                429,
+                r#"{"Success":false,"Error":"Rate limit"}"#,
+                Failure::Server,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/dorequest.php", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 8192);
+                }
+                let headers = String::from_utf8(request).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                stream.read_exact(&mut vec![0; length]).unwrap();
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let mut http = Http::new();
+            let result = http.call_url(&url, &[("r", "gameid".into())]);
+            assert_ne!(result, Err(Failure::Network));
+            assert_eq!(result, Err(expected));
+            assert!(http
+                .diagnostic()
+                .unwrap()
+                .starts_with(&format!("http {status}")));
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn empty_session_unlock_lists_may_be_omitted() {
@@ -1057,12 +1453,18 @@ mod tests {
             earned_at: 100,
             synced: false,
         };
-        for reply in [json!({"Success":false,"Error":"Expired token"}), json!({})] {
+        for (reply, expected) in [
+            (
+                json!({"Success":false,"Error":"Expired token"}),
+                Failure::Authentication,
+            ),
+            (json!({}), Failure::Rejected),
+        ] {
             let mut http = Fake {
                 reply,
                 fields: vec![],
             };
-            assert_eq!(award(&mut http, &auth, &unlock, 50), Err(Failure::Rejected));
+            assert_eq!(award(&mut http, &auth, &unlock, 50), Err(expected));
             assert!(!http.fields.iter().any(|(k, _)| k == "o"));
         }
     }

@@ -13,6 +13,7 @@ pub enum GameAchievementState {
     Unrecognized,
     NoAchievements,
     Ready,
+    ServerBusy,
     Offline(String),
     Error(String),
     NotSupportedPlatform,
@@ -48,6 +49,7 @@ pub struct GameAchievementSnapshot {
     pub state: GameAchievementState,
     pub game_id: Option<u32>,
     pub game_title: String,
+    pub unsynced_unlocks: u32,
     pub summary: AchievementSummary,
     pub achievements: Vec<AchievementView>,
 }
@@ -60,6 +62,7 @@ impl GameAchievementSnapshot {
             state,
             game_id: None,
             game_title,
+            unsynced_unlocks: 0,
             summary: AchievementSummary::default(),
             achievements: Vec::new(),
         }
@@ -96,6 +99,22 @@ pub(crate) fn catalog_state(game: &storage::Game) -> GameAchievementState {
     }
 }
 
+pub(crate) fn unsynced_unlocks(
+    store: &storage::Store,
+    pending: &BTreeMap<u32, (storage::Unlock, crate::Notice)>,
+) -> u32 {
+    let count = store
+        .unlocks
+        .values()
+        .filter(|unlock| !unlock.synced)
+        .count()
+        + pending
+            .keys()
+            .filter(|id| !store.unlocks.contains_key(id))
+            .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
 pub(crate) fn build(
     game: &Playing,
     store: &storage::Store,
@@ -106,6 +125,7 @@ pub(crate) fn build(
         game.state.clone(),
         game.catalog.title.clone(),
     );
+    snapshot.unsynced_unlocks = unsynced_unlocks(store, pending);
     snapshot.game_id = (game.catalog.id != 0).then_some(game.catalog.id);
     for a in game.catalog.achievements.iter().filter(|a| a.flags == 3) {
         let local = store

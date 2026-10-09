@@ -1313,6 +1313,7 @@ fn snapshots_keep_the_official_catalog_and_union_all_unlock_sources() {
     ram[0] = 12;
     playing.runtime.frame(&ram, &[0x8000, 0x40000, 0]);
     let view = snapshot::build(&playing, &store, &pending);
+    assert_eq!(view.unsynced_unlocks, 1);
     assert_eq!(
         view.achievements.iter().map(|a| a.id).collect::<Vec<_>>(),
         [7, 8, 9, 10, 12, 13]
@@ -1483,9 +1484,66 @@ fn online_unrecognised_and_empty_catalog_results_reach_the_snapshot() {
 }
 
 #[test]
+fn background_library_failures_leave_a_verified_active_game_online() {
+    struct LibraryFailure {
+        failure: network::Failure,
+        failed: Arc<AtomicBool>,
+        server: Server,
+    }
+    impl network::Transport for LibraryFailure {
+        fn badge(&mut self, name: &str) -> Result<Vec<u8>, network::Failure> {
+            self.server.badge(name)
+        }
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            if fields
+                .iter()
+                .any(|(key, value)| *key == "r" && value == "unlocks")
+            {
+                self.failed.store(true, Ordering::Release);
+                return Err(self.failure);
+            }
+            self.server.call(fields)
+        }
+    }
+    for failure in [
+        network::Failure::Network,
+        network::Failure::Server,
+        network::Failure::Rejected,
+    ] {
+        let root = configured();
+        let rom = root.path().join("Games/GBA/Active.gba");
+        std::fs::write(&rom, b"active ROM").unwrap();
+        std::fs::write(root.path().join("Games/GBA/Other.gba"), b"background ROM").unwrap();
+        let store = Store::open(root.path(), "Player").unwrap();
+        library::checked(&store.dir, &rom, network::now());
+        let failed = Arc::new(AtomicBool::new(false));
+        let (calls, _) = mpsc::channel();
+        let service = Service::start_with(
+            root.path().into(),
+            LibraryFailure {
+                failure,
+                failed: failed.clone(),
+                server: Server { calls },
+            },
+        );
+        let mut core = service.wrap(Box::<TestCore>::default());
+        core.load(&rom).unwrap();
+        wait_for(|| {
+            failed.load(Ordering::Acquire)
+                && service.sync_status() == SyncStatus::Ready
+                && service
+                    .game_snapshot()
+                    .is_some_and(|s| s.state == GameAchievementState::Ready)
+        });
+        assert!(service.account_state().signed_in);
+    }
+}
+
+#[test]
 fn an_online_game_publishes_ready_after_a_failed_sync_recovers() {
     struct Recovering {
         fail_next: Arc<AtomicBool>,
+        failure: network::Failure,
         server: Server,
     }
     impl network::Transport for Recovering {
@@ -1499,58 +1557,77 @@ fn an_online_game_publishes_ready_after_a_failed_sync_recovers() {
                 .any(|(key, value)| *key == "r" && value == "awardachievement")
                 && self.fail_next.swap(false, Ordering::AcqRel)
             {
-                return Err(network::Failure::Network);
+                return Err(self.failure);
             }
             self.server.call(fields)
         }
     }
-    let root = configured();
-    let rom = root.path().join("Test.gba");
-    std::fs::write(&rom, b"ROM").unwrap();
-    let fail_next = Arc::new(AtomicBool::new(true));
-    let (calls, requests) = mpsc::channel();
-    let service = Service::start_with(
-        root.path().into(),
-        Recovering {
-            fail_next,
-            server: Server { calls },
-        },
-    );
-    let mut core = service.wrap(Box::<TestCore>::default());
-    core.load(&rom).unwrap();
-    wait_for(|| {
-        service.sync_status() == SyncStatus::Ready
-            && service
-                .game_snapshot()
-                .is_some_and(|s| s.state == GameAchievementState::Ready)
-    });
-    let generation = service.game_generation();
-    core.run_frame(ButtonMask(0));
-    core.run_frame(ButtonMask(1));
-    wait_for(|| {
-        service.sync_status() == SyncStatus::Offline
-            && service
-                .game_snapshot()
-                .is_some_and(|s| matches!(s.state, GameAchievementState::Offline(_)))
-    });
-    let failed = service.game_snapshot().unwrap();
-    service.network_available();
-    wait_for(|| {
-        service.sync_status() == SyncStatus::Ready
-            && service
-                .game_snapshot()
-                .is_some_and(|s| s.state == GameAchievementState::Ready)
-    });
-    let recovered = service.game_snapshot().unwrap();
-    assert_eq!(recovered.generation, generation);
-    assert_eq!(recovered.game_id, Some(1));
-    assert_eq!(recovered.summary.unlocked, 1);
-    assert!(recovered.revision > failed.revision);
-    let requests: Vec<_> = requests.try_iter().collect();
-    for request in ["gameid", "patch", "startsession"] {
-        assert_eq!(requests.iter().filter(|r| r.as_str() == request).count(), 1);
+    for (failure, sync_state, game_state) in [
+        (
+            network::Failure::Network,
+            SyncStatus::Offline,
+            GameAchievementState::Offline("Cannot reach RetroAchievements".into()),
+        ),
+        (
+            network::Failure::Server,
+            SyncStatus::ServerBusy,
+            GameAchievementState::ServerBusy,
+        ),
+        (
+            network::Failure::Authentication,
+            SyncStatus::Attention,
+            GameAchievementState::Error("Sign in again".into()),
+        ),
+    ] {
+        let root = configured();
+        let rom = root.path().join("Test.gba");
+        std::fs::write(&rom, b"ROM").unwrap();
+        let fail_next = Arc::new(AtomicBool::new(true));
+        let (calls, requests) = mpsc::channel();
+        let service = Service::start_with(
+            root.path().into(),
+            Recovering {
+                fail_next,
+                failure,
+                server: Server { calls },
+            },
+        );
+        let mut core = service.wrap(Box::<TestCore>::default());
+        core.load(&rom).unwrap();
+        wait_for(|| {
+            service.sync_status() == SyncStatus::Ready
+                && service
+                    .game_snapshot()
+                    .is_some_and(|s| s.state == GameAchievementState::Ready)
+        });
+        let generation = service.game_generation();
+        core.run_frame(ButtonMask(0));
+        core.run_frame(ButtonMask(1));
+        wait_for(|| {
+            service.sync_status() == sync_state
+                && service
+                    .game_snapshot()
+                    .is_some_and(|s| s.state == game_state && s.unsynced_unlocks == 1)
+        });
+        let failed = service.game_snapshot().unwrap();
+        service.network_available();
+        wait_for(|| {
+            service.sync_status() == SyncStatus::Ready
+                && service.game_snapshot().is_some_and(|s| {
+                    s.state == GameAchievementState::Ready && s.unsynced_unlocks == 0
+                })
+        });
+        let recovered = service.game_snapshot().unwrap();
+        assert_eq!(recovered.generation, generation);
+        assert_eq!(recovered.game_id, Some(1));
+        assert_eq!(recovered.summary.unlocked, 1);
+        assert!(recovered.revision > failed.revision);
+        let requests: Vec<_> = requests.try_iter().collect();
+        for request in ["gameid", "patch", "startsession"] {
+            assert_eq!(requests.iter().filter(|r| r.as_str() == request).count(), 1);
+        }
+        assert_eq!(requests.iter().filter(|r| *r == "login2").count(), 2);
     }
-    assert_eq!(requests.iter().filter(|r| *r == "login2").count(), 2);
 }
 
 #[test]

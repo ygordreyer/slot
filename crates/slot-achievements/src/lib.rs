@@ -68,6 +68,7 @@ pub enum SyncStatus {
     Ready,
     Offline,
     Attention,
+    ServerBusy,
 }
 
 #[derive(Default)]
@@ -76,6 +77,7 @@ struct Status {
     snapshot: Mutex<snapshot::Published>,
     epoch: AtomicU64,
     network: AtomicU8,
+    reported: AtomicU8,
     unsaved: AtomicBool,
     reconnect: AtomicBool,
     // Zero means unknown; otherwise percent + 1, keeping Default valid.
@@ -87,18 +89,52 @@ struct Status {
 
 impl Status {
     fn set(&self, value: SyncStatus) {
+        self.set_diagnostic(
+            value,
+            match value {
+                SyncStatus::Disabled => "disabled",
+                SyncStatus::Syncing => "syncing",
+                SyncStatus::Ready => "signed in, sync ok",
+                SyncStatus::Offline => "failed: network (connection)",
+                SyncStatus::Attention => "sync needs attention",
+                SyncStatus::ServerBusy => "server busy, retrying",
+            },
+        );
+    }
+
+    fn set_diagnostic(&self, value: SyncStatus, diagnostic: &str) {
         self.network.store(value as u8, Ordering::Release);
+        let effective = self.get();
+        if self.reported.swap(effective as u8, Ordering::AcqRel) != effective as u8 {
+            let diagnostic = if effective == value {
+                diagnostic
+            } else {
+                "local unlock save failed"
+            };
+            eprintln!("slot: achievements: {diagnostic}");
+        }
+    }
+
+    fn set_unsaved(&self, value: bool) {
+        if self.unsaved.swap(value, Ordering::AcqRel) != value {
+            self.set(self.network_status());
+        }
     }
 
     fn get(&self) -> SyncStatus {
         if self.unsaved.load(Ordering::Acquire) {
             return SyncStatus::Attention;
         }
+        self.network_status()
+    }
+
+    fn network_status(&self) -> SyncStatus {
         match self.network.load(Ordering::Acquire) {
             0 => SyncStatus::Disabled,
             1 => SyncStatus::Syncing,
             2 => SyncStatus::Ready,
             3 => SyncStatus::Offline,
+            5 => SyncStatus::ServerBusy,
             _ => SyncStatus::Attention,
         }
     }
@@ -122,8 +158,6 @@ pub struct Notice {
 
 impl Notice {
     fn status(generation: u64, title: &str) -> Self {
-        // Background diagnostics only; routine status is represented by the shelf icon.
-        eprintln!("slot: {title}");
         Self {
             badge: None,
             generation,
@@ -579,6 +613,7 @@ fn run(
                 });
             }
             let game = playing.as_mut().unwrap();
+            let previous_state = game.state.clone();
             snapshot::prepare(
                 game,
                 prepared.game,
@@ -586,6 +621,10 @@ fn run(
                 &store.lock().unwrap(),
                 &unsaved,
             );
+            // Cached definitions can evaluate before the active session is verified.
+            if prepared.cached && game.state == GameAchievementState::Ready {
+                game.state = previous_state;
+            }
             snapshot_state = game.state.clone();
             let state = if prepared.cached { "cached" } else { "online" };
             let _ = notices.send(Notice {
@@ -654,6 +693,7 @@ fn run(
                 )
             };
             next.state = state;
+            next.unsynced_unlocks = snapshot::unsynced_unlocks(&store.lock().unwrap(), &unsaved);
             if next.game_title.is_empty() {
                 next.game_title = snapshot_title.clone();
             }
@@ -676,7 +716,7 @@ fn run(
             snapshot_dirty = false;
             snapshot_updated = Instant::now();
         }
-        status.unsaved.store(!unsaved.is_empty(), Ordering::Release);
+        status.set_unsaved(!unsaved.is_empty());
     }
 }
 

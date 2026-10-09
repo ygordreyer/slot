@@ -288,10 +288,21 @@ fn status(state: &GameAchievementState) -> &str {
         GameAchievementState::SigningIn | GameAchievementState::Loading => "LOADING",
         GameAchievementState::Unrecognized => "GAME NOT RECOGNISED BY RETROACHIEVEMENTS",
         GameAchievementState::NoAchievements => "NO ACHIEVEMENTS FOR THIS GAME",
-        GameAchievementState::Ready => "",
+        GameAchievementState::Ready => "ONLINE",
+        GameAchievementState::ServerBusy => "SERVER BUSY, RETRYING",
         GameAchievementState::Offline(_) => "OFFLINE",
         GameAchievementState::Error(message) => message,
         GameAchievementState::NotSupportedPlatform => "ONLY GBA GAMES SUPPORT ACHIEVEMENTS",
+    }
+}
+
+fn sync_status(snapshot: &GameAchievementSnapshot) -> String {
+    let state = status(&snapshot.state).to_uppercase();
+    // The label wrapper splits on whitespace, so a newline would not break the line.
+    match snapshot.unsynced_unlocks {
+        0 => state,
+        1 => format!("{state}, 1 UNLOCK WAITING TO SYNC"),
+        n => format!("{state}, {n} UNLOCKS WAITING TO SYNC"),
     }
 }
 
@@ -437,7 +448,7 @@ fn raster(key: &ScreenKey, snapshot: Option<&GameAchievementSnapshot>) -> (CartF
         1,
         18.0,
     );
-    put_text(&mut face, status(&snapshot.state), 24, 80, 672, 34, 2, 18.0);
+    put_text(&mut face, &sync_status(snapshot), 24, 80, 672, 34, 2, 18.0);
     if selection.detail {
         if let Some(a) = snapshot.achievements.get(selection.row) {
             put_text(&mut face, &a.title, 32, 118, 656, 48, 2, 24.0);
@@ -710,6 +721,11 @@ mod tests {
             "ACHIEVEMENTS ARE OFF"
         );
         assert_eq!(status(&GameAchievementState::SignedOut), "NOT SIGNED IN");
+        assert_eq!(status(&GameAchievementState::Ready), "ONLINE");
+        assert_eq!(
+            status(&GameAchievementState::ServerBusy),
+            "SERVER BUSY, RETRYING"
+        );
         assert_eq!(
             status(&GameAchievementState::Unrecognized),
             "GAME NOT RECOGNISED BY RETROACHIEVEMENTS"
@@ -726,6 +742,23 @@ mod tests {
             status(&GameAchievementState::NotSupportedPlatform),
             "ONLY GBA GAMES SUPPORT ACHIEVEMENTS"
         );
+        let mut snapshot =
+            GameAchievementSnapshot::empty(1, GameAchievementState::Ready, "Test".into());
+        assert_eq!(sync_status(&snapshot), "ONLINE");
+        snapshot.unsynced_unlocks = 2;
+        assert_eq!(sync_status(&snapshot), "ONLINE, 2 UNLOCKS WAITING TO SYNC");
+        snapshot.state = GameAchievementState::ServerBusy;
+        assert_eq!(
+            sync_status(&snapshot),
+            "SERVER BUSY, RETRYING, 2 UNLOCKS WAITING TO SYNC"
+        );
+        snapshot.state = GameAchievementState::Offline(String::new());
+        assert_eq!(sync_status(&snapshot), "OFFLINE, 2 UNLOCKS WAITING TO SYNC");
+        snapshot.unsynced_unlocks = 1;
+        assert_eq!(sync_status(&snapshot), "OFFLINE, 1 UNLOCK WAITING TO SYNC");
+        snapshot.state = GameAchievementState::Error("Sign in again".into());
+        snapshot.unsynced_unlocks = 0;
+        assert_eq!(sync_status(&snapshot), "SIGN IN AGAIN");
     }
 
     #[test]
