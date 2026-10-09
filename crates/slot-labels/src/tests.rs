@@ -67,14 +67,17 @@ fn title_resolution_requires_unique_exact_gba_match() {
     );
     assert_eq!(
         source::game_id(&page, "mario kart super circuit", Platform::Gba).unwrap(),
-        1
+        vec![1]
     );
-    assert!(source::game_id(
-        &(correct.clone() + &item(4, "Mario Kart: Super Circuit", "Nintendo Game Boy Advance")),
-        "mario kart super circuit",
-        Platform::Gba
-    )
-    .is_err());
+    assert_eq!(
+        source::game_id(
+            &(correct.clone() + &item(4, "Mario Kart: Super Circuit", "Nintendo Game Boy Advance")),
+            "mario kart super circuit",
+            Platform::Gba
+        )
+        .unwrap(),
+        vec![1, 4]
+    );
     assert_eq!(
         source::game_id(
             &(correct.clone() + &correct),
@@ -82,7 +85,7 @@ fn title_resolution_requires_unique_exact_gba_match() {
             Platform::Gba
         )
         .unwrap(),
-        1
+        vec![1]
     );
     assert!(source::game_id(
         "<html>changed layout</html>",
@@ -106,7 +109,9 @@ fn artwork_is_cartridge_front_for_the_requested_region() {
     assert!(source::image_url(page, &cart("Test (Europe)"))
         .unwrap()
         .ends_with("/eu.png"));
-    assert!(source::image_url(page, &cart("Test (Japan)")).is_err());
+    assert!(source::image_url(page, &cart("Test (Japan)"))
+        .unwrap()
+        .ends_with("/us.png"));
     for url in [
         "http://images.launchbox-app.com/x",
         "https://images.launchbox-app.com.evil/x",
@@ -125,14 +130,262 @@ fn a_game_boy_cart_matches_its_own_platform_first_and_the_other_second() {
         + &item(2, "Tetris", "Nintendo Game Boy Color")
         + &item(3, "Tetris", "Nintendo Game Boy Advance")
         + &item(4, "Wario Land 3", "Nintendo Game Boy Color");
-    assert_eq!(source::game_id(&page, "tetris", Platform::Gb).unwrap(), 1);
-    assert_eq!(source::game_id(&page, "tetris", Platform::Gbc).unwrap(), 2);
-    assert_eq!(source::game_id(&page, "tetris", Platform::Gba).unwrap(), 3);
+    assert_eq!(
+        source::game_id(&page, "tetris", Platform::Gb).unwrap(),
+        vec![1]
+    );
+    assert_eq!(
+        source::game_id(&page, "tetris", Platform::Gbc).unwrap(),
+        vec![2]
+    );
+    assert_eq!(
+        source::game_id(&page, "tetris", Platform::Gba).unwrap(),
+        vec![3]
+    );
     assert_eq!(
         source::game_id(&page, "wario land 3", Platform::Gb).unwrap(),
-        4
+        vec![4]
     );
     assert!(source::game_id(&page, "wario land 3", Platform::Gba).is_err());
+}
+
+#[test]
+fn search_queries_keep_punctuation_and_keys_fold_common_variants() {
+    for (stem, wanted) in [
+        ("Cruis'n Velocity (USA)", "Cruis'n Velocity"),
+        ("Pac-Man Collection (USA)", "Pac-Man Collection"),
+        ("Power Rangers S.P.D. (USA)", "Power Rangers S.P.D."),
+        ("Tron 2.0 - Killer App (USA)", "Tron 2.0 Killer App"),
+        (
+            "Lilo & Stitch 2 - Haemsterviel Havoc (USA)",
+            "Lilo & Stitch 2 Haemsterviel Havoc",
+        ),
+        ("A - B + . & C (USA)", "A B & C"),
+    ] {
+        assert_eq!(source::query(stem), wanted);
+    }
+    let item = |id, name| {
+        format!("<a href='/games/details/{id}-game'><h3>{name}</h3><p>Nintendo Game Boy Advance</p></a>")
+    };
+    assert_eq!(
+        source::game_id(
+            &item(1, "Megaman Battle Network"),
+            "mega man battle network",
+            Platform::Gba
+        )
+        .unwrap(),
+        vec![1]
+    );
+    assert_eq!(
+        source::game_id(
+            &item(2, "Hämsterviel Havoc"),
+            "haemsterviel havoc",
+            Platform::Gba
+        )
+        .unwrap(),
+        vec![2]
+    );
+    assert_eq!(
+        source::game_id(
+            &(item(3, "Megaman Battle Network") + &item(4, "Mega Man Battle Network")),
+            "mega man battle network",
+            Platform::Gba
+        )
+        .unwrap(),
+        vec![4]
+    );
+}
+
+#[test]
+fn year_retry_does_not_change_non_year_hyphens() {
+    assert_eq!(
+        source::year_query("NFL Blitz 20-02"),
+        Some("NFL Blitz 2002".into())
+    );
+    assert_eq!(source::year_query("Mother 1-2"), None);
+}
+
+#[test]
+fn regional_fallback_uses_regionless_before_world() {
+    let regionless = "<a href='https://images.launchbox-app.com/plain.png' data-title='Test - Cart - Front Image'></a>";
+    let world = "<a href='https://images.launchbox-app.com/world.png' data-title='Test - Cart - Front Image (World)'></a>";
+    assert!(
+        source::image_url(&(world.to_owned() + regionless), &cart("Test (Europe)"))
+            .unwrap()
+            .ends_with("/plain.png")
+    );
+    assert!(source::image_url(world, &cart("Test (Europe)"))
+        .unwrap()
+        .ends_with("/world.png"));
+}
+
+#[test]
+fn aliases_are_keyed_by_rom_titles() {
+    for (stem, key, id) in [
+        ("Invincible Iron Man, The (USA, Europe)", "invincible iron man", 10770),
+        ("Rayman - 10th Anniversary (USA)", "rayman 10th anniversary", 3325),
+        ("Three-in-One Pack - Connect Four + Perfection + Trouble (USA)", "three in one pack connect four perfection trouble", 21686),
+        ("Three-in-One Pack - Risk + Battleship + Clue (USA)", "three in one pack risk battleship clue", 18148),
+        ("Three-in-One Pack - Sorry! + Aggravation + Scrabble Junior (USA)", "three in one pack sorry aggravation scrabble junior", 91944),
+        ("Crash & Spyro Superpack - Spyro - Season of Ice + Crash Bandicoot - The Huge Adventure (USA)", "crash and spyro superpack spyro season of ice crash bandicoot the huge adventure", 18386),
+        ("Pokemon - Ruby Version (USA, Europe) (Rev 2)", "pokemon ruby version", 2241),
+        ("Oriental Blue - Ao no Tengai (Japan) [T-En]", "oriental blue ao no tengai", 30529),
+        ("Mega Man Battle Network 6 - Cybeast Gregar (USA)", "mega man battle network 6 cybeast gregar", 6641),
+        ("Tron 2.0 - Killer App (USA)", "tron 2 0 killer app", 3907),
+        ("Yggdra Union - We'll Never Fight Alone (USA)", "yggdra union well never fight alone", 3817),
+    ] {
+        assert_eq!(source::title(stem), key, "{stem}");
+        assert_eq!(source::known(key), Some(id));
+    }
+}
+
+enum Reply {
+    Page(&'static str),
+    Network(&'static str),
+    Unavailable(&'static str),
+}
+
+struct Fixture {
+    calls: Vec<String>,
+    replies: Vec<(&'static str, Reply)>,
+}
+
+impl Transport for Fixture {
+    fn get(&mut self, url: &str) -> Result<Vec<u8>, Error> {
+        self.calls.push(url.into());
+        match self.replies.iter().find(|(needle, _)| url.contains(needle)) {
+            Some((_, Reply::Page(page))) => Ok(page.as_bytes().to_vec()),
+            Some((_, Reply::Network(message))) => Err(Error::Network((*message).into())),
+            Some((_, Reply::Unavailable(message))) => Err(Error::Unavailable((*message).into())),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+#[test]
+fn resolve_tries_duplicate_candidates_and_short_circuits_searches() {
+    let mut http = Fixture {
+        calls: vec![],
+        replies: vec![
+            ("Duplicate%20Game", Reply::Page("<a href='/games/details/1-game'><h3>Duplicate Game</h3><p>Nintendo Game Boy Advance</p></a><a href='/games/details/2-game'><h3>Duplicate Game</h3><p>Nintendo Game Boy Advance</p></a>")),
+            ("images/1", Reply::Unavailable("404")),
+            ("images/2", Reply::Page("<a href='https://images.launchbox-app.com/cart.png' data-title='Game - Cart - Front Image (North America)'></a>")),
+        ],
+    };
+    assert!(
+        source::resolve(&mut http, &cart("Duplicate Game (USA)"), None)
+            .unwrap()
+            .ends_with("/cart.png")
+    );
+    assert!(http
+        .calls
+        .iter()
+        .any(|call| call.ends_with("/games/images/1")));
+    assert!(http
+        .calls
+        .iter()
+        .any(|call| call.ends_with("/games/images/2")));
+
+    assert_eq!(http.calls.len(), 3);
+}
+
+#[test]
+fn resolve_spends_gallery_budget_on_distinct_candidates() {
+    let mut http = Fixture {
+        calls: vec![],
+        replies: vec![
+            ("Fallback%20Game", Reply::Page("<a href='/games/details/1-game'><h3>Fallback Game</h3><p>Nintendo Game Boy Advance</p></a><a href='/games/details/2-game'><h3>Fallback Game</h3><p>Nintendo Game Boy Advance</p></a>")),
+            ("fallback%20game", Reply::Page("<a href='/games/details/1-game'><h3>Fallback Game</h3><p>Nintendo Game Boy Advance</p></a><a href='/games/details/2-game'><h3>Fallback Game</h3><p>Nintendo Game Boy Advance</p></a><a href='/games/details/3-game'><h3>Fallback Game</h3><p>Nintendo Game Boy Advance</p></a>")),
+            ("images/1", Reply::Page("")),
+            ("images/2", Reply::Page("")),
+            ("images/3", Reply::Page("<a href='https://images.launchbox-app.com/cart.png' data-title='Game - Cart - Front Image (North America)'></a>")),
+        ],
+    };
+
+    assert!(source::resolve(
+        &mut http,
+        &cart("fallback game (USA)"),
+        Some("Fallback Game")
+    )
+    .unwrap()
+    .ends_with("/cart.png"));
+    assert_eq!(
+        http.calls
+            .iter()
+            .filter(|call| call.ends_with("/games/images/1"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        http.calls
+            .iter()
+            .filter(|call| call.ends_with("/games/images/2"))
+            .count(),
+        1
+    );
+    assert!(http
+        .calls
+        .iter()
+        .any(|call| call.ends_with("/games/images/3")));
+}
+
+#[test]
+fn resolve_keeps_going_after_network_and_gallery_errors() {
+    let mut http = Fixture {
+        calls: vec![],
+        replies: vec![
+            ("Network%20Game%20Deluxe", Reply::Page("<a href='/games/details/1-game'><h3>Network Game Deluxe</h3><p>Nintendo Game Boy Advance</p></a>")),
+            ("Network%20Game%20Original", Reply::Network("search failed")),
+            ("network%20game%20deluxe", Reply::Page("<a href='/games/details/2-game'><h3>Network Game Deluxe</h3><p>Nintendo Game Boy Advance</p></a>")),
+            ("images/1", Reply::Page("")),
+            ("images/2", Reply::Page("<a href='https://images.launchbox-app.com/cart.png' data-title='Game - Cart - Front Image (North America)'></a>")),
+        ],
+    };
+    assert!(source::resolve(
+        &mut http,
+        &cart("Network Game - Original (USA)"),
+        Some("Network Game - Deluxe"),
+    )
+    .unwrap()
+    .ends_with("/cart.png"));
+    assert!(http
+        .calls
+        .iter()
+        .any(|call| call.ends_with("/games/images/1")));
+    assert!(http
+        .calls
+        .iter()
+        .any(|call| call.ends_with("/games/images/2")));
+}
+
+#[test]
+fn resolve_returns_network_when_no_art_is_found() {
+    let mut http = Fixture {
+        calls: vec![],
+        replies: vec![("Network%20Only", Reply::Network("search failed"))],
+    };
+    assert!(matches!(
+        source::resolve(&mut http, &cart("Network Only (USA)"), None),
+        Err(Error::Network(_))
+    ));
+}
+
+#[test]
+fn bracketed_stem_never_retries_only_its_prefix() {
+    let mut http = Fixture {
+        calls: vec![],
+        replies: vec![],
+    };
+    assert!(source::resolve(
+        &mut http,
+        &cart("Golden Sun - The Lost Age (USA) [!]"),
+        None
+    )
+    .is_err());
+    assert!(!http
+        .calls
+        .iter()
+        .any(|call| call.ends_with("id=Golden%20Sun")));
 }
 
 #[test]
@@ -140,7 +393,14 @@ fn crop_produces_exact_rgb_png_and_rejects_bad_input() {
     for (platform, sizes) in [
         (
             Platform::Gba,
-            &[(1000, 574), (600, 355), (473, 283), (800, 465)][..],
+            &[
+                (1000, 574),
+                (600, 355),
+                (473, 283),
+                (800, 465),
+                (300, 176),
+                (320, 187),
+            ][..],
         ),
         (Platform::Gb, &[(796, 906), (674, 759)][..]),
         (Platform::Gbc, &[(800, 916)][..]),
@@ -161,6 +421,30 @@ fn crop_produces_exact_rgb_png_and_rejects_bad_input() {
     // A cart scan of the other shape is not this platform's cart.
     assert!(artwork::prepare(&image_bytes(1000, 574), Platform::Gb).is_err());
     assert!(artwork::prepare(&image_bytes(796, 906), Platform::Gba).is_err());
+}
+
+#[test]
+fn special_gba_crop_uses_the_cartridge_area() {
+    let inside = Rgb([12, 34, 56]);
+    let outside = Rgb([210, 180, 140]);
+    let image = RgbImage::from_fn(999, 925, |x, y| {
+        if (100..900).contains(&x) && (468..883).contains(&y) {
+            inside
+        } else {
+            outside
+        }
+    });
+    let mut input = Cursor::new(Vec::new());
+    image.write_to(&mut input, ImageFormat::Png).unwrap();
+
+    let png = artwork::prepare(&input.into_inner(), Platform::Gba).unwrap();
+    let output = image::load_from_memory(&png).unwrap().to_rgb8();
+    let (width, height) = output.dimensions();
+    for x in [20, width / 2, width - 21] {
+        for y in [20, height / 2, height - 21] {
+            assert_eq!(output.get_pixel(x, y), &inside, "sample at ({x}, {y})");
+        }
+    }
 }
 
 struct Fake {
