@@ -478,6 +478,34 @@ mod bundled_tests {
                 &BTreeMap::new(),
             )
             .unwrap();
+            for (pass, source) in preset.passes.iter().zip(&sources) {
+                let parameters =
+                    collect_parameters([source.as_str()], &preset.overrides, &BTreeMap::new())
+                        .unwrap();
+                for es in [true, false] {
+                    for stage in ["VERTEX", "FRAGMENT"] {
+                        let assembled = crate::retroshader::stage_source(source, stage, es);
+                        assert!(
+                            !assembled.contains('"'),
+                            "{}: {stage}, es={es} contains quotes",
+                            pass.path.display()
+                        );
+                        for parameter in &parameters {
+                            assert!(
+                                assembled.lines().any(|line| {
+                                    let mut tokens =
+                                        line.split(|c: char| c.is_whitespace() || c == ';');
+                                    tokens.next() == Some("uniform")
+                                        && tokens.any(|token| token == parameter.name)
+                                }),
+                                "{}: missing uniform {} in {stage}, es={es}",
+                                pass.path.display(),
+                                parameter.name
+                            );
+                        }
+                    }
+                }
+            }
             let mut size = [240, 160];
             for (i, pass) in preset.passes.iter().enumerate() {
                 size = output_size(pass.scale, size, [720, 480], i + 1 == preset.passes.len())

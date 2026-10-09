@@ -55,10 +55,14 @@ pub fn stage_source(src: &str, stage: &str, es: bool) -> String {
     let body = src
         .lines()
         .map(|l| {
-            if l.trim_start().starts_with("#version") {
-                ""
+            let trimmed = l.trim_start();
+            // Mali GLES tokenizes quoted parameter labels; keep their lines for diagnostics.
+            if trimmed.starts_with("#version") || trimmed.starts_with("#pragma parameter") {
+                String::new()
+            } else if trimmed.starts_with("//") {
+                l.replace('"', " ")
             } else {
-                l
+                l.to_owned()
             }
         })
         .collect::<Vec<_>>()
@@ -1265,6 +1269,52 @@ mod tests {
         let s = stage_source(SHADER, "VERTEX", false);
         assert!(s.starts_with("#version 330 core\n#define VERTEX\n"));
         assert_eq!(s.matches("#version").count(), 1);
+    }
+
+    #[test]
+    fn parameter_pragmas_are_blanked_without_moving_source_lines() {
+        let source = "// \"header\"\n#version 130\n  #pragma parameter X \"Label\" 0.5 0.0 1.0 0.1\n\t#pragma parameter Y \"Other label\" 0.5 0.0 1.0 0.1\n#pragma slot_filter linear\n#ifdef PARAMETER_UNIFORM\nuniform float X;\nuniform float Y;\n#else\n#define X 0.5\n#define Y 0.5\n#endif\nvoid main() {}\n";
+        for newline in ["\n", "\r\n"] {
+            for trailing_newline in [false, true] {
+                let source = source.trim_end_matches('\n').replace('\n', newline)
+                    + if trailing_newline { newline } else { "" };
+                for es in [true, false] {
+                    for stage in ["VERTEX", "FRAGMENT"] {
+                        let assembled = stage_source(&source, stage, es);
+                        let prefix_lines = if es { 3 } else { 5 };
+                        assert_eq!(
+                            assembled.lines().count(),
+                            source.lines().count() + prefix_lines
+                        );
+                        assert!(!assembled.contains('"'));
+                        let (_, body) = assembled.split_once("#line 1\n").unwrap();
+                        let lines = body.lines().collect::<Vec<_>>();
+                        assert_eq!(lines[0], "//  header ");
+                        assert_eq!(lines[1], "");
+                        assert_eq!(lines[2], "");
+                        assert_eq!(lines[3], "");
+                        assert_eq!(lines[4], LINEAR_PRAGMA);
+                        assert_eq!(lines[6], "uniform float X;");
+                        assert_eq!(lines[7], "uniform float Y;");
+                        assert_eq!(lines[9], "#define X 0.5");
+                        assert_eq!(lines[10], "#define Y 0.5");
+                        assert_eq!(lines[12], "void main() {}");
+                    }
+                }
+                let parameters = preset::collect_parameters(
+                    [source.as_str()],
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+                assert_eq!(parameters.len(), 2);
+                assert_eq!(parameters[0].name, "X");
+                assert_eq!(parameters[0].label, "Label");
+                assert_eq!(parameters[0].value, 0.5);
+                assert_eq!(parameters[1].name, "Y");
+                assert_eq!(parameters[1].label, "Other label");
+            }
+        }
     }
 
     #[test]
