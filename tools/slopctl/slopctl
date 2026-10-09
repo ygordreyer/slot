@@ -24,6 +24,7 @@ CABLE_HINT = ('Connect a data USB-A to USB-C cable BEFORE powering on. BaseOS bi
               'a cable-only start may enter charger mode, so press POWER.')
 PROTECTED = {'games', 'saves', 'states', 'bios'}
 PAYLOAD = {'System', 'Shaders', 'Audio', 'Config', 'Cheats', 'Labels', 'Wallpapers'}
+MAX_DEVICE_COMMAND_BYTES = 8000
 # crates/slot/src/input/evdev.rs:12-14,85-104.
 BUTTONS = {
     'A': (1, 0x130, 1), 'B': (1, 0x131, 1), 'Y': (1, 0x132, 1),
@@ -453,23 +454,37 @@ def deploy_files(src, only):
 
 
 def device_hashes(device, files):
-    # One shell call covers existence and all hashes, with no reliance on filename parsing.
-    script = '''
+    header = '''
 if command -v sha256sum >/dev/null 2>&1; then h=sha256sum
 elif command -v md5sum >/dev/null 2>&1; then h=md5sum
 else echo 'No sha256sum or md5sum available'; exit 1; fi
 printf 'algorithm=%s\\n' "$h"
 '''
+    batches = []
+    script, start = header, 0
     for index, (_, rel) in enumerate(files):
         target = q(CARD + '/' + rel)
-        script += (f'if [ -e {target} ]; then '
-                   f'v=$($h {target}) || exit 1; v=${{v%% *}}; '
-                   f"printf '{index}=%s\\n' \"$v\"; else echo '{index}=-'; fi\n")
-    output = device.shell(script)
-    rows = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
-    algorithm = {'sha256sum': 'sha256', 'md5sum': 'md5'}.get(rows.get('algorithm'))
-    if not algorithm or any(str(i) not in rows for i in range(len(files))):
-        raise Error('Incomplete device hash inventory')
+        line = (f'if [ -e {target} ]; then '
+                f'v=$($h {target}) || exit 1; v=${{v%% *}}; '
+                f"printf '{index}=%s\\n' \"$v\"; else echo '{index}=-'; fi\n")
+        # Dropbear limits the exec request, including SSH's outer shell quoting.
+        if len(('sh -c ' + q(header + line)).encode()) > MAX_DEVICE_COMMAND_BYTES:
+            raise Error(f'Device hash command exceeds {MAX_DEVICE_COMMAND_BYTES} bytes: {rel}')
+        if len(('sh -c ' + q(script + line)).encode()) > MAX_DEVICE_COMMAND_BYTES:
+            batches.append((script, range(start, index)))
+            script, start = header, index
+        script += line
+    batches.append((script, range(start, len(files))))
+    algorithm, rows = None, {}
+    for script, indices in batches:
+        output = device.shell(script)
+        batch = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        batch_algorithm = {'sha256sum': 'sha256', 'md5sum': 'md5'}.get(batch.get('algorithm'))
+        if (not batch_algorithm or any(str(i) not in batch for i in indices)
+                or (algorithm is not None and algorithm != batch_algorithm)):
+            raise Error('Incomplete device hash inventory')
+        algorithm = batch_algorithm
+        rows.update(batch)
     return algorithm, rows
 
 

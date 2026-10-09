@@ -9,6 +9,7 @@ import json
 import os
 import shlex
 from pathlib import Path
+import re
 import struct
 import subprocess
 import tempfile
@@ -37,15 +38,18 @@ files = json.loads(files_path.read_text()) if files_path.exists() else {}
 if 'push' in args:
     files[args[-1]] = record['bytes']
     files_path.write_text(json.dumps(files))
+    if config.get('execute_shell'):
+        pathlib.Path(args[-1]).write_bytes(base64.b64decode(record['bytes']))
 if args and args[0] == '-s': args = args[2:]
 if args[:1] == ['devices']:
     print(config.get('devices', 'List of devices attached\r\nSLOP\tdevice usb:1-1 product:BaseOS\r\n'), end='')
 elif args[:1] == ['shell']:
     command = args[1]
-    for remote, encoded in files.items():
-        if remote.startswith('/tmp/slopctl-script-') and 'sh ' + remote in command:
-            command = base64.b64decode(encoded).decode()
-            break
+    if not config.get('execute_shell'):
+        for remote, encoded in files.items():
+            if remote.startswith('/tmp/slopctl-script-') and 'sh ' + remote in command:
+                command = base64.b64decode(encoded).decode()
+                break
     if config.get('execute_shell'):
         sys.exit(subprocess.run(['sh', '-c', command]).returncode)
     output = 'pushed' if 'mv -f' in command else ''
@@ -481,6 +485,68 @@ class FakeSshTests(TestEnvironment):
     def ssh_commands(self):
         return [shlex.split(r['argv'][-1])[0] for r in self.ssh_records() if 'sh' in r['argv']]
 
+    def test_large_deploy_bounds_commands_and_hashes_every_file(self):
+        self.configure_ssh(execute_shell=True)
+        self.configure(execute_shell=True)
+        hash_tool = self.root / 'sha256sum'
+        hash_tool.write_text('#!/usr/bin/env python3\nimport hashlib, pathlib, sys\n'
+                             'for name in sys.argv[1:]:\n'
+                             '    print(hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest() + "  " + name)\n')
+        hash_tool.chmod(0o755)
+        src = self.root / 'dist'
+        expected = {}
+        for index in range(120):
+            group = ('System', 'Shaders', 'Audio', 'Config')[index % 4]
+            relative = f"{group}/{index:03d} café ' ;$(false).sample"
+            path = src / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = f'payload {index}'.encode()
+            path.write_bytes(data)
+            expected[relative] = data
+        files, _ = slop.deploy_files(src, 'all')
+        for device in (slop.Ssh(), self.adb):
+            with self.subTest(transport=device.name):
+                card = self.root / (device.name + '-card')
+                for _, relative in files[:-4]:
+                    target = card / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(expected[relative])
+                inventory_outputs = []
+                shell = device.shell
+
+                def run(command, timeout=30):
+                    if '/proc/mounts' in command:
+                        return ''
+                    output = shell(command, timeout=timeout)
+                    if 'algorithm=%s' in command:
+                        inventory_outputs.append(output)
+                    return output
+
+                args = argparse.Namespace(src=src, only='all', dry_run=False, no_restart=True)
+                with patch.object(slop, 'CARD', str(card)), patch.object(device, 'shell', side_effect=run), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    slop.deploy(device, args)
+                self.assertIn('pushed=4 unchanged=116 skipped=0', output.getvalue())
+                self.assertGreater(len(inventory_outputs), 1)
+                rows = [line.split('=', 1) for batch in inventory_outputs for line in batch.splitlines()
+                        if not line.startswith('algorithm=')]
+                self.assertEqual(len(rows), 120)
+                self.assertEqual(dict(rows), {
+                    str(index): hashlib.sha256(expected[relative]).hexdigest() if index < 116 else '-'
+                    for index, (_, relative) in enumerate(files)})
+                for relative, data in expected.items():
+                    self.assertEqual((card / relative).read_bytes(), data)
+                self.assertFalse(list(card.rglob('.slopctl-*')))
+        ssh_commands = [' '.join(record['argv'][record['argv'].index('sh'):])
+                        for record in self.ssh_records() if 'sh' in record['argv']]
+        self.assertTrue(ssh_commands)
+        self.assertTrue(all(len(command.encode()) <= slop.MAX_DEVICE_COMMAND_BYTES
+                            for command in ssh_commands))
+        adb_commands = [record['argv'][-1] for record in self.records() if 'shell' in record['argv']]
+        self.assertTrue(all(len(command.encode()) <= 2000 for command in adb_commands))
+        self.assertTrue(any('push' in record['argv'] and '/tmp/slopctl-script-' in record['argv'][-1]
+                            for record in self.records()))
+
     def test_auto_ssh_probe_once_and_verbose_selection(self):
         result = self.cli('--transport', 'auto', '-v', 'status')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -641,6 +707,41 @@ class FakeSshTests(TestEnvironment):
                 slop.Ssh().shell('true', timeout=12)
             self.assertEqual(run.call_args.kwargs['timeout'], 12)
             self.assertEqual(run.call_args.kwargs['stdin'], subprocess.DEVNULL)
+
+
+class HashInventoryTests(unittest.TestCase):
+    def test_batched_inventory_fails_closed_for_missing_indices(self):
+        files = [(None, f'System/file-{index:03d}') for index in range(120)]
+        for missing in (0, 60, 119):
+            with self.subTest(missing=missing):
+                def inventory(command):
+                    indices = re.findall(r"printf '(\d+)=%s", command)
+                    return 'algorithm=sha256sum\n' + ''.join(f'{i}=-\n' for i in indices if int(i) != missing)
+
+                device = slop.Ssh()
+                with patch.object(device, 'shell', side_effect=inventory), \
+                        self.assertRaisesRegex(slop.Error, 'Incomplete device hash inventory'):
+                    slop.device_hashes(device, files)
+
+    def test_batched_inventory_rejects_algorithm_change(self):
+        files = [(None, f'System/file-{index:03d}') for index in range(120)]
+        algorithms = iter(('sha256sum', 'md5sum'))
+
+        def inventory(command):
+            indices = re.findall(r"printf '(\d+)=%s", command)
+            return f'algorithm={next(algorithms)}\n' + ''.join(f'{i}=-\n' for i in indices)
+
+        device = slop.Ssh()
+        with patch.object(device, 'shell', side_effect=inventory), \
+                self.assertRaisesRegex(slop.Error, 'Incomplete device hash inventory'):
+            slop.device_hashes(device, files)
+
+    def test_oversized_hash_row_fails_before_device_commands(self):
+        device = slop.Ssh()
+        with patch.object(device, 'shell') as shell, \
+                self.assertRaisesRegex(slop.Error, 'Device hash command exceeds 8000 bytes'):
+            slop.device_hashes(device, [(None, 'System/' + 'é' * 4000)])
+        shell.assert_not_called()
 
 
 class EncodingTests(unittest.TestCase):

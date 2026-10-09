@@ -43,7 +43,7 @@ The default source is `SLOPCTL_SRC`, or `<repo>/../slop-device-build/dist-device
 
 - Deploy never writes into Games, Saves, States, or BIOS. Selecting one of those as the source is refused. Symlinks and parent traversal are refused.
 - Existing Config files are preserved unless their names end in `.example` or `.sample`, or contain `.example.` or `.sample.`. Missing Config files can be installed with `all`. `config-examples` installs only examples.
-- Device hashes are collected in one shell call. SHA-256 is preferred, with MD5 as a runtime fallback. Missing hash tools fail before deployment.
+- Device hashes are collected in as few shell calls as needed, with each command capped at 8000 bytes including SSH quoting. SHA-256 is preferred, with MD5 as a runtime fallback. Missing hash tools or an incomplete inventory fail before deployment.
 - Changed files are pushed to unique temporary names beside their targets, then replaced with `mv -f`. The live binary is never overwritten in place. Deploy does not delete destination files.
 - Deploy calls `sync`, then restarts slot unless `--no-restart` is supplied. Use `--no-restart` while the frontend is held. A dry run prints planned transfers and changes no card files. Long adb commands use temporary scripts in /tmp, which are removed after use. SSH sends scripts directly.
 
