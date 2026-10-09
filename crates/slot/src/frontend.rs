@@ -66,6 +66,7 @@ pub struct Frontend {
     framerate: RateWindow,
     framerate_face: FramerateFace,
     effective_shader: EffectiveShader,
+    game_frame_rewound: bool,
 }
 
 #[derive(Default)]
@@ -297,6 +298,7 @@ impl Frontend {
             framerate: RateWindow::default(),
             framerate_face: FramerateFace::default(),
             effective_shader: EffectiveShader::default(),
+            game_frame_rewound: false,
             account_tex: None,
             account_shown: None,
             wifi_shown: None,
@@ -517,6 +519,10 @@ impl Frontend {
         }
     }
 
+    fn game_rewinding(&self) -> bool {
+        self.session.actually_rewinding() && self.game_frame_rewound
+    }
+
     pub fn compose(&mut self, compositor: &mut Compositor) {
         compositor.set_blue_light(self.session.app().blue_light());
         compositor.set_shake(self.session.app().screen_shake());
@@ -527,6 +533,7 @@ impl Frontend {
         compositor.begin_frame();
         if let Some(frame) = self.session.frame() {
             compositor.upload_game(&frame);
+            self.game_frame_rewound = frame.rewound();
             crate::latency::taken();
         }
         self.sync_labels(compositor);
@@ -535,7 +542,7 @@ impl Frontend {
         sync_quick_clock(self.session.app_mut(), compositor, &mut self.quick_clock);
         sync_quick_shader(self.session.app_mut(), compositor, &mut self.quick_shader);
         sync_shader(&mut self.session, compositor, &mut self.effective_shader);
-        compositor.set_game_rewinding(self.session.actually_rewinding());
+        compositor.set_game_rewinding(self.game_rewinding());
         sync_cheats(self.session.app_mut(), compositor, &mut self.cheats);
         if let Some(screen) = self.session.app().account_screen() {
             if self.account_shown != Some(screen.revision()) {
@@ -1133,6 +1140,92 @@ mod tests {
     use super::*;
     use slot_input::{Action, Btn, RawEvent};
     use slot_ui::QuickRow;
+
+    fn rewind_frontend() -> (tempfile::TempDir, Frontend) {
+        let root = tempfile::tempdir().unwrap();
+        crate::root::ensure(root.path());
+        std::fs::write(root.path().join("Games/GBA/Example.gba"), vec![0; 256]).unwrap();
+        slot_store::write_slot_state(
+            root.path(),
+            &slot_store::SlotState {
+                cart: Some("Example".into()),
+                clock_set: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut frontend =
+            Frontend::boot(Box::new(slot_power::SimPlatform::at(root.path().into())));
+        let app = frontend.session.app_mut();
+        app.set_snapshot(Box::new(ExitSnapshot(Default::default())));
+        app.on_core_ready();
+        for _ in 0..120 {
+            app.update(1.0 / 60.0);
+        }
+        assert!(matches!(app.phase(), Phase::Playing { .. }));
+        (root, frontend)
+    }
+
+    #[test]
+    fn rewind_hold_with_an_empty_history_keeps_forward_shader_direction() {
+        let (_root, mut frontend) = rewind_frontend();
+        frontend.session.feed([RawEvent::Down(Btn::L2)], 100);
+        assert!(frontend.session.actually_rewinding());
+        assert!(!frontend.game_rewinding());
+    }
+
+    #[test]
+    fn shader_reverses_only_after_a_rewind_frame_is_uploaded_and_retains_its_origin() {
+        let (_root, mut frontend) = rewind_frontend();
+        let frames = crate::frames::Frames::new(4);
+        frames.publish(vec![1; 4], false);
+        frontend.game_frame_rewound = frames.latest().unwrap().rewound();
+        frontend.session.feed([RawEvent::Down(Btn::L2)], 100);
+        frames.publish(vec![2; 4], true);
+        assert!(!frontend.game_rewinding());
+        frontend.game_frame_rewound = frames.latest().unwrap().rewound();
+        assert!(frontend.game_rewinding());
+        assert!(frames.latest().is_none());
+        assert!(frontend.game_rewinding());
+        frames.publish(vec![3; 4], false);
+        frontend.game_frame_rewound = frames.latest().unwrap().rewound();
+        assert!(!frontend.game_rewinding());
+    }
+
+    #[test]
+    fn releasing_rewind_restores_forward_shader_direction_before_the_next_frame() {
+        let (_root, mut frontend) = rewind_frontend();
+        frontend.session.feed([RawEvent::Down(Btn::L2)], 100);
+        frontend.game_frame_rewound = true;
+        assert!(frontend.game_rewinding());
+        frontend.session.feed([RawEvent::Up(Btn::L2)], 200);
+        assert!(!frontend.game_rewinding());
+        frontend.game_frame_rewound = false;
+        assert!(!frontend.game_rewinding());
+    }
+
+    #[test]
+    fn pausing_during_a_rewind_hold_restores_forward_shader_direction() {
+        let (_root, mut frontend) = rewind_frontend();
+        frontend.session.feed([RawEvent::Down(Btn::L2)], 100);
+        frontend.game_frame_rewound = true;
+        assert!(frontend.game_rewinding());
+        frontend.session.app_mut().apply(Action::GameMenu);
+        assert!(!frontend.session.actually_rewinding());
+        assert!(!frontend.game_rewinding());
+    }
+
+    #[test]
+    fn fast_forward_with_a_retained_rewind_frame_uses_forward_shader_direction() {
+        let (_root, mut frontend) = rewind_frontend();
+        frontend.session.feed([RawEvent::Down(Btn::L2)], 100);
+        frontend.game_frame_rewound = true;
+        frontend.session.feed([RawEvent::Up(Btn::L2)], 200);
+        frontend.session.feed([RawEvent::Down(Btn::R2)], 300);
+        frontend.session.update(1.0 / 60.0);
+        assert!(frontend.session.app().ff_badge().is_some());
+        assert!(!frontend.game_rewinding());
+    }
 
     #[test]
     fn framerate_texture_refreshes_only_when_its_formatted_text_changes() {

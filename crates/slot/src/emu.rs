@@ -657,13 +657,17 @@ impl Worker {
             };
             if rewinding {
                 if let Some(state) = rewind.pop() {
-                    if let Err(e) = core.unserialize(&state) {
-                        eprintln!("slot: rewind: {e}");
-                    }
+                    let rewound = match core.unserialize(&state) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("slot: rewind: {e}");
+                            false
+                        }
+                    };
                     core.set_frame_skip(false);
                     core.run_frame(ButtonMask(0));
                     self.shared.emulated.fetch_add(1, Ordering::Relaxed);
-                    self.publish(core.video_xrgb8888());
+                    self.publish(core.video_xrgb8888(), rewound);
                 }
                 self.shared
                     .rewind_fill
@@ -780,7 +784,7 @@ impl Worker {
                     }
                 }
                 flush_outbound(&mut transport, &link);
-                self.publish(core.video_xrgb8888());
+                self.publish(core.video_xrgb8888(), false);
                 self.frame_done(served);
 
                 since_snapshot += 1;
@@ -1002,11 +1006,11 @@ impl Worker {
         }
     }
 
-    fn publish(&self, video: &[u8]) {
+    fn publish(&self, video: &[u8], rewound: bool) {
         let mut buf = self.frames.take_write();
         buf.clear();
         buf.extend_from_slice(video);
-        self.frames.publish(buf);
+        self.frames.publish(buf, rewound);
         self.shared.published.fetch_add(1, Ordering::Relaxed);
         crate::latency::published();
     }
