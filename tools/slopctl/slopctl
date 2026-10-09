@@ -23,7 +23,7 @@ AWAKE = '/run/slop-awake'
 CABLE_HINT = ('Connect a data USB-A to USB-C cable BEFORE powering on. BaseOS binds adb at boot; '
               'a cable-only start may enter charger mode, so press POWER.')
 PROTECTED = {'games', 'saves', 'states', 'bios'}
-PAYLOAD = {'System', 'Shaders', 'Config', 'Cheats', 'Labels', 'Wallpapers'}
+PAYLOAD = {'System', 'Shaders', 'Audio', 'Config', 'Cheats', 'Labels', 'Wallpapers'}
 # crates/slot/src/input/evdev.rs:12-14,85-104.
 BUTTONS = {
     'A': (1, 0x130, 1), 'B': (1, 0x131, 1), 'Y': (1, 0x132, 1),

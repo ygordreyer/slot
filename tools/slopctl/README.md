@@ -39,7 +39,7 @@ Each operation has a timeout of at most 30 seconds. Interactive shell sessions a
 
 ## Deploy safety
 
-The default source is `SLOPCTL_SRC`, or `<repo>/../slop-device-build/dist-device` if that directory exists. Otherwise supply `--src`. An explicit `--src` takes precedence. Selection is `system`, `shaders`, `config-examples`, or `all`. The default `all` covers System, Shaders, Config, Cheats, Labels, and Wallpapers. Other source files are skipped.
+The default source is `SLOPCTL_SRC`, or `<repo>/../slop-device-build/dist-device` if that directory exists. Otherwise supply `--src`. An explicit `--src` takes precedence. Selection is `system`, `shaders`, `config-examples`, or `all`. The default `all` covers System, Shaders, Audio, Config, Cheats, Labels, and Wallpapers. Other source files are skipped.
 
 - Deploy never writes into Games, Saves, States, or BIOS. Selecting one of those as the source is refused. Symlinks and parent traversal are refused.
 - Existing Config files are preserved unless their names end in `.example` or `.sample`, or contain `.example.` or `.sample.`. Missing Config files can be installed with `all`. `config-examples` installs only examples.
