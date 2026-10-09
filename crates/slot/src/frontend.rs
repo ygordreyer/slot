@@ -894,7 +894,7 @@ fn sync_cheats(app: &mut App, compositor: &mut Compositor, state: &mut CheatFace
 
 /// The longest shader name the row shows whole. Past this the value runs into the label, so
 /// the rest is cut and marked.
-const SHADER_NAME_MAX: usize = 22;
+const SHADER_NAME_MAX: usize = 18;
 
 fn shader_display(name: &str) -> String {
     if name.chars().count() <= SHADER_NAME_MAX {
@@ -979,7 +979,10 @@ fn sync_shader(
     session
         .app_mut()
         .set_shader_parameters(compositor.shader_parameters().to_vec());
-    session.set_custom_shader(result.is_ok() && !matches!(name.as_str(), SHADER_LCD | SHADER_OFF));
+    session.set_shader_profile(
+        result.is_ok() && !matches!(name.as_str(), SHADER_LCD | SHADER_OFF),
+        compositor.shader_profile().cloned(),
+    );
     if let Err(e) = result {
         eprintln!("slot: shader: {name}: {e}");
         session.app_mut().shader_failed();
@@ -991,6 +994,10 @@ fn sync_shader_error(
     compositor: &mut Compositor,
     effective: &mut EffectiveShader,
 ) {
+    if let Some(error) = compositor.take_overlay_error() {
+        eprintln!("slot: overlay: {error}");
+        session.app_mut().shader_failed();
+    }
     if let Some(error) = compositor.take_shader_error() {
         effective.fallback();
         eprintln!("slot: shader: {error}");
@@ -1225,6 +1232,31 @@ mod tests {
         frontend.session.update(1.0 / 60.0);
         assert!(frontend.session.app().ff_badge().is_some());
         assert!(!frontend.game_rewinding());
+    }
+
+    #[test]
+    fn shader_scale_label_and_long_names_fit_without_overlapping_carets() {
+        let label = slot_ui::quick_label_face(QuickRow::Shader);
+        let left = slot_ui::quick_caret_face(false);
+        let right = slot_ui::quick_caret_face(true);
+        for name in [
+            "vba-color-lcd3x",
+            "pixellate-sharp-shimmerless",
+            "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+            "vba-color-lcd1x (handheld)",
+        ] {
+            let display = shader_display(name);
+            let value = quick_value_face(&display, true);
+            let label_end = slot_ui::QUICK_EDGE + label.w as f32 - 2.0 * slot_ui::MENU_PAD as f32;
+            let caret_start = OUT_W as f32 - slot_ui::QUICK_EDGE - right.w as f32 - 28.0
+                + 2.0 * slot_ui::MENU_PAD as f32
+                - value.w as f32
+                - left.w as f32;
+            assert!(
+                label_end <= caret_start,
+                "{display}: label ends at {label_end}, caret starts at {caret_start}"
+            );
+        }
     }
 
     #[test]

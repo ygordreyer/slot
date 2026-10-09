@@ -10,6 +10,7 @@ mod headless;
 mod host;
 mod lcd3x;
 mod pipeline;
+mod png_image;
 mod power;
 pub mod preset;
 mod quad;

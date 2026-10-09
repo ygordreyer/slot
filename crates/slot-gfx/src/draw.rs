@@ -97,8 +97,22 @@ impl Sprites {
 
     fn push(&mut self, w: u32, h: u32, rgba: &[u8], filter: gl::types::GLenum) -> TexId {
         let tex = crate::gl::texture(w, h, filter, gl::CLAMP_TO_EDGE, gl::RGBA, Some(rgba));
-        self.textures.push(tex);
-        TexId(self.textures.len() - 1)
+        if let Some(index) = self.textures.iter().position(|t| *t == 0) {
+            self.textures[index] = tex;
+            TexId(index)
+        } else {
+            self.textures.push(tex);
+            TexId(self.textures.len() - 1)
+        }
+    }
+
+    pub fn remove_texture(&mut self, id: TexId) {
+        if let Some(tex) = self.textures.get_mut(id.0) {
+            unsafe {
+                gl::DeleteTextures(1, tex);
+            }
+            *tex = 0;
+        }
     }
 
     pub fn update_texture(&mut self, id: TexId, w: u32, h: u32, rgba: &[u8]) {
@@ -126,7 +140,7 @@ impl Sprites {
     }
 
     pub fn source(&self, id: TexId) -> Option<gl::types::GLuint> {
-        self.textures.get(id.0).copied()
+        self.textures.get(id.0).copied().filter(|t| *t != 0)
     }
 
     pub fn draw(&self, items: &[Draw], quad: &Quad) {

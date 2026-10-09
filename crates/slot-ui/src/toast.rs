@@ -27,10 +27,12 @@ pub enum Toast {
     ShaderFailed,
     TurnCheatsOff,
     NoShaderParams,
+    ProfileCoreMismatch,
+    ProfileColourLocked,
 }
 
 impl Toast {
-    pub const ALL: [Toast; 15] = [
+    pub const ALL: [Toast; 17] = [
         Toast::StateSaved,
         Toast::StateLoaded,
         Toast::NeedsGpsp,
@@ -46,6 +48,8 @@ impl Toast {
         Toast::ShaderFailed,
         Toast::TurnCheatsOff,
         Toast::NoShaderParams,
+        Toast::ProfileCoreMismatch,
+        Toast::ProfileColourLocked,
     ];
 
     pub fn index(self) -> usize {
@@ -69,6 +73,8 @@ impl Toast {
             Toast::ShaderFailed => "Shader failed",
             Toast::TurnCheatsOff => "Turn cheats off",
             Toast::NoShaderParams => "No shader parameters",
+            Toast::ProfileCoreMismatch => "Preset core mismatch",
+            Toast::ProfileColourLocked => "Preset sets colour",
         }
     }
 }

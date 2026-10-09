@@ -30,6 +30,7 @@ pub mod resample;
 pub mod rewind;
 pub mod root;
 pub mod session;
+mod shader_profile;
 pub mod thumb;
 pub mod video_mode;
 pub mod wallpaper;

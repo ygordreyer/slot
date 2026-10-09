@@ -421,6 +421,14 @@ pub struct LibretroCore {
     _lib: Library,
 }
 
+fn effective_option(host: &Host, key: &str) -> Option<String> {
+    host.options
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| host.declared.get(key)?.first().cloned())
+}
+
 fn cdir(path: &Path) -> Result<CString, CoreError> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| CoreError::Load(format!("{} contains a nul", path.display())))
@@ -612,6 +620,9 @@ impl RetroCore for LibretroCore {
     }
     fn set_option(&mut self, key: &str, value: &str) {
         LibretroCore::set_option(self, key, value);
+    }
+    fn option(&self, key: &str) -> Option<String> {
+        effective_option(&self.host, key)
     }
 
     fn load(&mut self, rom: &Path) -> Result<(), CoreError> {
@@ -818,6 +829,28 @@ mod tests {
             options_dirty,
             declared: HashMap::new(),
         })
+    }
+
+    #[test]
+    fn effective_option_uses_declared_default_until_explicitly_overridden() {
+        let mut host = host_with(HashMap::new(), false);
+        host.declared.insert(
+            "mgba_audio_low_pass_range".into(),
+            vec!["60".into(), "30".into()],
+        );
+        assert_eq!(
+            effective_option(&host, "mgba_audio_low_pass_range"),
+            Some("60".into())
+        );
+        host.options.insert(
+            "mgba_audio_low_pass_range".into(),
+            CString::new("75").unwrap(),
+        );
+        assert_eq!(
+            effective_option(&host, "mgba_audio_low_pass_range"),
+            Some("75".into())
+        );
+        assert_eq!(effective_option(&host, "undeclared"), None);
     }
 
     fn declaration(key: &str, value: &str) -> (Variable, CString, CString) {

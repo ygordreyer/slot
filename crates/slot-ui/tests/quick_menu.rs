@@ -76,6 +76,20 @@ fn the_fast_forward_row_offers_the_four_ceilings_the_card_can_hold() {
 }
 
 #[test]
+fn only_the_shader_row_has_a_presentation_scale_note() {
+    for row in QuickRow::ALL {
+        assert_eq!(
+            row.note(),
+            if row == QuickRow::Shader {
+                Some("3X INTEGER")
+            } else {
+                None
+            }
+        );
+    }
+}
+
+#[test]
 fn the_rows_run_in_the_order_the_user_chose() {
     assert_eq!(QuickRow::Shader.index(), 3);
     assert_eq!(QuickRow::Shader.down(), QuickRow::ShowFps);
@@ -115,7 +129,7 @@ fn the_rows_run_in_the_order_the_user_chose() {
 fn the_values_read_as_the_menu_prints_them() {
     assert_eq!(
         QuickValue::ALL.map(QuickValue::text),
-        ["2×", "3×", "4×", "6×", "On", "Off"]
+        ["2×", "3×", "4×", "6×", "On", "Off", "GBA", "Auto"]
     );
     assert_eq!(QuickValue::flag(true), QuickValue::On);
     assert_eq!(QuickValue::flag(false), QuickValue::Off);
