@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""SSH over Wi-Fi or USB adb control for Slop on BaseOS. Standard library only."""
+import argparse
+import datetime
+import hashlib
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import zlib
+
+CARD = '/mnt/sdcard'
+HOLD = '/run/slop-hold'
+AWAKE = '/run/slop-awake'
+CABLE_HINT = ('Connect a data USB-A to USB-C cable BEFORE powering on. BaseOS binds adb at boot; '
+              'a cable-only start may enter charger mode, so press POWER.')
+PROTECTED = {'games', 'saves', 'states', 'bios'}
+PAYLOAD = {'System', 'Shaders', 'Config', 'Cheats', 'Labels', 'Wallpapers'}
+# crates/slot/src/input/evdev.rs:12-14,85-104.
+BUTTONS = {
+    'A': (1, 0x130, 1), 'B': (1, 0x131, 1), 'Y': (1, 0x132, 1),
+    'X': (1, 0x133, 1), 'L1': (1, 0x134, 1), 'R1': (1, 0x135, 1),
+    'SELECT': (1, 0x136, 1), 'START': (1, 0x137, 1), 'MENU': (1, 0x138, 1),
+    'L2': (1, 0x13a, 1), 'R2': (1, 0x13b, 1),
+    'VOLUP': (1, 115, 1), 'VOLDOWN': (1, 114, 1), 'POWER': (1, 116, 1),
+    'LEFT': (3, 0x10, -1), 'RIGHT': (3, 0x10, 1),
+    'UP': (3, 0x11, -1), 'DOWN': (3, 0x11, 1),
+}
+
+
+class Error(Exception):
+    pass
+
+
+def q(value):
+    """The single device-side argument quoting boundary."""
+    return shlex.quote(str(value))
+
+
+def parse_shell(text):
+    text = text.replace('\r', '')
+    match = re.search(r'\n__slopctl_rc=(\d+)\n?\Z', text)
+    if not match:
+        raise Error('adb shell returned no exit-status sentinel')
+    output = text[:match.start()]
+    rc = int(match.group(1))
+    if rc:
+        raise Error(f'device command exited {rc}' + (f': {output.strip()}' if output.strip() else ''))
+    return output
+
+
+class Adb:
+    name = 'adb'
+
+    def __init__(self):
+        self.binary = shutil.which('adb') or '/opt/homebrew/bin/adb'
+        self.serial = None
+
+    def run(self, args, timeout=30, interactive=False):
+        argv = [self.binary] + (['-s', self.serial] if self.serial else []) + list(args)
+        try:
+            result = subprocess.run(argv, timeout=min(timeout, 30),
+                                    capture_output=not interactive, text=not interactive)
+        except FileNotFoundError:
+            raise Error('adb is missing. Install Android platform-tools and put adb on PATH.') from None
+        except subprocess.TimeoutExpired:
+            raise Error(f'adb command timed out after {min(timeout, 30):g} s') from None
+        if result.returncode:
+            detail = '' if interactive else (result.stderr or result.stdout).strip().replace('\r', '')
+            raise Error(f'adb exited {result.returncode}: {detail}')
+        return '' if interactive else result.stdout.replace('\r', '')
+
+    def connect(self, timeout=5):
+        try:
+            listing = self.run(['devices', '-l'], timeout=timeout)
+        except Error as exc:
+            detail = str(exc)
+            if 'Operation not permitted' in detail:
+                detail = 'adb server access denied by this environment'
+            else:
+                detail = ' '.join(detail.splitlines())
+            raise Error('Cannot query USB adb: ' + detail + '. ' + CABLE_HINT) from None
+        rows = [line.split() for line in listing.splitlines() if line and not line.startswith('List ')]
+        # Never select a TCP transport. BaseOS only exposes USB.
+        ready = [r for r in rows if len(r) >= 2 and r[1] == 'device' and ':' not in r[0]]
+        if not ready:
+            raise Error('No USB adb device ready. ' + CABLE_HINT)
+        if len(ready) != 1:
+            raise Error('Multiple USB adb devices ready. Disconnect the other devices.')
+        self.serial = ready[0][0]
+        return self.serial
+
+    def shell(self, command, timeout=30):
+        wrapper = f"sh -c {q(command)}; printf '\\n__slopctl_rc=%s\\n' \"$?\""
+        # Old adbd has small service-name packets. Transfer long scripts as files.
+        if len(wrapper.encode()) > 2000:
+            remote = '/tmp/slopctl-script-' + uuid.uuid4().hex
+            try:
+                with tempfile.TemporaryDirectory(prefix='slopctl-script-') as td:
+                    local = Path(td) / 'command.sh'
+                    local.write_text(command + '\n')
+                    self.push(local, remote)
+                    return self.shell('sh ' + q(remote), timeout=timeout)
+            finally:
+                self.shell('rm -f ' + q(remote), timeout=5)
+        return parse_shell(self.run(['shell', wrapper], timeout=timeout))
+
+    def push(self, src, dst):
+        return self.run(['push', str(src), str(dst)])
+
+    def pull(self, src, dst):
+        return self.run(['pull', str(src), str(dst)])
+
+    @property
+    def identity(self):
+        return 'serial ' + self.serial
+
+    def wait(self, timeout):
+        deadline = time.monotonic() + timeout
+        try:
+            self.run(['wait-for-usb-device'], timeout=timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Error('Timed out waiting for USB adb')
+            self.connect(timeout=min(5, remaining))
+        except Error as exc:
+            raise Error('USB adb wait failed. ' + CABLE_HINT + ' ' + str(exc)) from None
+
+    def interactive_shell(self):
+        self.run(['shell'], interactive=True)
+
+    def framebuffer(self, stride, yoff, height):
+        remote = '/tmp/slopctl-fb-' + uuid.uuid4().hex
+        try:
+            self.shell(f'dd if=/dev/fb0 of={q(remote)} bs={stride} skip={yoff} count={height}')
+            with tempfile.TemporaryDirectory(prefix='slopctl-shot-') as td:
+                local = Path(td) / 'fb.raw'
+                self.pull(remote, local)
+                return local.read_bytes()
+        finally:
+            self.shell(f'rm -f {q(remote)}', timeout=5)
+
+
+class Ssh:
+    name = 'ssh'
+
+    def __init__(self, host='slop'):
+        if not host or host.startswith('-'):
+            raise Error('SSH host must be a nonempty host name or config alias')
+        self.binary = shutil.which('ssh') or 'ssh'
+        self.host = host
+
+    @property
+    def identity(self):
+        return 'host ' + self.host
+
+    def run(self, args, timeout=30, payload=None, interactive=False, connect_timeout=None):
+        argv = [self.binary, '-o', 'BatchMode=yes']
+        if connect_timeout is not None:
+            argv += ['-o', f'ConnectTimeout={connect_timeout}']
+        if interactive:
+            argv += ['-tt']
+        argv += [self.host] + list(args)
+        try:
+            result = subprocess.run(argv, timeout=min(timeout, 30),
+                                    stdin=None if interactive else (payload if payload is not None else subprocess.DEVNULL),
+                                    capture_output=not interactive)
+        except FileNotFoundError:
+            raise Error('ssh is missing. Put OpenSSH on PATH.') from None
+        except subprocess.TimeoutExpired:
+            raise Error(f'ssh command timed out after {min(timeout, 30):g} s') from None
+        if result.returncode:
+            detail = '' if interactive else (result.stderr or result.stdout).decode(errors='replace').strip()
+            detail = ' '.join(detail.splitlines())
+            raise Error(f'device command exited {result.returncode}' + (f': {detail}' if detail else ''))
+        return b'' if interactive else result.stdout
+
+    def connect(self, timeout=5):
+        self.run(['true'], timeout=timeout, connect_timeout=max(1, math.ceil(timeout)))
+        return self.host
+
+    def wait(self, timeout):
+        self.connect(timeout=timeout)
+
+    def shell_bytes(self, command, timeout=30, payload=None):
+        # OpenSSH joins command arguments into a remote shell command.
+        return self.run(['sh', '-c', q(command)], timeout=timeout, payload=payload)
+
+    def shell(self, command, timeout=30):
+        return self.shell_bytes(command, timeout=timeout).decode(errors='replace')
+
+    def push(self, src, dst):
+        temp = str(PurePosixPath(dst).parent / ('.slopctl-' + uuid.uuid4().hex))
+        command = (f'trap {q("rm -f " + q(temp))} EXIT HUP INT TERM; '
+                   f'cat > {q(temp)} && mv -f {q(temp)} {q(dst)}')
+        with Path(src).open('rb') as payload:
+            self.shell_bytes(command, payload=payload)
+        return ''
+
+    def pull(self, src, dst):
+        Path(dst).write_bytes(self.shell_bytes('cat ' + q(src)))
+        return ''
+
+    def interactive_shell(self):
+        self.run([], interactive=True)
+
+    def framebuffer(self, stride, yoff, height):
+        return self.shell_bytes(f'dd if=/dev/fb0 bs={stride} skip={yoff} count={height}')
+
+
+def select_transport(mode, host, wait_timeout=None):
+    if mode in ('auto', 'ssh'):
+        device = Ssh(host)
+        try:
+            if mode == 'ssh' and wait_timeout is not None:
+                device.wait(wait_timeout)
+            else:
+                device.connect(timeout=3 if mode == 'auto' else 5)
+            return device
+        except Error:
+            if mode == 'ssh':
+                raise
+    device = Adb()
+    if wait_timeout is not None:
+        device.wait(wait_timeout)
+    else:
+        device.connect()
+    return device
+
+
+def default_source():
+    configured = os.environ.get('SLOPCTL_SRC')
+    if configured:
+        return configured
+    candidate = Path(__file__).resolve().parents[2].parent / 'slop-device-build/dist-device'
+    return str(candidate) if candidate.is_dir() else None
+
+
+PID_FUNCTION = r'''
+slot_pids() {
+    for f in /proc/[0-9]*/cmdline; do
+        [ -r "$f" ] || continue
+        if tr '\000' '\n' < "$f" 2>/dev/null | grep -Fx /mnt/sdcard/System/slot >/dev/null; then
+            p=${f#/proc/}; printf '%s\n' "${p%/cmdline}"
+        fi
+    done
+}
+'''
+
+
+def slot_pids(device):
+    return device.shell(PID_FUNCTION + 'slot_pids').split()
+
+
+SAVE_ACK_FUNCTION = r'''
+save_ack() {
+    for pid in "$@"; do
+        line=$(grep -h -F "slot: sigterm: pid $pid:" /mnt/sdcard/slot.log /mnt/sdcard/slot.log.1 2>/dev/null)
+        [ -n "$line" ] && printf '%s\n' "$line" ||
+            echo "slot: sigterm: pid $pid: no save acknowledgement; this slot build may predate the SIGTERM handler"
+    done
+}
+'''
+
+
+def save_acknowledgements(output, pids=()):
+    lines = dict(re.findall(r'^slot: sigterm: pid (\d+): (.*)$', output, re.MULTILINE))
+    for pid in dict.fromkeys([*pids, *lines]):
+        outcome = lines.get(pid, 'no save acknowledgement; this slot build may predate the SIGTERM handler')
+        if outcome == 'saved, exiting':
+            print(f'slot pid {pid}: saved')
+        else:
+            print(f'slopctl: warning: slot pid {pid}: {outcome}', file=sys.stderr)
+
+
+def lifecycle(device, action):
+    if action == 'stop':
+        device.shell(f'grep -F {q(HOLD)} {q(CARD + "/System/launch_frontend.sh")} >/dev/null || '
+                  '{ echo "Deploy the updated launch_frontend.sh with hold support first"; exit 1; }; '
+                  f': > {q(HOLD)}')
+    elif action == 'start':
+        device.shell(f'rm -f {q(HOLD)}')
+    else:
+        if device.shell(f'[ -e {q(HOLD)} ] && echo held; :').strip():
+            raise Error('Frontend is held. Use start to clear the hold before restart.')
+    old = []
+    if action != 'start':
+        old = slot_pids(device)
+        if old:
+            device.shell('; '.join(f'kill -TERM {q(p)} || [ ! -d /proc/{q(p)} ] || exit 1' for p in old))
+            alive = ' || '.join(f'[ -d /proc/{q(p)} ]' for p in old)
+            result = device.shell(SAVE_ACK_FUNCTION + 'n=0; while ' + alive +
+                                  '; do [ "$n" -lt 10 ] || { echo term_timeout; exit 0; }; '
+                                  'sleep 1; n=$((n+1)); done; save_ack ' + ' '.join(q(p) for p in old), timeout=12)
+            if result.strip() != 'term_timeout':
+                save_acknowledgements(result, old)
+            else:
+                if action == 'stop':
+                    raise Error('slot did not exit after SIGTERM; hold remains set')
+                print('slopctl: warning: slot did not exit after SIGTERM in 10 s; '
+                      'sending SIGKILL, saves may be lost.', file=sys.stderr)
+                device.shell('; '.join(f'kill -KILL {q(p)} || [ ! -d /proc/{q(p)} ] || exit 1' for p in old))
+                device.shell('n=0; while ' + alive +
+                             '; do [ "$n" -lt 5 ] || { echo "slot did not exit after SIGKILL"; exit 1; }; '
+                             'sleep 1; n=$((n+1)); done', timeout=7)
+        if action == 'stop':
+            result = device.shell(PID_FUNCTION + SAVE_ACK_FUNCTION + '''
+n=0
+quiet=0
+terminated=
+while :; do
+    pids=$(slot_pids)
+    if [ -n "$pids" ]; then
+        quiet=0
+        for pid in $pids; do
+            case " $terminated " in
+                *" $pid "*) ;;
+                *) kill -TERM "$pid" || [ ! -d "/proc/$pid" ] || exit 1
+                   terminated="$terminated $pid" ;;
+            esac
+        done
+    else
+        quiet=$((quiet+1))
+        if [ "$quiet" -ge 2 ]; then
+            save_ack $terminated
+            exit 0
+        fi
+    fi
+    [ "$n" -lt 15 ] || { echo 'Frontend did not stay stopped within 15 s; hold remains set'; exit 1; }
+    sleep 1
+    n=$((n+1))
+done
+''', timeout=18)
+            save_acknowledgements(result)
+            print('Frontend stopped; hold set.')
+            return
+    result = device.shell(PID_FUNCTION + 'old=' + q(' ' + ' '.join(old) + ' ') + '''
+n=0
+while :; do
+    p=
+    for pid in $(slot_pids); do
+        case "$old" in *" $pid "*) ;; *) p="$p $pid" ;; esac
+    done
+    [ -z "$p" ] || { echo "$p"; break; }
+    [ "$n" -lt 10 ] || { echo 'No new slot pid after 10 s'; exit 1; }
+    sleep 1; n=$((n+1))
+done
+''', timeout=12)
+    print('slot pid: ' + result.strip())
+
+
+def awake(device, state):
+    if state == 'on':
+        device.shell(': > ' + q(AWAKE))
+    elif state == 'off':
+        device.shell('rm -f ' + q(AWAKE))
+    result = device.shell(f'if [ -e {q(AWAKE)} ]; then echo on; else echo off; fi').strip()
+    print('Awake: ' + result)
+
+
+def status(device):
+    print(f'Transport: {device.name}, {device.identity}')
+    print(device.shell(PID_FUNCTION + r'''
+echo 'BaseOS:'; cat /etc/baseos-release 2>/dev/null || echo unknown
+echo 'Kernel:'; uname -a
+echo 'Uptime:'; cat /proc/uptime
+echo 'slot:'
+p=$(slot_pids); [ -n "$p" ] || echo stopped
+for pid in $p; do printf 'pid %s: ' "$pid"; tr '\000' ' ' < /proc/$pid/cmdline; echo; done
+echo 'Card mount:'; grep ' /mnt/sdcard ' /proc/mounts || true
+echo 'Card free space:'; df -k /mnt/sdcard
+echo 'Power supplies:'
+for d in /sys/class/power_supply/*; do
+    [ -d "$d" ] || continue
+    printf '%s: ' "${d##*/}"
+    for k in type capacity status online; do
+        [ -r "$d/$k" ] || continue
+        printf '%s=' "$k"; cat "$d/$k"; done
+done
+echo 'wlan0:'; ip -4 addr show dev wlan0 2>/dev/null || true
+printf 'Hold: '; if [ -e /run/slop-hold ]; then echo set; else echo clear; fi
+'''))
+
+
+def logs(device, args):
+    paths = {'slot': CARD + '/slot.log', 'prev': CARD + '/slot.log.1',
+             'session': CARD + '/slot-session.log', 'frontend': '/tmp/generic.log'}
+    boot = device.shell('for p in /mnt/sdcard/baseos-boot.log /tmp/baseos-boot.log /data/baseos-boot.log; '
+                     'do [ ! -f "$p" ] || { echo "$p"; break; }; done; :').strip()
+    paths['boot'] = boot or '/tmp/baseos-boot.log'
+    pattern = re.compile(args.grep) if args.grep else None
+    names = paths if args.kind == 'all' else [args.kind]
+    for name in names:
+        print(f'=== {name}: {paths[name]} ===')
+        output = device.shell(f'if [ -f {q(paths[name])} ]; then tail -n {args.lines} {q(paths[name])}; '
+                           'else echo "(missing)"; fi')
+        for line in output.splitlines():
+            if pattern is None or pattern.search(line):
+                print(line)
+
+
+def safe_relative(relative):
+    p = PurePosixPath(relative)
+    if p.is_absolute() or not p.parts or any(x in ('.', '..') for x in p.parts):
+        raise Error(f'Unsafe deploy path: {relative}')
+    if p.parts[0].lower() in PROTECTED:
+        raise Error(f'Protected deploy directory: {p.parts[0]}')
+    if p.parts[0] not in PAYLOAD or len(p.parts) < 2:
+        raise Error(f'Not a frontend payload path: {relative}')
+    if any('\n' in x or '\r' in x or '\t' in x for x in p.parts):
+        raise Error(f'Unsupported newline or tab in deploy path: {relative!r}')
+    return p
+
+
+def is_example(relative):
+    name = PurePosixPath(relative).name.lower()
+    return name.endswith(('.example', '.sample')) or '.example.' in name or '.sample.' in name
+
+
+def deploy_files(src, only):
+    src = Path(src)
+    if not src.is_dir() or src.is_symlink():
+        raise Error(f'Deploy source must be a real directory: {src}')
+    if src.name.lower() in PROTECTED:
+        raise Error(f'Protected deploy directory: {src.name}')
+    groups = {'system': {'System'}, 'shaders': {'Shaders'},
+              'config-examples': {'Config'}, 'all': PAYLOAD}[only]
+    files, skipped = [], 0
+    for file in sorted(src.rglob('*')):
+        rel = file.relative_to(src).as_posix()
+        top = PurePosixPath(rel).parts[0]
+        if file.is_symlink():
+            raise Error(f'Symlinks are not supported in deploy sources: {rel}')
+        if not file.is_file():
+            continue
+        if top not in groups:
+            skipped += 1
+            continue
+        safe_relative(rel)
+        if only == 'config-examples' and not is_example(rel):
+            skipped += 1
+            continue
+        files.append((file, rel))
+    return files, skipped
+
+
+def device_hashes(device, files):
+    # One shell call covers existence and all hashes, with no reliance on filename parsing.
+    script = '''
+if command -v sha256sum >/dev/null 2>&1; then h=sha256sum
+elif command -v md5sum >/dev/null 2>&1; then h=md5sum
+else echo 'No sha256sum or md5sum available'; exit 1; fi
+printf 'algorithm=%s\\n' "$h"
+'''
+    for index, (_, rel) in enumerate(files):
+        target = q(CARD + '/' + rel)
+        script += (f'if [ -e {target} ]; then '
+                   f'v=$($h {target}) || exit 1; v=${{v%% *}}; '
+                   f"printf '{index}=%s\\n' \"$v\"; else echo '{index}=-'; fi\n")
+    output = device.shell(script)
+    rows = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+    algorithm = {'sha256sum': 'sha256', 'md5sum': 'md5'}.get(rows.get('algorithm'))
+    if not algorithm or any(str(i) not in rows for i in range(len(files))):
+        raise Error('Incomplete device hash inventory')
+    return algorithm, rows
+
+
+def atomic_command(temp, target, preserve=False):
+    # Recheck Config at the final write boundary, including VFAT case aliases.
+    if preserve:
+        return (f'if [ -e {q(target)} ]; then rm -f {q(temp)} && echo skipped; '
+                f'else mv -f {q(temp)} {q(target)} && echo pushed; fi')
+    return f'mv -f {q(temp)} {q(target)} && echo pushed'
+
+
+def deploy(device, args):
+    if not args.src:
+        raise Error('Deploy source not found. Supply --src or set SLOPCTL_SRC.')
+    files, skipped = deploy_files(args.src, args.only)
+    device.shell("grep ' /mnt/sdcard ' /proc/mounts >/dev/null || "
+              "{ echo 'Frontend card is not mounted; refuse deploy'; exit 1; }")
+    if not args.dry_run and not args.no_restart:
+        if device.shell(f'[ -e {q(HOLD)} ] && echo held; :').strip():
+            raise Error('Frontend is held. Deploy with --no-restart, then use start.')
+    algorithm, remote = device_hashes(device, files)
+    pushed = unchanged = 0
+    for index, (file, rel) in enumerate(files):
+        preserve = rel.startswith('Config/') and not is_example(rel)
+        if preserve and remote[str(index)] != '-':
+            skipped += 1
+            print(f'skip existing config: {rel}')
+            continue
+        with file.open('rb') as stream:
+            digest = hashlib.file_digest(stream, algorithm).hexdigest()
+        if digest == remote[str(index)]:
+            unchanged += 1
+            continue
+        if args.dry_run:
+            pushed += 1
+            print(f'would push: {rel}')
+            continue
+        target = CARD + '/' + rel
+        temp = str(PurePosixPath(target).parent / ('.slopctl-' + uuid.uuid4().hex))
+        device.shell(f'mkdir -p {q(PurePosixPath(target).parent)}')
+        try:
+            device.push(file, temp)
+            hash_tool = 'sha256sum' if algorithm == 'sha256' else 'md5sum'
+            verify = (f'v=$({hash_tool} {q(temp)}) || exit 1; v=${{v%% *}}; '
+                      f'[ "$v" = {q(digest)} ] || {{ echo "Transfer hash mismatch"; exit 1; }}; ')
+            result = device.shell(verify + atomic_command(temp, target, preserve)).strip()
+            if result == 'skipped':
+                skipped += 1
+            elif result == 'pushed':
+                pushed += 1
+                print(f'pushed: {rel}')
+            else:
+                raise Error('Atomic deploy returned an unexpected result')
+        finally:
+            device.shell(f'rm -f {q(temp)}')
+    print(f'{"Dry run: " if args.dry_run else ""}pushed={pushed} unchanged={unchanged} skipped={skipped}')
+    if not args.dry_run:
+        device.shell('sync')
+        if not args.no_restart:
+            lifecycle(device, 'restart')
+
+
+def encode_png(raw, width, height, bpp, stride, rotate=0):
+    if width <= 0 or height <= 0 or bpp not in (16, 32) or stride < width * (bpp // 8):
+        raise Error('Unsupported framebuffer geometry')
+    if len(raw) != stride * height:
+        raise Error(f'Framebuffer length {len(raw)} does not match {stride * height}')
+    pixels = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            offset = y * stride + x * (bpp // 8)
+            if bpp == 32:
+                b, g, r, _ = raw[offset:offset + 4]
+            else:
+                value = struct.unpack_from('<H', raw, offset)[0]
+                r, g, b = ((value >> 11) * 255 // 31,
+                           ((value >> 5) & 63) * 255 // 63, (value & 31) * 255 // 31)
+            row.append(bytes((r, g, b)))
+        pixels.append(row)
+    for _ in range(rotate // 90):
+        pixels = [list(row) for row in zip(*pixels[::-1])]
+    height, width = len(pixels), len(pixels[0])
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    scan = b''.join(b'\0' + b''.join(row) for row in pixels)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(scan)) + chunk(b'IEND', b''))
+
+
+def shot(device, args):
+    output = device.shell('for k in virtual_size bits_per_pixel stride pan modes; do '
+                       'printf "%s=" "$k"; cat /sys/class/graphics/fb0/$k || exit 1; done')
+    attrs = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+    vw, vh = map(int, attrs['virtual_size'].split(','))
+    bpp, stride = int(attrs['bits_per_pixel']), int(attrs['stride'])
+    xoff, yoff = map(int, attrs['pan'].split(','))
+    mode = re.search(r'(\d+)x(\d+)', attrs['modes'])
+    if not mode:
+        raise Error('Cannot determine visible resolution from fb0/modes')
+    width, height = map(int, mode.groups())
+    if (bpp not in (16, 32) or width <= 0 or height <= 0 or yoff < 0
+            or stride < width * (bpp // 8) or width + xoff > vw or height + yoff > vh or xoff != 0):
+        raise Error('Unsupported framebuffer page layout')
+    raw = device.framebuffer(stride, yoff, height)
+    png = encode_png(raw, width, height, bpp, stride, args.rotate)
+    out = Path(args.out) if args.out else Path('slopctl-shots') / (
+        datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.png')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(png)
+    print(out)
+
+
+def event_bytes(button, down=True):
+    kind, code, value = BUTTONS[button.upper()]
+    return struct.pack('<qqHHi', 0, 0, kind, code, value if down else 0) + struct.pack('<qqHHi', 0, 0, 0, 0, 0)
+
+
+def capability_has(words, code):
+    return bool(int(''.join(f'{int(word, 16):016x}' for word in words.split()) or '0', 16) & (1 << code))
+
+
+def discover_event(listing, button):
+    kind, code, _ = BUTTONS[button]
+    matches = []
+    for block in listing.strip().split('\n\n'):
+        name = re.search(r'^N: Name="(.*)"$', block, re.M)
+        handlers = re.search(r'^H: Handlers=(.*)$', block, re.M)
+        cap = re.search(r'^B: ' + ('KEY' if kind == 1 else 'ABS') + r'=(.*)$', block, re.M)
+        if not (name and handlers and cap and capability_has(cap.group(1), code)):
+            continue
+        node = re.search(r'\bevent\d+\b', handlers.group(1))
+        if node:
+            matches.append((node.group(), name.group(1)))
+    if len(matches) != 1:
+        raise Error(f'Expected one input device for {button}, found {len(matches)}')
+    node, name = matches[0]
+    return '/dev/input/' + node, name
+
+
+def delay(ms):
+    # Probe the actual runtime, since BaseOS packages Alpine busybox-static.
+    return (f'if command -v usleep >/dev/null 2>&1; then usleep {ms * 1000}; '
+            f'else sleep {ms / 1000:.3f} 2>/dev/null || sleep {math.ceil(ms / 1000)}; fi')
+
+
+def parse_seq(sequence):
+    actions = []
+    for item in sequence.split(','):
+        words = item.strip().upper().split()
+        if not words or len(words) > 2:
+            raise Error(f'Invalid sequence item: {item!r}')
+        button = words[0]
+        if button != 'WAIT' and button not in BUTTONS:
+            raise Error(f'Unknown button: {button}')
+        if button == 'WAIT' and len(words) != 2:
+            raise Error('wait requires a duration in milliseconds')
+        ms = int(words[1]) if len(words) == 2 else 100
+        if not 0 <= ms <= 10000:
+            raise Error('Input durations must be between 0 and 10000 ms')
+        actions.append((button, ms))
+    if sum(ms for _, ms in actions) > 20000 or len(actions) > 50:
+        raise Error('Sequence exceeds 20 s or 50 actions')
+    return actions
+
+
+def inject(device, actions):
+    listing = device.shell('cat /proc/bus/input/devices')
+    nodes = {button: discover_event(listing, button) for button, _ in actions if button != 'WAIT'}
+    remote_dir = '/tmp/slopctl-input-' + uuid.uuid4().hex
+    device.shell(f'mkdir {q(remote_dir)}')
+    try:
+        with tempfile.TemporaryDirectory(prefix='slopctl-input-') as td:
+            script = []
+            for index, (button, ms) in enumerate(actions):
+                if button == 'WAIT':
+                    script.append(delay(ms) + ' || exit 1')
+                    continue
+                paths = []
+                for down in (True, False):
+                    name = f'{index}-{int(down)}'
+                    local = Path(td) / name
+                    local.write_bytes(event_bytes(button, down))
+                    remote = remote_dir + '/' + name
+                    device.push(local, remote)
+                    paths.append(remote)
+                raw_node, name = nodes[button]
+                node = q(raw_node)
+                sys_name = '/sys/class/input/' + PurePosixPath(raw_node).name + '/device/name'
+                script.append(f'[ "$(cat {q(sys_name)})" = {q(name)} ] || '
+                              '{ echo "Input device name changed"; exit 1; }')
+                # A trap releases a held button on shell failure or termination.
+                script.append(f'trap {q("cat " + q(paths[1]) + " > " + node)} EXIT HUP INT TERM')
+                script.append(f'cat {q(paths[0])} > {node} || exit 1')
+                script.append(delay(ms) + ' || exit 1')
+                script.append(f'cat {q(paths[1])} > {node} || exit 1')
+                script.append('trap - EXIT HUP INT TERM')
+            device.shell('\n'.join(script), timeout=30)
+    finally:
+        device.shell(f'rm -rf {q(remote_dir)}')
+
+
+def bounded_int(low, high):
+    def parse(value):
+        number = int(value)
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(f'must be between {low} and {high}')
+        return number
+    return parse
+
+
+def parser():
+    p = argparse.ArgumentParser(description='Drive Slop over Wi-Fi SSH or USB adb. ' + CABLE_HINT)
+    p.add_argument('--transport', choices=['auto', 'ssh', 'adb'],
+                   default=os.environ.get('SLOPCTL_TRANSPORT', 'auto'))
+    p.add_argument('--host', default=os.environ.get('SLOPCTL_HOST', 'slop'))
+    p.add_argument('-v', '--verbose', action='store_true')
+    sub = p.add_subparsers(dest='command', required=True)
+    for name in ('status', 'buttons'):
+        sub.add_parser(name)
+    sub.add_parser('restart', help='Send SIGTERM, report save acknowledgements, and wait for respawn.')
+    sub.add_parser('stop', help='Set the hold, send SIGTERM, and confirm two empty scans within 15 s.')
+    sub.add_parser('start', help='Clear the hold and wait for slot.')
+    awake_parser = sub.add_parser('awake', help='Keep the console powered on during an agent session')
+    awake_parser.add_argument('state', choices=['on', 'off', 'status'])
+    wait = sub.add_parser('wait', help='Wait for the selected transport, at most 30 s')
+    wait.add_argument('--timeout', type=bounded_int(1, 30), default=20, metavar='S')
+    log = sub.add_parser('logs')
+    log.add_argument('kind', nargs='?', choices=['slot', 'prev', 'session', 'boot', 'frontend', 'all'], default='slot')
+    log.add_argument('--lines', type=bounded_int(1, 100000), default=100, metavar='N')
+    log.add_argument('--grep', metavar='RE')
+    dep = sub.add_parser('deploy')
+    dep.add_argument('--src', default=default_source())
+    dep.add_argument('--only', choices=['system', 'shaders', 'config-examples', 'all'], default='all')
+    dep.add_argument('--dry-run', action='store_true')
+    dep.add_argument('--no-restart', action='store_true')
+    capture = sub.add_parser('shot')
+    capture.add_argument('out', nargs='?', metavar='OUT.png')
+    capture.add_argument('--rotate', type=int, choices=[0, 90, 180, 270], default=0)
+    press = sub.add_parser('press')
+    press.add_argument('button', type=str.upper, choices=list(BUTTONS))
+    press.add_argument('--hold', type=bounded_int(0, 10000), default=100, metavar='MS')
+    sequence = sub.add_parser('seq')
+    sequence.add_argument('sequence', help='Example: A 100, wait 500, DOWN, START')
+    shell = sub.add_parser('shell')
+    shell.add_argument('cmd', nargs=argparse.REMAINDER)
+    for name in ('push', 'pull'):
+        transfer = sub.add_parser(name)
+        transfer.add_argument('src')
+        transfer.add_argument('dst')
+    return p
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        if args.command == 'buttons':
+            for button, (kind, code, value) in BUTTONS.items():
+                print(f'{button:8} {"EV_KEY" if kind == 1 else "EV_ABS"} code=0x{code:x} down={value} up=0')
+            return 0
+        if args.transport not in ('auto', 'ssh', 'adb'):
+            raise Error('SLOPCTL_TRANSPORT must be auto, ssh, or adb')
+        device = select_transport(args.transport, args.host,
+                                  args.timeout if args.command == 'wait' else None)
+        if args.verbose:
+            print(f'slopctl: using {device.name} ({device.identity})', file=sys.stderr)
+        if args.command == 'wait':
+            print(f'Ready: {device.name}, {device.identity}')
+            return 0
+        if args.command == 'status':
+            status(device)
+        elif args.command == 'awake':
+            awake(device, args.state)
+        elif args.command == 'logs':
+            logs(device, args)
+        elif args.command in ('restart', 'stop', 'start'):
+            lifecycle(device, args.command)
+        elif args.command == 'deploy':
+            deploy(device, args)
+        elif args.command == 'shot':
+            shot(device, args)
+        elif args.command == 'press':
+            inject(device, [(args.button, args.hold)])
+        elif args.command == 'seq':
+            inject(device, parse_seq(args.sequence))
+        elif args.command == 'shell':
+            if len(args.cmd) == 1:
+                # One argument is a whole shell command, so pipes and redirects work.
+                print(device.shell(args.cmd[0]), end='')
+            elif args.cmd:
+                print(device.shell(' '.join(q(arg) for arg in args.cmd)), end='')
+            else:
+                device.interactive_shell()
+        elif args.command in ('push', 'pull'):
+            print(getattr(device, args.command)(args.src, args.dst), end='')
+        return 0
+    except (Error, OSError, ValueError, KeyError, re.error) as exc:
+        print(f'slopctl: {exc}', file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print('slopctl: interrupted', file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -25,4 +25,9 @@ done
 [ -f "$SD/slot.log" ] && mv -f "$SD/slot.log" "$SD/slot.log.1"
 log "exec $SYS/slot"
 
+if [ -e /run/slop-hold ]; then
+	log "frontend held by /run/slop-hold"
+	while [ -e /run/slop-hold ]; do sleep 1; done
+fi
+
 exec /lib/ld-linux-aarch64.so.1 "$SYS/slot" > "$SD/slot.log" 2>&1
