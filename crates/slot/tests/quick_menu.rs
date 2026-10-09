@@ -648,12 +648,33 @@ fn a_shader_on_the_card_joins_the_row_after_the_built_in_looks() {
 
 /// A card that remembers a file since taken off it reads as the default look.
 #[test]
-fn a_shader_no_longer_on_the_card_reads_as_lcd() {
-    let (_d, a, _) = on_carousel_with(SlotState {
-        shader: "gone".into(),
-        ..SlotState::default()
-    });
+fn a_shader_no_longer_on_the_card_reads_as_lcd_and_ignores_saved_parameters() {
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    let name = "handheld/removed.glslp";
+    write_slot_state(
+        d.path(),
+        &SlotState {
+            clock_set: true,
+            shader: name.into(),
+            ..SlotState::default()
+        },
+    )
+    .unwrap();
+    let params = slot_store::params_path(d.path(), name).unwrap();
+    std::fs::create_dir_all(params.parent().unwrap()).unwrap();
+    let saved = "OLD_PARAMETER = 0.75\nINVALID = NaN\nmalformed\n";
+    std::fs::write(&params, saved).unwrap();
+    let (mut a, _) = app_booting_at(d.path(), CLOCK_IS_SET);
     assert_eq!(a.shader(), "LCD");
+    assert_eq!(a.take_shader().as_deref(), Some("LCD"));
+    assert_eq!(a.take_shader(), None);
+    assert!(a.shader_parameters().is_empty());
+    open_at(&mut a, QuickRow::Shader);
+    press(&mut a, Btn::A);
+    assert!(!a.shader_params_open());
+    assert!(a.take_parameter_changes().is_none());
+    assert_eq!(std::fs::read_to_string(params).unwrap(), saved);
+    assert_eq!(read_slot_state(d.path()).shader, name);
 }
 
 /// The clock row is a flag like Rumble: either arrow flips it, it is on the card at once, and

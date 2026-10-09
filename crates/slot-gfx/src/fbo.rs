@@ -109,6 +109,9 @@ impl Compositor {
     pub fn set_shader_parameter(&mut self, name: &str, value: f32) {
         self.game.set_parameter(name, value);
     }
+    pub fn set_game_rewinding(&mut self, rewinding: bool) {
+        self.game.set_rewinding(rewinding);
+    }
     pub fn take_shader_error(&mut self) -> Option<String> {
         self.game.take_shader_error()
     }

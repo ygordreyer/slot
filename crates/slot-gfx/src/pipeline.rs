@@ -146,6 +146,11 @@ impl GamePass {
             s.set_parameter(name, value);
         }
     }
+    pub fn set_rewinding(&mut self, rewinding: bool) {
+        if let Look::Retro(s) = &mut self.look {
+            s.set_rewinding(rewinding);
+        }
+    }
     pub fn take_shader_error(&mut self) -> Option<String> {
         self.shader_error.take()
     }

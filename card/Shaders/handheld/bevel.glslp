@@ -2,3 +2,7 @@ shaders = 1
 
 shader0 = shaders/bevel.glsl
 filter_linear0 = false
+
+# The upstream constant highlight lifts black pixels to grey.
+parameters = BEVEL_LEVEL
+BEVEL_LEVEL = 0.0
