@@ -15,6 +15,16 @@ pub struct Cart {
     pub shell: Option<crate::ShellChoice>,
 }
 
+impl Cart {
+    pub fn key(&self) -> String {
+        format!(
+            "Games/{}/{}",
+            self.platform.dir_name(),
+            self.rom.file_name().unwrap_or_default().to_string_lossy()
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Io(std::io::Error),

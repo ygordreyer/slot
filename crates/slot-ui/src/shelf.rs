@@ -1,3 +1,5 @@
+use std::collections::{BTreeSet, HashMap};
+
 use slot_gfx::{Draw, TexId, OUT_H, OUT_W};
 use slot_store::Cart;
 
@@ -31,7 +33,12 @@ pub struct Shelf {
     pub carts: Vec<Cart>,
     pub index: usize,
     pub scroll: f32,
-    faces: Vec<TexId>,
+    keys: Vec<String>,
+    fallback_colours: Vec<[u8; 3]>,
+    faces: Vec<Option<TexId>>,
+    favorites: BTreeSet<String>,
+    favorited: Vec<bool>,
+    star: Option<TexId>,
     shadow: Option<TexId>,
     gb_shadow: Option<TexId>,
     gbc_shadow: Option<TexId>,
@@ -44,11 +51,19 @@ pub struct Shelf {
 impl Shelf {
     pub fn new(carts: Vec<Cart>) -> Self {
         Shelf {
+            keys: carts.iter().map(Cart::key).collect(),
+            fallback_colours: carts
+                .iter()
+                .map(|cart| label_colour(&label_text(cart)))
+                .collect(),
             shells: carts.iter().map(gb_shell_of).collect(),
             carts,
             index: 0,
             scroll: 0.0,
             faces: Vec::new(),
+            favorites: BTreeSet::new(),
+            favorited: Vec::new(),
+            star: None,
             shadow: None,
             gb_shadow: None,
             gbc_shadow: None,
@@ -77,12 +92,64 @@ impl Shelf {
     }
 
     pub fn set_faces(&mut self, faces: Vec<TexId>) {
-        self.faces = faces;
+        self.faces = faces.into_iter().map(Some).collect();
     }
 
-    pub fn find(&self, stem: &str) -> Option<(&Cart, Option<TexId>)> {
-        let i = self.carts.iter().position(|c| c.stem == stem)?;
-        Some((&self.carts[i], self.faces.get(i).copied()))
+    pub fn set_favorite_star(&mut self, star: TexId) {
+        self.star = Some(star);
+    }
+
+    pub fn set_favorites(&mut self, keys: &BTreeSet<String>) {
+        self.favorites = keys.clone();
+        self.favorited = self.keys.iter().map(|key| keys.contains(key)).collect();
+    }
+
+    pub fn cart_key(&self, index: usize) -> Option<&str> {
+        self.keys.get(index).map(String::as_str)
+    }
+
+    pub fn set_cart_faces(&mut self, faces: &HashMap<String, TexId>) {
+        self.faces = self
+            .keys
+            .iter()
+            .map(|key| faces.get(key).copied())
+            .collect();
+    }
+
+    pub fn replace_carts(&mut self, carts: Vec<Cart>, faces: &HashMap<String, TexId>) {
+        let selected = self.cart_key(self.index).map(str::to_owned);
+        let old = self.index;
+        self.keys = carts.iter().map(Cart::key).collect();
+        self.fallback_colours = carts
+            .iter()
+            .map(|cart| label_colour(&label_text(cart)))
+            .collect();
+        self.favorited = self
+            .keys
+            .iter()
+            .map(|key| self.favorites.contains(key))
+            .collect();
+        self.shells = carts.iter().map(gb_shell_of).collect();
+        self.carts = carts;
+        self.set_cart_faces(faces);
+        let index = self
+            .keys
+            .iter()
+            .position(|key| Some(key.as_str()) == selected.as_deref())
+            .unwrap_or_else(|| {
+                if self.carts.is_empty() {
+                    0
+                } else {
+                    old % self.carts.len()
+                }
+            });
+        self.release_hold();
+        self.select(index);
+    }
+
+    pub fn find(&self, key: &str) -> Option<(&Cart, Option<TexId>)> {
+        let i = self.keys.iter().position(|candidate| candidate == key)?;
+        Some((&self.carts[i], self.faces.get(i).copied().flatten()))
     }
 
     pub fn left(&mut self) {
@@ -267,7 +334,7 @@ impl Shelf {
                 continue;
             };
             let cart = &self.carts[i];
-            if hidden == Some(cart.stem.as_str()) {
+            if hidden.is_some() && hidden == self.cart_key(i) {
                 continue;
             }
             let offset = target + slot as f32 - self.scroll;
@@ -301,7 +368,7 @@ impl Shelf {
                 }
             }
             out.push(match self.faces.get(i) {
-                Some(tex) => Draw::Tex {
+                Some(Some(tex)) => Draw::Tex {
                     x,
                     y,
                     w,
@@ -309,8 +376,12 @@ impl Shelf {
                     tex: *tex,
                     alpha: alpha * dim,
                 },
-                None => {
-                    let c = label_colour(&label_text(cart));
+                _ => {
+                    let c = self
+                        .fallback_colours
+                        .get(i)
+                        .copied()
+                        .unwrap_or_else(|| label_colour(&label_text(cart)));
                     Draw::Rect {
                         x,
                         y,
@@ -325,6 +396,16 @@ impl Shelf {
                     }
                 }
             });
+            if let Some(tex) = self.star.filter(|_| self.favorited.get(i) == Some(&true)) {
+                out.push(Draw::Tex {
+                    x: x + w - (FAVORITE_STAR_PX as f32 + FAVORITE_STAR_INSET) * scale,
+                    y: y + FAVORITE_STAR_INSET * scale,
+                    w: FAVORITE_STAR_PX as f32 * scale,
+                    h: FAVORITE_STAR_PX as f32 * scale,
+                    tex,
+                    alpha: alpha * dim,
+                });
+            }
         }
     }
 }
@@ -335,4 +416,20 @@ fn shrink(offset: f32) -> f32 {
 
 fn recede_alpha(face_alpha: f32) -> f32 {
     (face_alpha / SIDE_ALPHA).clamp(0.0, 1.0)
+}
+
+pub const FAVORITE_STAR_PX: u32 = 24;
+pub const FAVORITE_STAR_INSET: f32 = 10.0;
+
+pub fn favorite_star_face() -> crate::CartFace {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+      <path fill="#efc75e" stroke="#302511" stroke-width="1"
+        d="M12 1.5 15.1 8.3 22.5 9.1 17 14.2 18.5 21.5 12 17.8 5.5 21.5 7 14.2 1.5 9.1 8.9 8.3Z"/>
+    </svg>"##;
+    crate::CartFace {
+        rgba: crate::art::render_svg(svg, FAVORITE_STAR_PX, FAVORITE_STAR_PX)
+            .unwrap_or_else(|| vec![0; (FAVORITE_STAR_PX * FAVORITE_STAR_PX * 4) as usize]),
+        w: FAVORITE_STAR_PX,
+        h: FAVORITE_STAR_PX,
+    }
 }

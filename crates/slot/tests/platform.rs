@@ -107,3 +107,44 @@ fn a_hand_organised_game_boy_card_scans_seats_saves_and_resumes() {
         cart.rom
     );
 }
+
+#[test]
+fn a_same_named_favorite_launches_and_saves_under_its_own_platform() {
+    let d = common::tmp_root_with_carts(&["Tetris", "Zzz"]);
+    common::write_gb_cart(&d, "Tetris", "TETRIS");
+    common::clocked(d.path());
+    let keys = std::collections::BTreeSet::from([
+        "Games/GBA/Tetris.gba".to_string(),
+        "Games/GB/Tetris.gb".to_string(),
+    ]);
+    slot_store::favorites::write_favorites(d.path(), &keys).unwrap();
+    let mut session = Session::boot(d.path().to_path_buf());
+    session.feed([RawEvent::Down(Btn::L1), RawEvent::Up(Btn::L1)], 10);
+    session.feed([RawEvent::Down(Btn::Right), RawEvent::Up(Btn::Right)], 20);
+    assert_eq!(
+        session.app().selected_key().as_deref(),
+        Some("Games/GB/Tetris.gb")
+    );
+    session.feed([RawEvent::Down(Btn::A)], 30);
+    session.feed([RawEvent::Up(Btn::A)], 40);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut now = 40;
+    while !matches!(session.app().phase(), Phase::Playing { .. }) {
+        assert!(Instant::now() < deadline, "the favorite never seated");
+        now += 16;
+        session.feed([], now);
+        session.update(1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        session.app().seated_cart().unwrap().rom,
+        d.path().join("Games/GB/Tetris.gb")
+    );
+    session.app_mut().tick_ms(60_000);
+    session.app_mut().settle_saves();
+    assert!(d.path().join("Saves/GB/Tetris.sav").is_file());
+    assert!(!d.path().join("Saves/GBA/Tetris.sav").exists());
+    let state = slot_store::read_slot_state(d.path());
+    assert_eq!(state.cart_key.as_deref(), Some("Games/GB/Tetris.gb"));
+    assert_eq!(state.cart.as_deref(), Some("Tetris"));
+}

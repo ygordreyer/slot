@@ -333,23 +333,15 @@ fn the_shoulders_ring_over_the_shelves() {
     let mut a = app_with_platforms(&[(Platform::Gba, "Emerald"), (Platform::Gb, "Tetris")]);
     assert_eq!(a.selected_stem(), Some("Emerald"));
     tap(&mut a, Btn::R1);
-    assert_eq!(
-        a.selected_stem(),
-        Some("Tetris"),
-        "R1 did not reach the Game Boy shelf"
-    );
+    assert_eq!(a.selected_stem(), Some("Tetris"));
     tap(&mut a, Btn::R1);
-    assert_eq!(
-        a.selected_stem(),
-        Some("Emerald"),
-        "the ring did not come back round"
-    );
+    assert!(a.empty_favorites());
+    tap(&mut a, Btn::R1);
+    assert_eq!(a.selected_stem(), Some("Emerald"));
     tap(&mut a, Btn::L1);
-    assert_eq!(
-        a.selected_stem(),
-        Some("Tetris"),
-        "L1 did not reach the Game Boy shelf"
-    );
+    assert!(a.empty_favorites());
+    tap(&mut a, Btn::L1);
+    assert_eq!(a.selected_stem(), Some("Tetris"));
 }
 
 #[test]
@@ -368,11 +360,15 @@ fn a_colour_cart_stands_on_a_shelf_of_its_own() {
         "the Colour cart shares the Game Boy shelf"
     );
     tap(&mut a, Btn::R1);
+    assert!(a.empty_favorites());
+    tap(&mut a, Btn::R1);
     assert_eq!(
         a.selected_stem(),
         Some("Emerald"),
-        "three shelves did not ring back round to the first"
+        "the shelves did not ring back round to GBA"
     );
+    tap(&mut a, Btn::L1);
+    assert!(a.empty_favorites());
     tap(&mut a, Btn::L1);
     assert_eq!(a.selected_stem(), Some("Chromatic"));
 }
@@ -444,25 +440,15 @@ fn a_shelf_comes_back_settled_where_it_was_left() {
 }
 
 #[test]
-fn the_shoulders_do_nothing_when_there_is_one_shelf_to_be_on() {
-    let mut a = app_with_platforms(&[(Platform::Gba, "Emerald"), (Platform::Gba, "Fusion")]);
+fn the_shoulders_reach_empty_favorites_with_only_gba_carts() {
     for btn in [Btn::L1, Btn::R1] {
+        let mut a = app_with_platforms(&[(Platform::Gba, "Emerald"), (Platform::Gba, "Fusion")]);
         tap(&mut a, btn);
-        assert_eq!(
-            a.selected_stem(),
-            Some("Emerald"),
-            "{btn:?} moved a shelf with no neighbour"
-        );
-        assert_eq!(
-            a.toast(),
-            None,
-            "{btn:?} said something about doing nothing"
-        );
-        assert_eq!(
-            a.shelf_shake(),
-            0.0,
-            "{btn:?} refused where it should have done nothing"
-        );
+        assert!(a.empty_favorites());
+        assert_eq!(a.selected_stem(), None);
+        assert_eq!(a.toast(), None);
+        tap(&mut a, btn);
+        assert_eq!(a.selected_stem(), Some("Emerald"));
     }
 }
 
@@ -481,7 +467,9 @@ fn the_switch_changes_the_name_on_the_band_and_says_nothing() {
     for (btn, want) in [
         (Btn::R1, "Game Boy"),
         (Btn::R1, "Game Boy Color"),
+        (Btn::R1, "FAVORITES"),
         (Btn::R1, "Game Boy Advance"),
+        (Btn::L1, "FAVORITES"),
         (Btn::L1, "Game Boy Color"),
     ] {
         a.apply_at(Action::GbaDown(btn), 1_000);
@@ -501,28 +489,13 @@ fn the_switch_changes_the_name_on_the_band_and_says_nothing() {
 }
 
 #[test]
-fn a_card_on_one_shelf_names_nothing_because_there_is_nowhere_to_switch_to() {
-    let mut alone = app_with_platforms(&[(Platform::Gba, "Emerald"), (Platform::Gba, "Fusion")]);
-    assert_eq!(
-        alone.shelf_platform_name(),
-        None,
-        "a card with only Game Boy Advance carts named its platform anyway"
-    );
-    for btn in [Btn::L1, Btn::R1] {
-        alone.apply_at(Action::GbaDown(btn), 1_000);
-        assert_eq!(
-            alone.shelf_platform_name(),
-            None,
-            "{btn:?} named a shelf on a card that has one"
-        );
-    }
-
-    let two = app_with_platforms(&[(Platform::Gba, "Emerald"), (Platform::Gb, "Tetris")]);
-    assert_eq!(
-        two.shelf_platform_name(),
-        Some("Game Boy Advance"),
-        "a card with two shelves did not say which one it was on"
-    );
+fn a_card_with_only_gba_carts_names_both_shelves() {
+    let mut a = app_with_platforms(&[(Platform::Gba, "Emerald"), (Platform::Gba, "Fusion")]);
+    assert_eq!(a.shelf_platform_name(), Some("Game Boy Advance"));
+    tap(&mut a, Btn::L1);
+    assert_eq!(a.shelf_platform_name(), Some("FAVORITES"));
+    tap(&mut a, Btn::L1);
+    assert_eq!(a.shelf_platform_name(), Some("Game Boy Advance"));
 }
 
 #[test]
@@ -1851,6 +1824,7 @@ fn a_shoulder_held_across_the_insert_does_not_stick_on_the_pad() {
     let d = common::tmp_root_with_gb_carts(&["Tetris", "Zzz"]);
     common::clocked(d.path());
     let mut s = Session::boot(d.path().to_path_buf());
+    s.app_mut().apply(Action::GbaDown(Btn::Y));
     s.feed([RawEvent::Down(Btn::L1)], 16);
     s.feed([RawEvent::Down(Btn::A)], 32);
     s.feed([RawEvent::Up(Btn::A)], 48);
@@ -1884,6 +1858,7 @@ fn a_shoulder_still_held_when_the_cart_seats_never_reaches_a_game_boy_core() {
     ] {
         common::clocked(root.path());
         let mut s = Session::boot(root.path().to_path_buf());
+        s.app_mut().apply(Action::GbaDown(Btn::Y));
         s.feed([RawEvent::Down(Btn::L1)], 16);
         s.feed([RawEvent::Down(Btn::A)], 32);
         s.feed([RawEvent::Up(Btn::A)], 48);
@@ -2132,8 +2107,8 @@ fn a_letter_jump_shows_the_letter_in_the_slot_and_fades_like_the_shelf_name() {
     let face = slot_ui::TexId::from_raw(77);
     assert_eq!(
         a.slot_text(),
-        None,
-        "a one shelf card printed something in the slot"
+        Some("Game Boy Advance".into()),
+        "GBA shelf name missing"
     );
 
     a.apply(Action::GbaDown(Btn::Down));

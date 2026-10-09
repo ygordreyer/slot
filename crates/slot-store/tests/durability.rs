@@ -189,6 +189,7 @@ fn a_card_from_before_the_settings_keeps_all_its_values() {
         SlotState {
             cart: Some("Emerald".into()),
             cart_platform: None,
+            cart_key: None,
             brightness: 3,
             blue_light: 1,
             volume: 40,
