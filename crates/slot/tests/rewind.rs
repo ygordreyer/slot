@@ -146,6 +146,7 @@ fn the_rewind_bar_is_up_while_l2_is_held_and_gone_once_it_is_let_go() {
     }
 
     step(&mut s, &mut now, Some(RawEvent::Down(Btn::L2)));
+    assert!(s.actually_rewinding());
     for _ in 0..200 {
         step(&mut s, &mut now, None);
     }
@@ -154,6 +155,7 @@ fn the_rewind_bar_is_up_while_l2_is_held_and_gone_once_it_is_let_go() {
         "the rewind bar timed out while L2 was held"
     );
     step(&mut s, &mut now, Some(RawEvent::Up(Btn::L2)));
+    assert!(!s.actually_rewinding());
     assert!(drawn(&s).is_empty(), "the bar outlived the hold");
 }
 

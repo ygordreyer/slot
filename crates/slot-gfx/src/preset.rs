@@ -448,6 +448,161 @@ mod tests {
 #[cfg(test)]
 mod bundled_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires glslangValidator on PATH; no GPU required"]
+    fn bundled_shader_stages_compile_and_link_for_gles2_and_desktop() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../card/Shaders");
+        let mut shaders = std::collections::BTreeSet::new();
+        for dir in ["crt", "handheld", "motionblur"] {
+            for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "glslp") {
+                    let preset = resolve_preset(&path, &|p| {
+                        std::fs::read_to_string(p).map_err(|e| e.to_string())
+                    })
+                    .unwrap();
+                    shaders.extend(preset.passes.into_iter().map(|p| p.path));
+                }
+            }
+        }
+        let temp = std::env::temp_dir().join(format!("slot-glsl-check-{}", std::process::id()));
+        std::fs::create_dir(&temp).unwrap();
+        let mut failures = Vec::new();
+        for path in &shaders {
+            let source = std::fs::read_to_string(path).unwrap();
+            for es in [true, false] {
+                let vertex = temp.join("pass.vert");
+                let fragment = temp.join("pass.frag");
+                std::fs::write(
+                    &vertex,
+                    crate::retroshader::stage_source(&source, "VERTEX", es),
+                )
+                .unwrap();
+                std::fs::write(
+                    &fragment,
+                    crate::retroshader::stage_source(&source, "FRAGMENT", es),
+                )
+                .unwrap();
+                let result = std::process::Command::new("glslangValidator")
+                    .arg("-l")
+                    .arg(&vertex)
+                    .arg(&fragment)
+                    .output();
+                match result {
+                    Ok(result) if result.status.success() => {}
+                    Ok(result) => failures.push(format!(
+                        "{}, es={es}: {}{}",
+                        path.display(),
+                        String::from_utf8_lossy(&result.stdout),
+                        String::from_utf8_lossy(&result.stderr)
+                    )),
+                    Err(e) => failures.push(format!("glslangValidator: {e}")),
+                }
+            }
+        }
+        std::fs::remove_file(temp.join("pass.vert")).unwrap();
+        std::fs::remove_file(temp.join("pass.frag")).unwrap();
+        std::fs::remove_dir(&temp).unwrap();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        eprintln!(
+            "validated {} bundled shader paths for GLES 2 and desktop",
+            shaders.len()
+        );
+    }
+
+    fn bundled(name: &str) -> (Preset, Vec<Parameter>) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../card/Shaders")
+            .join(name);
+        let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| e.to_string());
+        let preset = resolve_preset(&path, &read).unwrap();
+        let sources = preset
+            .passes
+            .iter()
+            .map(|p| read(&p.path).unwrap())
+            .collect::<Vec<_>>();
+        let parameters = collect_parameters(
+            sources.iter().map(String::as_str),
+            &preset.overrides,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        (preset, parameters)
+    }
+
+    #[test]
+    fn mgba_masks_and_recipes_use_one_rgb_triad_per_gba_pixel_at_three_times() {
+        for name in [
+            "handheld/agb001-gba-color-motionblur.glslp",
+            "handheld/ags001-gba-color-motionblur.glslp",
+            "handheld/ags001.glslp",
+        ] {
+            let (preset, parameters) = bundled(name);
+            let value = |name: &str| parameters.iter().find(|p| p.name == name).unwrap().value;
+            assert_eq!(value("LCD_SCALE"), 3.0);
+            assert_eq!(value("MASK_STRENGTH"), 0.35);
+            if name.contains("gba-color") {
+                assert_eq!(value("darken_screen"), 0.0);
+            }
+            let mut size = [240, 160];
+            for (i, pass) in preset.passes.iter().enumerate() {
+                assert!(!pass.linear);
+                size = output_size(pass.scale, size, [720, 480], i + 1 == preset.passes.len())
+                    .unwrap();
+                assert!(size[0] <= 720 && size[1] <= 480);
+                if pass
+                    .path
+                    .file_name()
+                    .is_some_and(|p| p == "agb001.glsl" || p == "ags001.glsl")
+                {
+                    assert_eq!(size, [720, 480]);
+                    for pixel in 0..240 {
+                        for column in 0..3 {
+                            let original_coord = (pixel * 3 + column) as f32 / 3.0 + 0.5 / 3.0;
+                            assert_eq!(
+                                ((original_coord * value("LCD_SCALE")) % value("LCD_SCALE"))
+                                    as usize,
+                                column
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(size, [720, 480]);
+        }
+    }
+
+    #[test]
+    fn bevel_preserves_black_and_zfast_avoids_extra_gamma_darkening() {
+        let (_, bevel) = bundled("handheld/bevel.glslp");
+        let level = bevel
+            .iter()
+            .find(|p| p.name == "BEVEL_LEVEL")
+            .unwrap()
+            .value;
+        for y in 0..3 {
+            for x in 0..3 {
+                let radius = ((x as f32 + 0.5) / 3.0 + (y as f32 + 0.5) / 3.0).sqrt();
+                assert_eq!((level * (1.0 - radius)).max(0.0), 0.0);
+            }
+        }
+        let (_, zfast) = bundled("handheld/zfast-lcd.glslp");
+        assert_eq!(
+            zfast.iter().find(|p| p.name == "GBAGAMMA").unwrap().value,
+            0.0
+        );
+        let (_, control) = bundled("handheld/gba-color.glslp");
+        assert_eq!(
+            control
+                .iter()
+                .find(|p| p.name == "darken_screen")
+                .unwrap()
+                .value,
+            1.0
+        );
+    }
+
     #[test]
     fn bundled_presets_resolve_every_pass_and_parameter_without_gl() {
         fn walk(dir: &Path, paths: &mut Vec<PathBuf>) {
@@ -463,7 +618,7 @@ mod bundled_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../card/Shaders");
         let mut paths = Vec::new();
         walk(&root, &mut paths);
-        assert_eq!(paths.len(), 13);
+        assert_eq!(paths.len(), 11);
         for path in paths {
             let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| e.to_string());
             let preset = resolve_preset(&path, &read).unwrap();

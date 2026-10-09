@@ -535,6 +535,7 @@ impl Frontend {
         sync_quick_clock(self.session.app_mut(), compositor, &mut self.quick_clock);
         sync_quick_shader(self.session.app_mut(), compositor, &mut self.quick_shader);
         sync_shader(&mut self.session, compositor, &mut self.effective_shader);
+        compositor.set_game_rewinding(self.session.actually_rewinding());
         sync_cheats(self.session.app_mut(), compositor, &mut self.cheats);
         if let Some(screen) = self.session.app().account_screen() {
             if self.account_shown != Some(screen.revision()) {

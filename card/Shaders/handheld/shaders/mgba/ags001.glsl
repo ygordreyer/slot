@@ -2,12 +2,16 @@
    AGS-001 shader
    A pristine recreation of the illuminated Game Boy Advance SP
    Author: endrift
+   Slot adaptation: selectable three-column mask and mask strength.
    License: MPL 2.0
 
    This Source Code Form is subject to the terms of the Mozilla Public
    License, v. 2.0. If a copy of the MPL was not distributed with this
    file, You can obtain one at http://mozilla.org/MPL/2.0/. 
 */
+
+#pragma parameter LCD_SCALE "LCD Mask Scale" 4.0 3.0 4.0 1.0
+#pragma parameter MASK_STRENGTH "LCD Mask Strength" 1.0 0.0 1.0 0.05
 
 #if defined(VERTEX)
 
@@ -90,23 +94,37 @@ COMPAT_VARYING vec4 TEX0;
 #define SourceSize vec4(TextureSize, 1.0 / TextureSize) //either TextureSize or InputSize
 #define OutSize vec4(OutputSize, 1.0 / OutputSize)
 
+#ifdef PARAMETER_UNIFORM
+uniform COMPAT_PRECISION float LCD_SCALE;
+uniform COMPAT_PRECISION float MASK_STRENGTH;
+#else
+#define LCD_SCALE 4.0
+#define MASK_STRENGTH 1.0
+#endif
+
 void main()
 {
 	vec4 color = COMPAT_TEXTURE(Source, vTexCoord);
 	vec2 original_coord = vTexCoord * TextureSize.xy / InputSize.xy * OrigInputSize.xy;
-	vec3 arrayX[4];
-	arrayX[0] = vec3(1.0, 0.2, 0.2);
-	arrayX[1] = vec3(0.2, 1.0, 0.2);
-	arrayX[2] = vec3(0.2, 0.2, 1.0);
-	arrayX[3] = vec3(0.4, 0.4, 0.4);
-	vec3 arrayY[4];
-	arrayY[0] = vec3(1.0, 1.0, 1.0);
-	arrayY[1] = vec3(1.0, 1.0, 1.0);
-	arrayY[2] = vec3(1.0, 1.0, 1.0);
-	arrayY[3] = vec3(0.9, 0.9, 0.9);
-	color.rgb = pow(color.rgb, vec3(1.6, 1.6, 1.6));
-	color.rgb *= arrayX[int(mod(original_coord.x * 4.0, 4.0))];
-	color.rgb *= arrayY[int(mod(original_coord.y * 4.0, 4.0))];
+	color.rgb = pow(color.rgb, vec3(1.6));
+
+	// A three-column panel needs all RGB columns, without the fourth grey column.
+	float mask_scale = floor(LCD_SCALE + 0.5);
+	int colorX = int(mod(original_coord.x * mask_scale, mask_scale));
+	vec3 mask = vec3(0.4);
+	if (colorX == 0) {
+		mask = vec3(1.0, 0.2, 0.2);
+	} else if (colorX == 1) {
+		mask = vec3(0.2, 1.0, 0.2);
+	} else if (colorX == 2) {
+		mask = vec3(0.2, 0.2, 1.0);
+	}
+	float colorY = floor(mod(original_coord.y * mask_scale, mask_scale));
+	if (colorY == mask_scale - 1.0) {
+		mask *= 0.9;
+	}
+	color.rgb *= mix(vec3(1.0), mask, MASK_STRENGTH);
+
 	color.a = 0.8;
 	FragColor = color;
 }

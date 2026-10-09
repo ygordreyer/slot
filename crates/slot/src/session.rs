@@ -455,7 +455,7 @@ impl Session {
         }
     }
 
-    fn actually_rewinding(&self) -> bool {
+    pub fn actually_rewinding(&self) -> bool {
         self.rewinding && self.playing() && self.app.may_rewind()
     }
 

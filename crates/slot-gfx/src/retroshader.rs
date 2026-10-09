@@ -45,6 +45,16 @@ impl Uniform {
             }
         }
     }
+    unsafe fn set_direction(self, rewinding: bool) {
+        if self.loc >= 0 {
+            let n = frame_direction(rewinding);
+            if self.float {
+                gl::Uniform1f(self.loc, n as f32)
+            } else {
+                gl::Uniform1i(self.loc, n)
+            }
+        }
+    }
     unsafe fn set_vec2(self, x: f32, y: f32) {
         if self.loc >= 0 {
             gl::Uniform2f(self.loc, x, y)
@@ -181,6 +191,72 @@ impl Texture {
             floating: false,
         }
     }
+    fn uniform_sizes(self) -> ([f32; 2], [f32; 2]) {
+        (self.input.map(|n| n as f32), self.size.map(|n| n as f32))
+    }
+}
+
+fn frame_count(frame: u32, modulus: u32) -> u32 {
+    if modulus == 0 {
+        frame
+    } else {
+        frame % modulus
+    }
+}
+
+fn frame_direction(rewinding: bool) -> i32 {
+    if rewinding {
+        -1
+    } else {
+        1
+    }
+}
+
+struct SourceHistory<'a> {
+    textures: &'a [Texture],
+    next: usize,
+    ready: bool,
+}
+
+fn texture_bindings<'a>(
+    orig: Texture,
+    prev: Texture,
+    outputs: &[Texture],
+    aliases: impl Iterator<Item = &'a str>,
+    history: SourceHistory<'_>,
+) -> HashMap<String, Texture> {
+    let index = outputs.len();
+    let mut b = HashMap::new();
+    b.insert("".into(), outputs.last().copied().unwrap_or(orig));
+    b.insert("Orig".into(), orig);
+    b.insert(format!("PassPrev{}", index + 1), orig);
+    for (i, (t, alias)) in outputs.iter().zip(aliases).enumerate() {
+        b.insert(format!("Pass{}", i + 1), *t);
+        b.insert(format!("PassPrev{}", index - i), *t);
+        if !alias.is_empty() {
+            b.insert(alias.to_string(), *t);
+        }
+    }
+    for n in 0..7 {
+        let name = if n == 0 {
+            "Prev".into()
+        } else {
+            format!("Prev{n}")
+        };
+        // Snapshots hand the same texture in for current and previous frames.
+        let mut t = if orig.id == prev.id || (n == 0 && !history.ready) {
+            prev
+        } else if n < history.textures.len() {
+            history.textures
+                [(history.next + history.textures.len() - 1 - n) % history.textures.len()]
+        } else {
+            prev
+        };
+        t.uv = orig.uv;
+        t.input = orig.input;
+        b.insert(name, t);
+    }
+    b
 }
 struct Target {
     tex: Texture,
@@ -392,6 +468,7 @@ pub struct RetroShader {
     vao: u32,
     copy: Program,
     history: RefCell<History>,
+    rewinding: bool,
 }
 const COPY: &str = r#"
 #if defined(VERTEX)
@@ -598,6 +675,7 @@ impl RetroShader {
             vao,
             copy,
             history: RefCell::new(history),
+            rewinding: false,
         };
         shader.resize([SRC_W, SRC_H], [OUT_W, OUT_H])?;
         shader.validate_bindings()?;
@@ -605,6 +683,9 @@ impl RetroShader {
     }
     pub fn parameters(&self) -> &[Parameter] {
         &self.parameters
+    }
+    pub fn set_rewinding(&mut self, rewinding: bool) {
+        self.rewinding = rewinding;
     }
     pub fn set_parameter(&mut self, name: &str, value: f32) {
         if let Some(p) = self.parameters.iter_mut().find(|p| p.name == name) {
@@ -634,38 +715,19 @@ impl RetroShader {
         prev: Texture,
         outputs: &[Texture],
     ) -> HashMap<String, Texture> {
-        let mut b = HashMap::new();
-        b.insert("".into(), outputs.last().copied().unwrap_or(orig));
-        b.insert("Orig".into(), orig);
-        b.insert(format!("PassPrev{}", index + 1), orig);
-        for (i, t) in outputs.iter().enumerate() {
-            b.insert(format!("Pass{}", i + 1), *t);
-            b.insert(format!("PassPrev{}", index - i), *t);
-            if !self.passes[i].spec.alias.is_empty() {
-                b.insert(self.passes[i].spec.alias.clone(), *t);
-            }
-        }
+        debug_assert_eq!(index, outputs.len());
         let history = self.history.borrow();
-        for n in 0..7 {
-            let name = if n == 0 {
-                "Prev".into()
-            } else {
-                format!("Prev{n}")
-            };
-            // Snapshots hand the same texture in for current and previous frames.
-            let mut t = if orig.id == prev.id || (n == 0 && history.frame.is_none()) {
-                prev
-            } else if n < history.textures.len() {
-                history.textures
-                    [(history.next + history.textures.len() - 1 - n) % history.textures.len()]
-            } else {
-                prev
-            };
-            t.uv = orig.uv;
-            t.input = orig.input;
-            b.insert(name, t);
-        }
-        b
+        texture_bindings(
+            orig,
+            prev,
+            outputs,
+            self.passes.iter().map(|p| p.spec.alias.as_str()),
+            SourceHistory {
+                textures: &history.textures,
+                next: history.next,
+                ready: history.frame.is_some(),
+            },
+        )
     }
     fn validate_bindings(&self) -> Result<(), GfxError> {
         let orig = Texture::full(u32::MAX, [SRC_W, SRC_H]);
@@ -869,12 +931,9 @@ impl RetroShader {
                 gl::UniformMatrix4fv(p.mvp, 1, gl::FALSE, mvp.as_ptr());
             }
             p.uniform("OutputSize").set_vec2(output[0], output[1]);
-            p.uniform("FrameCount").set_count(if spec.frame_mod > 0 {
-                frame % spec.frame_mod
-            } else {
-                frame
-            });
-            p.uniform("FrameDirection").set_count(1);
+            p.uniform("FrameCount")
+                .set_count(frame_count(frame, spec.frame_mod));
+            p.uniform("FrameDirection").set_direction(self.rewinding);
             for param in &self.parameters {
                 let u = p.uniform(&param.name);
                 if u.loc >= 0 {
@@ -882,10 +941,11 @@ impl RetroShader {
                 }
             }
             for (prefix, t) in bindings {
+                let (input, texture) = t.uniform_sizes();
                 p.uniform(&format!("{prefix}InputSize"))
-                    .set_vec2(t.input[0] as f32, t.input[1] as f32);
+                    .set_vec2(input[0], input[1]);
                 p.uniform(&format!("{prefix}TextureSize"))
-                    .set_vec2(t.size[0] as f32, t.size[1] as f32);
+                    .set_vec2(texture[0], texture[1]);
             }
             let mut units = HashMap::new();
             for name in &p.samplers {
@@ -1239,6 +1299,140 @@ unsafe fn uniform_kinds(prog: gl::types::GLuint) -> HashMap<String, gl::types::G
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_uniforms_preserve_the_modulus_and_signed_rewind_direction() {
+        assert_eq!(frame_count(19, 0), 19);
+        assert_eq!(frame_count(19, 8), 3);
+        assert_eq!(frame_count(u32::MAX, 2), 1);
+        assert_eq!(frame_direction(false), 1);
+        assert_eq!(frame_direction(true), -1);
+    }
+
+    #[test]
+    fn every_pass_keeps_original_sizes_and_relative_pass_bindings() {
+        for (input, uv) in [
+            ([240, 160], [0.0, 0.0, 1.0, 1.0]),
+            (
+                [160, 144],
+                [40.0 / 240.0, 8.0 / 160.0, 160.0 / 240.0, 144.0 / 160.0],
+            ),
+        ] {
+            let orig = Texture {
+                input,
+                uv,
+                ..Texture::full(1, [240, 160])
+            };
+            let prev = Texture { id: 2, ..orig };
+            let outputs = [Texture::full(3, [720, 480]), Texture::full(4, [720, 480])];
+            for index in 0..=outputs.len() {
+                let b = texture_bindings(
+                    orig,
+                    prev,
+                    &outputs[..index],
+                    ["Mask", "Colour"].into_iter(),
+                    SourceHistory {
+                        textures: &[],
+                        next: 0,
+                        ready: false,
+                    },
+                );
+                let source = b[""];
+                assert_eq!(
+                    source.id,
+                    if index == 0 {
+                        orig.id
+                    } else {
+                        outputs[index - 1].id
+                    }
+                );
+                assert_eq!(
+                    source.uniform_sizes(),
+                    if index == 0 {
+                        orig.uniform_sizes()
+                    } else {
+                        ([720.0, 480.0], [720.0, 480.0])
+                    }
+                );
+                assert_eq!(
+                    b["Orig"].uniform_sizes(),
+                    (input.map(|n| n as f32), [240.0, 160.0])
+                );
+                assert_eq!(b["Orig"].uv, uv);
+                assert_eq!(b[&format!("PassPrev{}", index + 1)].id, orig.id);
+                for (i, alias) in ["Mask", "Colour"].into_iter().take(index).enumerate() {
+                    assert_eq!(b[&format!("Pass{}", i + 1)].id, outputs[i].id);
+                    assert_eq!(b[&format!("PassPrev{}", index - i)].id, outputs[i].id);
+                    assert_eq!(b[alias].uv, [0.0, 0.0, 1.0, 1.0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_is_previous_source_frames_even_after_an_upscaling_pass() {
+        let orig = Texture::full(1, [240, 160]);
+        let prev = Texture::full(2, [240, 160]);
+        let history = (10..17)
+            .map(|id| Texture::full(id, [240, 160]))
+            .collect::<Vec<_>>();
+        let outputs = [Texture::full(3, [720, 480])];
+        for next in 0..7 {
+            let b = texture_bindings(
+                orig,
+                prev,
+                &outputs,
+                [""].into_iter(),
+                SourceHistory {
+                    textures: &history,
+                    next,
+                    ready: true,
+                },
+            );
+            for n in 0..7 {
+                let name = if n == 0 {
+                    "Prev".into()
+                } else {
+                    format!("Prev{n}")
+                };
+                assert_eq!(b[&name].id, history[(next + 6 - n) % 7].id);
+                assert_eq!(b[&name].uniform_sizes(), ([240.0, 160.0], [240.0, 160.0]));
+            }
+        }
+        let b = texture_bindings(
+            orig,
+            orig,
+            &outputs,
+            [""].into_iter(),
+            SourceHistory {
+                textures: &history,
+                next: 0,
+                ready: true,
+            },
+        );
+        assert!((0..7).all(|n| b[&if n == 0 {
+            "Prev".into()
+        } else {
+            format!("Prev{n}")
+        }]
+            .id
+            == orig.id));
+    }
+
+    #[test]
+    fn framebuffer_and_panel_matrices_flip_only_the_final_output() {
+        let size = [720, 480];
+        for fbo in [false, true] {
+            let m = matrix((0.0, 0.0, 720.0, 480.0), size, fbo);
+            for (x, y) in [(0.0, 0.0), (1.0, 1.0), (0.5, 0.5)] {
+                assert_eq!(m[0] * x + m[12], 2.0 * x - 1.0);
+                assert_eq!(
+                    m[5] * y + m[13],
+                    if fbo { 2.0 * y - 1.0 } else { 1.0 - 2.0 * y }
+                );
+            }
+        }
+    }
 
     #[test]
     fn texture_coordinates_cover_only_the_source_rectangle() {

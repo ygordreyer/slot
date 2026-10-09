@@ -3,8 +3,14 @@ shaders = 2
 shader0 = shaders/mgba/ags001.glsl
 filter_linear0 = false
 scale_type0 = source
-scale0 = 4.0
+scale0 = 3.0
 
 shader1 = shaders/mgba/ags001-light.glsl
-filter_linear1 = true
+filter_linear1 = false
 scale_type1 = viewport
+
+# Match the panel grid and avoid stacking a second darkening curve.
+parameters = LCD_SCALE;MASK_STRENGTH;lightBrightness
+LCD_SCALE = 3.0
+MASK_STRENGTH = 0.35
+lightBrightness = 0.5
