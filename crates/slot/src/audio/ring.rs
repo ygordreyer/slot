@@ -78,6 +78,19 @@ impl Ring {
         self.priming.store(false, Ordering::Relaxed);
     }
 
+    pub fn clear(&self) {
+        let mut i = self.lock();
+        i.head = 0;
+        i.len = 0;
+        i.pending.clear();
+        i.placed = 0;
+        i.pending_at = 0;
+        i.drained = 0;
+        self.queued.store(0, Ordering::Relaxed);
+        self.priming.store(true, Ordering::Relaxed);
+        self.room.notify_all();
+    }
+
     pub fn push(&self, samples: &[i16]) {
         let mut i = self.lock();
         let lost = write_into(&mut i, samples).len();

@@ -302,6 +302,8 @@ tasks:
       - cp vendor/slot-net/iw vendor/slot-net/*.so.* {{.OUT}}/System/slot-net/
       - cp card/System/* {{.OUT}}/System/
       - cp -r card/Shaders/. {{.OUT}}/Shaders/
+      - mkdir -p {{.OUT}}/Audio
+      - cp -r card/Audio/. {{.OUT}}/Audio/
       - file vendor/mgba_libretro.so | grep -q aarch64
       - file vendor/gpsp_libretro.so | grep -q aarch64
       - cp vendor/mgba_libretro.so {{.OUT}}/System/

@@ -14,7 +14,7 @@ const SND_PCM_FORMAT_S16_LE: c_int = 2;
 const SND_PCM_ACCESS_RW_INTERLEAVED: c_int = 3;
 const CHANNELS: c_uint = 2;
 
-const LATENCY_US: c_uint = 40_000;
+const LATENCY_MS: u32 = 40;
 
 const PERIOD_FRAMES: usize = 512;
 
@@ -81,7 +81,7 @@ impl Alsa {
         }
     }
 
-    fn open_pcm(&self, rate: u32) -> Result<*mut c_void, AudioError> {
+    fn open_pcm(&self, rate: u32, latency_ms: u32) -> Result<*mut c_void, AudioError> {
         let mut last = AudioError::NoDevice;
         for name in DEVICES {
             let Ok(cname) = CString::new(name) else {
@@ -101,7 +101,7 @@ impl Alsa {
                     CHANNELS,
                     rate,
                     1,
-                    LATENCY_US,
+                    latency_ms.saturating_mul(1000),
                 )
             };
             if err < 0 {
@@ -156,6 +156,10 @@ impl Drop for AlsaSink {
 
 impl AudioSink for AlsaSink {
     fn open(&mut self, sample_rate: u32) -> Result<(), AudioError> {
+        self.open_with_latency(sample_rate, LATENCY_MS)
+    }
+
+    fn open_with_latency(&mut self, sample_rate: u32, latency_ms: u32) -> Result<(), AudioError> {
         self.close();
         let ring = self.ring.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -163,7 +167,7 @@ impl AudioSink for AlsaSink {
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = std::thread::Builder::new()
             .name("slot-audio".into())
-            .spawn(move || match play(&ring, sample_rate) {
+            .spawn(move || match play(&ring, sample_rate, latency_ms) {
                 Ok(mut device) => {
                     let _ = ready_tx.send(Ok(()));
                     device.run(&ring, &flag);
@@ -222,16 +226,18 @@ struct Playback {
     alsa: Alsa,
     pcm: *mut c_void,
     rate: u32,
+    latency_ms: u32,
 }
 
-fn play(ring: &Arc<Ring>, sample_rate: u32) -> Result<Playback, AudioError> {
+fn play(ring: &Arc<Ring>, sample_rate: u32, latency_ms: u32) -> Result<Playback, AudioError> {
     let alsa = Alsa::load()?;
-    let pcm = alsa.open_pcm(sample_rate)?;
+    let pcm = alsa.open_pcm(sample_rate, latency_ms)?;
     ring.reopen(sample_rate);
     Ok(Playback {
         alsa,
         pcm,
         rate: sample_rate,
+        latency_ms,
     })
 }
 
@@ -300,7 +306,7 @@ impl Playback {
     }
 
     fn claim(&mut self) -> bool {
-        match self.alsa.open_pcm(self.rate) {
+        match self.alsa.open_pcm(self.rate, self.latency_ms) {
             Ok(pcm) => {
                 self.pcm = pcm;
                 true

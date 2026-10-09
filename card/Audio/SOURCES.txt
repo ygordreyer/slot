@@ -1,0 +1,37 @@
+ChipTuneEnhance.dsp
+Upstream: https://github.com/libretro/RetroArch/blob/master/libretro-common/audio/dsp_filters/ChipTuneEnhance.dsp
+Library: https://github.com/libretro/libretro-common/tree/master/audio/dsp_filters
+License: MIT
+Copyright (C) 2010-2020 The RetroArch team
+
+Native ports:
+  audio/dsp_filters/eq.c and audio/dsp_filters/fft/fft.c -> audio/dsp.rs, audio/fft.rs
+  audio/dsp_filters/reverb.c, iir.c, panning.c -> audio/dsp.rs
+  audio/resampler/drivers/sinc_resampler.c, include/filters.h -> audio/sinc.rs, audio/fft.rs
+Rust paths above are relative to crates/slot/src/.
+The complete copyright and permission notices are retained in each port.
+
+Reference fixture generator (from repository root):
+  python3 crates/slot/tests/audio_reference.py --golden
+Requires cc and the supplied reference copies in target/ref/ra-audio/.
+The generator compiles those copies directly, supplies minimal ABI headers, and
+uses their float processing entry points with SIMD disabled and FP contraction off.
+No int16 reference path is used. FFT is included by eq.c.
+Fixtures: crates/slot/tests/fixtures/audio/*.f32le, little endian IEEE f32 stereo.
+Each DSP fixture uses 4096 frames of swept sine plus deterministic LCG noise at
+32768 Hz. Sinc HIGHER outputs 48000 Hz, with a separate +0.4% ratio change halfway.
+The live equivalence check uses 8192 input frames:
+  python3 crates/slot/tests/audio_reference.py
+  cargo test --offline -p slot --test audio_look reference_live_equivalence -- --ignored --nocapture
+Host benchmark:
+  cargo test --offline --release -p slot --test audio_look benchmark_ten_seconds -- --ignored --nocapture
+
+These supplied references include local safety and allocation changes. Their
+hashes pin the actual inputs used rather than claiming an unverified upstream revision:
+db5b19c1c27b4ca613909f61b8b2e3feea11b15ebf40442c9e7537b1b9950ffa  ChipTuneEnhance.dsp
+d886d13e1438ba051a1c8be960b406c00cdf4e0453d2845e93527e584be5cbcb  eq.c
+16824f0037c40aa675b94a490395177555b9e63bc437007a4639d00b4f933ca0  fft.c
+77d4ea161e8471098fc54f82420af1b57c42aed84a2d9f12a30fab14ed2f9ceb  reverb.c
+37fd9925b37bd2a49fb9a33c8ee65798bce81b04e91d38265b6c583a598a8b72  iir.c
+2e9b6a86cad8a8116d12b670e7ef4aee1ad870051afc5ff3ba113325f193c579  panning.c
+d679f8ef8e38f177cb909b83ada1167631f2ef3a8edef7ce9917c8e2c51972d4  sinc_resampler.c

@@ -10,7 +10,8 @@ use slot_retro::{
     ButtonMask, Link, LinkChannel, RetroCore, Rumble, GBA_H, GBA_W, NETPACKET_RELIABLE,
 };
 
-use crate::audio::Ring;
+use crate::audio::look::LookProcessor;
+use crate::audio::{AudioLook, AudioLookError, Ring};
 use crate::drc::{drc_ratio, drc_target};
 use crate::frames::{FrameRef, Frames};
 use crate::link_state;
@@ -72,6 +73,8 @@ pub struct EmuHandle {
 }
 
 enum Cmd {
+    SuspendAudio(Sender<()>),
+    SetAudioLook(Option<AudioLook>, Sender<Result<(), AudioLookError>>),
     Load(Vec<u8>),
     Save(Sender<Vec<u8>>),
     Sav(Sender<Option<Vec<u8>>>),
@@ -86,6 +89,79 @@ enum Cmd {
     SetCheats(Vec<String>),
 }
 
+struct WorkerAudio {
+    baseline: Resampler,
+    look: Option<LookProcessor>,
+    suspended: bool,
+    out: Vec<i16>,
+    input_rate: f64,
+    clock_rate: f64,
+}
+impl WorkerAudio {
+    fn new(input_rate: f64, clock_rate: f64, output_rate: f64) -> Self {
+        Self {
+            baseline: Resampler::new(clock_rate, output_rate),
+            look: None,
+            suspended: false,
+            out: Vec::new(),
+            input_rate,
+            clock_rate,
+        }
+    }
+    fn apply(&mut self, cmd: Cmd, ring: &Ring) -> Option<Cmd> {
+        match cmd {
+            Cmd::SuspendAudio(reply) => {
+                self.suspended = true;
+                ring.clear();
+                let _ = reply.send(());
+            }
+            Cmd::SetAudioLook(look, reply) => {
+                let output_hz = match ring.sample_rate() {
+                    0 => self.input_rate,
+                    hz => hz as f64,
+                };
+                let result = look
+                    .as_ref()
+                    .map(|look| {
+                        LookProcessor::new(look, self.input_rate, self.clock_rate, output_hz as u32)
+                    })
+                    .transpose();
+                match result {
+                    Ok(processor) => {
+                        self.look = processor;
+                        self.baseline = Resampler::new(self.clock_rate, output_hz);
+                        self.out.clear();
+                        ring.clear();
+                        ring.clear_faults();
+                        self.suspended = false;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+            }
+            cmd => return Some(cmd),
+        }
+        None
+    }
+    fn process(&mut self, input: &[i16], ratio: f64, volume: u8, ring: &Ring) {
+        if let Some(processor) = &mut self.look {
+            processor.process(
+                input,
+                ratio,
+                crate::audio::volume::gain(volume),
+                &mut |samples| ring.push_blocking(samples),
+            );
+        } else {
+            self.baseline.set_ratio(ratio);
+            self.baseline.process(input, &mut self.out);
+            crate::audio::volume::apply(&mut self.out, volume);
+            ring.push_blocking(&self.out);
+        }
+    }
+}
+
 struct Shared {
     input: AtomicU16,
     speed: AtomicU8,
@@ -95,6 +171,8 @@ struct Shared {
     rewind_fill: AtomicU8,
     stop: AtomicBool,
     volume: AtomicU8,
+    #[cfg(test)]
+    audio_look_commands: AtomicU64,
     fast_steps: AtomicU32,
     ff_sound: AtomicBool,
     published: AtomicU64,
@@ -161,6 +239,8 @@ impl EmuHandle {
             rewind_fill: AtomicU8::new(0),
             stop: AtomicBool::new(false),
             volume: AtomicU8::new(100),
+            #[cfg(test)]
+            audio_look_commands: AtomicU64::new(0),
             fast_steps: AtomicU32::new(FAST_STEPS),
             ff_sound: AtomicBool::new(false),
             published: AtomicU64::new(0),
@@ -243,6 +323,33 @@ impl EmuHandle {
 
     pub fn end_link(&self) {
         request(&self.cmds, &self.shared, Cmd::EndLink);
+    }
+
+    pub fn suspend_audio(&self) -> Result<(), AudioLookError> {
+        let (tx, rx) = channel();
+        if !request(&self.cmds, &self.shared, Cmd::SuspendAudio(tx)) {
+            return Err(AudioLookError("emulator worker stopped".into()));
+        }
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|e| AudioLookError(format!("suspend audio: {e}")))
+    }
+
+    pub fn set_audio_look(&self, look: Option<AudioLook>) -> Result<(), AudioLookError> {
+        #[cfg(test)]
+        self.shared
+            .audio_look_commands
+            .fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = channel();
+        if !request(&self.cmds, &self.shared, Cmd::SetAudioLook(look, tx)) {
+            return Err(AudioLookError("emulator worker stopped".into()));
+        }
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|e| AudioLookError(format!("install audio look: {e}")))?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn audio_look_commands(&self) -> u64 {
+        self.shared.audio_look_commands.load(Ordering::Relaxed)
     }
 
     pub fn set_option(&self, key: &str, value: &str) {
@@ -551,13 +658,12 @@ impl Worker {
             fps if fps > 0.0 => av.sample_rate / (fps * PRESENT.as_secs_f64()),
             _ => av.sample_rate,
         };
-        let mut resampler = Resampler::new(core_hz, device_hz);
+        let mut audio_path = WorkerAudio::new(av.sample_rate, core_hz, device_hz);
         ring.clear_faults();
         self.shared
             .state
             .store(CoreState::Ready as u8, Ordering::Release);
 
-        let mut out = Vec::new();
         let mut gated = (false, false);
         let rewind = RewindThread::spawn(REWIND_BYTES);
         let mut since_snapshot = 0;
@@ -582,7 +688,9 @@ impl Worker {
         let mut ff = (0u32, 0u32, Duration::ZERO, Instant::now());
         while !self.shared.stop.load(Ordering::Relaxed) {
             for cmd in self.cmds.try_iter() {
-                self.apply(cmd, core.as_mut(), &mut transport, &mut cable, &link);
+                if let Some(cmd) = audio_path.apply(cmd, &ring) {
+                    self.apply(cmd, core.as_mut(), &mut transport, &mut cable, &link);
+                }
             }
 
             if let Some(t) = transport.as_mut() {
@@ -798,7 +906,7 @@ impl Worker {
                 }
 
                 let mut audio = core.take_audio();
-                if speed == Speed::Normal || ff_sound {
+                if !audio_path.suspended && (speed == Speed::Normal || ff_sound) {
                     let target = drc_target(ring.capacity_frames());
                     let queued = ring.queued_frames();
                     if lock && scale == 0.0 {
@@ -806,15 +914,9 @@ impl Worker {
                             / PRESENT.as_nanos() as f64;
                     }
                     let base = if lock { scale } else { 1.0 };
-                    resampler.set_ratio(
-                        drc_ratio(queued, target) * base * f64::from(span) / f64::from(ran),
-                    );
-                    resampler.process(&audio, &mut out);
-                    crate::audio::volume::apply(
-                        &mut out,
-                        self.shared.volume.load(Ordering::Relaxed),
-                    );
-                    ring.push_blocking(&out);
+                    let ratio = drc_ratio(queued, target) * base * f64::from(span) / f64::from(ran);
+                    let volume = self.shared.volume.load(Ordering::Relaxed);
+                    audio_path.process(&audio, ratio, volume, &ring);
                     paced += 1;
                     if crate::session::trace() && paced.is_multiple_of(TRACE_EVERY) {
                         let (dropped, starved) = (ring.overruns(), ring.underruns());
@@ -844,7 +946,15 @@ impl Worker {
                         }
                         Wait::Request => {
                             for cmd in self.cmds.try_iter() {
-                                self.apply(cmd, core.as_mut(), &mut transport, &mut cable, &link);
+                                if let Some(cmd) = audio_path.apply(cmd, &ring) {
+                                    self.apply(
+                                        cmd,
+                                        core.as_mut(),
+                                        &mut transport,
+                                        &mut cable,
+                                        &link,
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -886,6 +996,9 @@ impl Worker {
         link: &Link,
     ) {
         match cmd {
+            Cmd::SuspendAudio(_) | Cmd::SetAudioLook(_, _) => {
+                unreachable!("audio commands handled by worker loop")
+            }
             Cmd::Save(reply) => match core.serialize() {
                 Ok(state) => {
                     let _ = reply.send(self.for_card(state));
@@ -1350,5 +1463,43 @@ mod tests {
         assert_eq!(link.take_inbound().as_deref(), Some(&b"one"[..]));
         assert_eq!(link.take_inbound().as_deref(), Some(&b"two"[..]));
         assert_eq!(link.take_inbound(), None);
+    }
+}
+
+#[cfg(test)]
+mod audio_path_tests {
+    use super::*;
+    use crate::audio::look::ResamplerKind;
+
+    #[test]
+    fn rate_change_uses_actual_sink_rate_and_none_restores_linear() {
+        let ring = Ring::new(0);
+        ring.reopen(44100);
+        let mut path = WorkerAudio::new(32768.0, 32768.0, 32768.0);
+        let (tx, rx) = channel();
+        path.apply(
+            Cmd::SetAudioLook(
+                Some(AudioLook {
+                    rate: Some(48000),
+                    resampler: Some(ResamplerKind::Linear),
+                    ..AudioLook::default()
+                }),
+                tx,
+            ),
+            &ring,
+        );
+        rx.recv().unwrap().unwrap();
+        path.process(&[1234; 2048], 1.0, 100, &ring);
+        assert_eq!(ring.queued_frames(), 1379);
+        ring.reopen(32768);
+        let (tx, rx) = channel();
+        path.apply(Cmd::SetAudioLook(None, tx), &ring);
+        rx.recv().unwrap().unwrap();
+        assert!(path.look.is_none());
+        assert!(!path.suspended);
+        path.process(&[1234; 2048], 1.0, 100, &ring);
+        assert_eq!(ring.queued_frames(), 1024);
+        assert_eq!(path.out[0], 0);
+        assert!(path.out[2..].iter().all(|&x| x == 1234));
     }
 }
