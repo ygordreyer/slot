@@ -22,7 +22,8 @@ pub(crate) fn prepare(bytes: &[u8], platform: Platform) -> Result<Vec<u8>, Error
         (Platform::Gba, 1000, 574) => (137, 130, 865, 497),
         (Platform::Gba, 600, 355) => (82, 82, 520, 305),
         (Platform::Gba, 473, 283) => (69, 68, 402, 246),
-        (Platform::Gba, ..) if w >= 390 && (1.65..=1.80).contains(&aspect) => (
+        (Platform::Gba, 999, 925) => (100, 468, 900, 883),
+        (Platform::Gba, ..) if w >= 300 && (1.65..=1.80).contains(&aspect) => (
             w * 137 / 1000,
             h * 226 / 1000,
             w * 865 / 1000,
