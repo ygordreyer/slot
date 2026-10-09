@@ -187,6 +187,14 @@ impl Frontend {
             })
             .collect();
         self.session.app_mut().set_faces(faces);
+        let star = slot_ui::favorite_star_face();
+        let star = compositor.create_texture(star.w, star.h, &star.rgba);
+        self.session.app_mut().set_favorite_star(star);
+        let empty = word_face(crate::app::EMPTY_FAVORITES_TEXT);
+        let empty_id = compositor.create_texture(empty.w, empty.h, &empty.rgba);
+        self.session
+            .app_mut()
+            .set_empty_favorites_face(empty_id, empty.w);
         let icons = Icon::ALL
             .iter()
             .map(|i| {
@@ -465,14 +473,14 @@ impl Frontend {
         let Some(ready) = self.labels.take() else {
             return;
         };
-        let Some(path) = ready.cart.label else {
+        let Some(path) = ready.cart.label.clone() else {
             return;
         };
         let app = self.session.app_mut();
         if let Some(tex) = app.attach_label(&ready.cart.rom, path) {
             compositor.update_texture(tex, ready.face.w, ready.face.h, &ready.face.rgba);
-            if self.core_asked.as_deref() == Some(ready.cart.stem.as_str())
-                || self.core_built.as_deref() == Some(ready.cart.stem.as_str())
+            if self.core_asked.as_deref() == Some(ready.cart.key().as_str())
+                || self.core_built.as_deref() == Some(ready.cart.key().as_str())
             {
                 self.core_asked = None;
                 self.core_built = None;
@@ -870,21 +878,18 @@ fn sync_core_picker(
     lid: &mut Option<TexId>,
     built: &mut Option<String>,
 ) {
-    let highlighted = app.selected_stem().map(str::to_string);
-    if highlighted.is_some() && *asked != highlighted {
-        if let Some(cart) = app
-            .carts()
-            .find(|c| highlighted.as_deref() == Some(c.stem.as_str()))
-        {
+    let highlighted = app.selected_key_ref();
+    if highlighted.is_some() && asked.as_deref() != highlighted {
+        if let Some(cart) = app.selected_cart() {
             builder.request(cart.clone());
         }
-        *asked = highlighted.clone();
+        *asked = highlighted.map(str::to_owned);
     }
     let Some(faces) = builder.take() else {
         return;
     };
-    if highlighted.as_deref() != Some(faces.stem.as_str())
-        || *built == highlighted
+    if highlighted != Some(faces.key.as_str())
+        || built.as_deref() == highlighted
         || !app.carts().any(|cart| faces.is_for(cart))
     {
         return;
@@ -898,7 +903,7 @@ fn sync_core_picker(
     );
     let lid_id = upload_rgba(compositor, lid, faces.lid.w, faces.lid.h, &faces.lid.rgba);
     app.set_core_board_faces(board_id, lid_id);
-    *built = Some(faces.stem);
+    *built = Some(faces.key);
 }
 
 fn upload(compositor: &mut Compositor, slot: &mut Option<TexId>, face: slot_ui::UndoFace) -> TexId {

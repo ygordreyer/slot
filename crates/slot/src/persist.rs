@@ -54,6 +54,7 @@ pub fn eject(
     flush(root, platform, core, stem, state, sav)?;
     let mut slot = read_slot_state(root);
     slot.cart = None;
+    slot.cart_key = None;
     slot.cart_platform = None;
     write_slot_state(root, &slot)
 }

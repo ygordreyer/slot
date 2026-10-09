@@ -76,10 +76,10 @@ fn upload_faces(app: &mut App, c: &mut Compositor) {
     .collect();
     app.set_core_legend_faces(legend);
 
-    let highlighted = app.selected_stem().map(str::to_string);
+    let highlighted = app.selected_key();
     let Some(cart) = app
         .carts()
-        .find(|c| highlighted.as_deref() == Some(c.stem.as_str()))
+        .find(|c| highlighted.as_deref() == Some(c.key().as_str()))
         .cloned()
     else {
         return;
@@ -264,4 +264,65 @@ fn paper(px: &[u8], ink: [u8; 3]) -> usize {
     px.chunks(4)
         .filter(|p| (0..3).all(|k| p[k].abs_diff(ink[k]) <= 24))
         .count()
+}
+
+#[test]
+fn favorites_empty_text_is_centered_and_the_star_is_a_shared_gold_texture() {
+    let Some((_guard, _surface, mut c)) = compositor() else {
+        eprintln!("headless GL unavailable, favorite pixel check skipped");
+        return;
+    };
+    let root = common::tmp_root_with_carts(&["Alpha", "Beta"]);
+    let mut app = shelf(&root, &mut c);
+    let star = slot_ui::favorite_star_face();
+    let star_id = tex(&mut c, star.w, star.h, &star.rgba);
+    app.set_favorite_star(star_id);
+    let empty = slot_ui::word_face(slot::app::EMPTY_FAVORITES_TEXT);
+    let empty_id = tex(&mut c, empty.w, empty.h, &empty.rgba);
+    app.set_empty_favorites_face(empty_id, empty.w);
+    app.apply(Action::GbaDown(Btn::L1));
+    let mut draws = Vec::new();
+    app.draw(&mut draws);
+    let (x, y, w, h) = draws
+        .iter()
+        .find_map(|draw| match *draw {
+            slot_ui::Draw::Tex {
+                x, y, w, h, tex, ..
+            } if tex == empty_id => Some((x, y, w, h)),
+            _ => None,
+        })
+        .expect("empty Favorites text missing");
+    assert!((x + w / 2.0 - OUT_W as f32 / 2.0).abs() < 0.001);
+    assert!((y + h / 2.0 - OUT_H as f32 / 2.0).abs() < 0.001);
+    assert!(w <= OUT_W as f32 - 48.0);
+    let empty_shot = shot(&app, &mut c, "empty-favorites");
+    assert!(
+        empty_shot
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > 20 && pixel[1] > 20 && pixel[2] > 20)
+            .count()
+            > 20
+    );
+    app.apply(Action::GbaDown(Btn::R1));
+    app.apply(Action::GbaDown(Btn::Y));
+    draws.clear();
+    app.draw(&mut draws);
+    assert!(draws
+        .iter()
+        .any(|draw| matches!(draw, slot_ui::Draw::Tex { tex, .. } if *tex == star_id)));
+    let marked = shot(&app, &mut c, "favorite-star");
+    let gold = marked
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] > 180 && pixel[1] > 140 && pixel[2] < 130)
+        .count();
+    assert!(gold > 20, "no gold favorite marker: {gold} pixels");
+    app.apply(Action::GbaDown(Btn::L1));
+    draws.clear();
+    app.draw(&mut draws);
+    assert!(draws
+        .iter()
+        .any(|draw| matches!(draw, slot_ui::Draw::Tex { tex, .. } if *tex == star_id)));
+    assert!(!draws
+        .iter()
+        .any(|draw| matches!(draw, slot_ui::Draw::Tex { tex, .. } if *tex == empty_id)));
 }

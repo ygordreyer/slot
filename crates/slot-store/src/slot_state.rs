@@ -17,6 +17,7 @@ pub const FF_SPEED_DEFAULT: u8 = 6;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SlotState {
     pub cart: Option<String>,
+    pub cart_key: Option<String>,
     pub cart_platform: Option<Platform>,
     pub brightness: u8,
     pub blue_light: u8,
@@ -44,6 +45,7 @@ impl Default for SlotState {
     fn default() -> Self {
         SlotState {
             cart: None,
+            cart_key: None,
             cart_platform: None,
             brightness: 5,
             blue_light: 0,
@@ -78,8 +80,9 @@ pub fn read_slot_state(root: &Path) -> SlotState {
 
 pub fn write_slot_state(root: &Path, s: &SlotState) -> std::io::Result<()> {
     let text = format!(
-        "cart={}\ncart_platform={}\nbrightness={}\nblue_light={}\nvolume={}\nvolume_hp={}\nmuted={}\nmuted_hp={}\nclock_set={}\nutc_offset_min={}\nrumble={}\nff_speed={}\nff_sound={}\ncolour_correction={}\nhome_wifi_enabled={}\nshader={}\nclock_12h={}\n",
+        "cart={}\ncart_key={}\ncart_platform={}\nbrightness={}\nblue_light={}\nvolume={}\nvolume_hp={}\nmuted={}\nmuted_hp={}\nclock_set={}\nutc_offset_min={}\nrumble={}\nff_speed={}\nff_sound={}\ncolour_correction={}\nhome_wifi_enabled={}\nshader={}\nclock_12h={}\n",
         s.cart.as_deref().unwrap_or(""),
+        s.cart_key.as_deref().unwrap_or(""),
         s.cart_platform.map_or(String::new(), platform_key),
         s.brightness,
         s.blue_light,
@@ -102,6 +105,7 @@ pub fn write_slot_state(root: &Path, s: &SlotState) -> std::io::Result<()> {
 
 fn parse(text: &str) -> Option<SlotState> {
     let mut cart = None;
+    let mut cart_key = None;
     let mut cart_platform = None;
     let mut brightness = None;
     let mut blue_light = None;
@@ -124,6 +128,7 @@ fn parse(text: &str) -> Option<SlotState> {
         };
         match key {
             "cart" => cart = Some(value.to_string()),
+            "cart_key" => cart_key = (!value.is_empty()).then(|| value.to_string()),
             "cart_platform" => cart_platform = platform_value(value),
             "brightness" => brightness = Some(level(value, BRIGHTNESS_MAX)?),
             "blue_light" => blue_light = Some(level(value, BLUE_LIGHT_MAX)?),
@@ -147,6 +152,7 @@ fn parse(text: &str) -> Option<SlotState> {
     let fallback = SlotState::default();
     Some(SlotState {
         cart: (!cart.is_empty()).then_some(cart),
+        cart_key,
         cart_platform,
         brightness: brightness?,
         blue_light: blue_light?,

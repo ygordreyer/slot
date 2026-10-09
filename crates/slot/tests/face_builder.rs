@@ -78,3 +78,20 @@ fn the_newest_request_of_a_burst_is_the_last_built() {
         "a build older than the newest came back after it"
     );
 }
+
+#[test]
+fn built_artwork_rejects_same_stem_on_another_platform_or_rom() {
+    let builder = FaceBuilder::spawn();
+    let source = cart("Tetris");
+    builder.request(source.clone());
+    let got = collect(&builder, 1);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].key, source.key());
+    let mut other = source.clone();
+    other.platform = Platform::Gb;
+    other.rom = "Games/GB/Tetris.gb".into();
+    assert!(!got[0].is_for(&other));
+    other = source;
+    other.rom = "Games/GBA/Tetris.GBA".into();
+    assert!(!got[0].is_for(&other));
+}

@@ -250,6 +250,8 @@ fn the_shoulders_ring_over_a_shelf_for_each_system() {
     }
 
     tap(&mut f, &mut input, Btn::R1);
+    assert!(f.app().empty_favorites());
+    tap(&mut f, &mut input, Btn::R1);
     let_the_name_in(&mut f, &mut c, &mut input);
     let back = composed(&mut f, &mut c, "gba-again");
     assert!(
@@ -349,7 +351,7 @@ fn a_card_nobody_has_organised_comes_up_an_empty_shelf() {
 }
 
 #[test]
-fn a_card_on_one_shelf_leaves_the_corner_empty() {
+fn a_card_with_only_gba_carts_names_gba_and_favorites() {
     let Ok(surface) = HeadlessSurface::new() else {
         return;
     };
@@ -363,20 +365,15 @@ fn a_card_on_one_shelf_leaves_the_corner_empty() {
     f.upload_faces(&mut c);
     let mut input = Script(VecDeque::new());
     f.advance(&mut input);
+    let_the_name_in(&mut f, &mut c, &mut input);
     let bare = composed(&mut f, &mut c, "one-shelf");
-    assert_eq!(
-        name_ink(&bare),
-        0,
-        "a card with one shelf named it in the slot: {} lit pixels",
-        name_ink(&bare)
-    );
+    assert!(name_ink(&bare) > 20, "GBA name missing");
     tap(&mut f, &mut input, Btn::R1);
-    let pressed = composed(&mut f, &mut c, "one-shelf-after-r1");
-    assert_eq!(
-        name_ink(&pressed),
-        0,
-        "R1 named a shelf on a card that has only one"
-    );
+    let_the_name_in(&mut f, &mut c, &mut input);
+    assert!(f.app().empty_favorites());
+    let pressed = composed(&mut f, &mut c, "favorites-after-r1");
+    assert!(name_ink(&pressed) > 20, "Favorites name missing");
+    assert_ne!(name_pixels(&bare), name_pixels(&pressed));
 
     let two = tmp_root_with_carts(&["Emerald", "Fusion"]);
     put_game_boy_carts(two.path());

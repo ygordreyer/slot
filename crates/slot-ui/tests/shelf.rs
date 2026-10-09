@@ -294,11 +294,11 @@ fn the_shelf_says_where_its_selected_cart_stands() {
             for _ in 0..frames {
                 s.update(1.0 / 60.0);
             }
-            let stem = s.carts[s.index].stem.clone();
+            let key = s.carts[s.index].key();
             let mut whole = Vec::new();
             s.draw_row(None, 0.0, 0.0, 1.0, &mut whole);
             let mut without = Vec::new();
-            s.draw_row(Some(&stem), 0.0, 0.0, 1.0, &mut without);
+            s.draw_row(Some(&key), 0.0, 0.0, 1.0, &mut without);
             let dropped: Vec<(f32, f32)> = whole
                 .iter()
                 .map(xw)
@@ -677,7 +677,7 @@ fn the_row_parts_for_the_cart_going_in() {
     let s = shelf_with(5);
     let at = |recede: f32| {
         let mut out = Vec::new();
-        s.draw_row(Some("Game 0"), 0.0, recede, 1.0, &mut out);
+        s.draw_row(Some("Games/GBA/Game 0.gba"), 0.0, recede, 1.0, &mut out);
         out
     };
     let start = at(0.0);
@@ -710,7 +710,7 @@ fn dim_darkens_a_side_carts_face_and_not_the_black_under_it() {
     s.set_faces(vec![TexId::from_raw(10), side, TexId::from_raw(12)]);
     let drawn = |dim: f32| {
         let mut out = Vec::new();
-        s.draw_row(Some("Game 0"), 0.0, 0.3, dim, &mut out);
+        s.draw_row(Some("Games/GBA/Game 0.gba"), 0.0, 0.3, dim, &mut out);
         let (x, face) = out
             .iter()
             .find_map(|d| match *d {
@@ -890,4 +890,130 @@ fn a_cart_pushed_onto_the_row_draws_rather_than_stopping_the_device() {
         2,
         "the row holding a cart the shells never heard of did not draw both its neighbours"
     );
+}
+
+#[test]
+fn favorite_marker_tracks_cart_geometry_scale_alpha_shake_and_dim() {
+    let mut carts = shelf_with(3).carts;
+    carts[1].platform = Platform::Gb;
+    carts[1].rom = "Games/GB/Game 1.gb".into();
+    carts[2].platform = Platform::Gbc;
+    carts[2].rom = "Games/GBC/Game 2.gbc".into();
+    let keys = carts.iter().map(Cart::key).collect();
+    let faces: Vec<_> = (20..23).map(TexId::from_raw).collect();
+    let star = TexId::from_raw(80);
+    let mut shelf = Shelf::new(carts);
+    shelf.set_faces(faces.clone());
+    shelf.set_favorites(&keys);
+    shelf.set_favorite_star(star);
+    for turn in 0..5 {
+        shelf.right();
+        for _ in 0..turn {
+            shelf.update(1.0 / 60.0);
+        }
+        for recede in [0.0, 0.3, 0.8, 1.0] {
+            for dim in [1.0, 0.4, 0.0] {
+                let mut row = Vec::new();
+                shelf.draw_row(None, 7.0, recede, dim, &mut row);
+                let mut markers = 0;
+                let mut carts = 0;
+                for (i, draw) in row.iter().enumerate() {
+                    if let Draw::Tex { tex, .. } = draw {
+                        if *tex == star {
+                            markers += 1;
+                        }
+                    }
+                    let Draw::Tex {
+                        x,
+                        y,
+                        w,
+                        alpha,
+                        tex,
+                        ..
+                    } = *draw
+                    else {
+                        continue;
+                    };
+                    let Some(at) = faces.iter().position(|face| *face == tex) else {
+                        continue;
+                    };
+                    carts += 1;
+                    let scale = w / slot_ui::cart_box(shelf.carts[at].platform).0 as f32;
+                    let Draw::Tex {
+                        x: sx,
+                        y: sy,
+                        w: sw,
+                        h: sh,
+                        alpha: sa,
+                        tex: st,
+                    } = row[i + 1]
+                    else {
+                        panic!("favorite cart has no marker");
+                    };
+                    assert_eq!(st, star);
+                    assert!((sw - slot_ui::FAVORITE_STAR_PX as f32 * scale).abs() < 0.001);
+                    assert_eq!(sw, sh);
+                    assert!(
+                        (sx - (x + w
+                            - (slot_ui::FAVORITE_STAR_PX as f32 + slot_ui::FAVORITE_STAR_INSET)
+                                * scale))
+                            .abs()
+                            < 0.001
+                    );
+                    assert!((sy - (y + slot_ui::FAVORITE_STAR_INSET * scale)).abs() < 0.001);
+                    assert_eq!(sa, alpha);
+                }
+                assert_eq!(markers, carts);
+                if recede == 1.0 {
+                    assert_eq!(markers, 0);
+                }
+            }
+        }
+    }
+    let key = shelf.carts[shelf.index].key();
+    shelf.set_favorites(&std::collections::BTreeSet::new());
+    let mut row = Vec::new();
+    shelf.draw_row(Some(&key), 0.0, 0.0, 1.0, &mut row);
+    assert!(!row
+        .iter()
+        .any(|draw| matches!(draw, Draw::Tex { tex, .. } if *tex == star)));
+}
+
+#[test]
+fn shelf_find_and_hidden_cart_use_rom_identity() {
+    let mut carts = shelf_with(2).carts;
+    carts[1].stem = carts[0].stem.clone();
+    carts[1].platform = Platform::Gb;
+    carts[1].rom = "Games/GB/Game 0.gb".into();
+    let mut shelf = Shelf::new(carts);
+    let a = TexId::from_raw(40);
+    let b = TexId::from_raw(41);
+    shelf.set_faces(vec![a, b]);
+    let key = shelf.carts[1].key();
+    assert_eq!(shelf.find(&key).unwrap().1, Some(b));
+    assert_eq!(shelf.find(&key).unwrap().0.platform, Platform::Gb);
+    let mut row = Vec::new();
+    shelf.draw_row(Some(&key), 0.0, 0.0, 1.0, &mut row);
+    assert!(row
+        .iter()
+        .any(|draw| matches!(draw, Draw::Tex { tex, .. } if *tex == a)));
+    assert!(!row
+        .iter()
+        .any(|draw| matches!(draw, Draw::Tex { tex, .. } if *tex == b)));
+}
+
+#[test]
+fn shared_favorite_star_raster_has_gold_ink_and_transparent_corners() {
+    let star = slot_ui::favorite_star_face();
+    assert_eq!(
+        (star.w, star.h),
+        (slot_ui::FAVORITE_STAR_PX, slot_ui::FAVORITE_STAR_PX)
+    );
+    assert_eq!(star.rgba[3], 0);
+    let gold = star
+        .rgba
+        .chunks_exact(4)
+        .filter(|pixel| pixel[0] > 200 && pixel[1] > 150 && pixel[2] < 130 && pixel[3] > 200)
+        .count();
+    assert!(gold > 100, "no gold star raster: {gold} pixels");
 }

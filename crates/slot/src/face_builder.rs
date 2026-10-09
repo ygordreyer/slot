@@ -7,13 +7,14 @@ use slot_ui::{board_face, cart_face, padded, CartFace, TURN_PAD};
 pub struct BuiltFaces {
     pub label: Option<std::path::PathBuf>,
     pub stem: String,
+    pub key: String,
     pub board: CartFace,
     pub lid: CartFace,
 }
 
 impl BuiltFaces {
     pub fn is_for(&self, cart: &Cart) -> bool {
-        self.stem == cart.stem && self.label == cart.label
+        self.key == cart.key() && self.label == cart.label
     }
 }
 
@@ -35,6 +36,7 @@ impl FaceBuilder {
                     }
                     let faces = BuiltFaces {
                         stem: cart.stem.clone(),
+                        key: cart.key(),
                         label: cart.label.clone(),
                         board: board_face(&cart),
                         lid: padded(&cart_face(&cart), TURN_PAD),

@@ -84,7 +84,7 @@ pub use quick_menu::{
     QUICK_TOP,
 };
 pub use refusal::Refusal;
-pub use shelf::{foot_y, rest_y, Shelf};
+pub use shelf::{favorite_star_face, foot_y, rest_y, Shelf, FAVORITE_STAR_INSET, FAVORITE_STAR_PX};
 pub use shell::{
     gb_table_shells, gba_shell_for, lookup_order_is_exact_then_family_then_default, shell_for,
     shell_presets, table_keys, Finish, Shell, DEFAULT_SHELL, DMG_SHELL, DUAL_MODE_SHELL,

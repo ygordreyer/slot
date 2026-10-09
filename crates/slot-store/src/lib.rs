@@ -3,6 +3,7 @@ pub mod cart_shell;
 mod cheats;
 mod config;
 mod core;
+pub mod favorites;
 pub mod gb;
 mod gba;
 pub mod ini;
