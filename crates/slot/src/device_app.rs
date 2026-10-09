@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slot::frontend::Frontend;
@@ -7,6 +8,20 @@ use slot_gfx::{Compositor, FbdevSurface, Surface};
 use slot_power::{trace_first_frame, DevicePlatform};
 
 const CARD: &str = "/mnt/sdcard";
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn stop(_signal: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
+
+struct DeviceDozePolicy;
+
+impl slot::app::DozePolicy for DeviceDozePolicy {
+    fn keep_awake(&self) -> bool {
+        std::path::Path::new("/run/slop-awake").exists()
+    }
+}
 
 const MIN_FRAME: Duration = Duration::from_millis(12);
 
@@ -64,6 +79,10 @@ impl Pacer {
 }
 
 pub fn run() {
+    unsafe {
+        libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);
+    }
     let root = std::env::var_os("SLOT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(CARD));
@@ -85,6 +104,7 @@ pub fn run() {
     eprintln!("slot: {}", platform.report());
     platform.trace_boot();
     let mut frontend = Frontend::boot(Box::new(platform));
+    frontend.set_doze_policy(Box::new(DeviceDozePolicy));
     frontend.upload_faces(&mut compositor);
     let mut input = DeviceInput::open(&root);
     let card = root.clone();
@@ -96,6 +116,17 @@ pub fn run() {
     let mut pacer = Pacer::new();
     let (mut frames, mut missed, mut early) = (0u32, 0u32, 0u32);
     loop {
+        if frontend.stop_requested(&STOP) {
+            unsafe { libc::sync() };
+            let saved = frontend.exit_saved() == Some(true);
+            let outcome = if saved { "saved" } else { "save incomplete" };
+            eprintln!(
+                "slot: sigterm: pid {}: {outcome}, exiting",
+                std::process::id()
+            );
+            // Process exit releases these handles; audio-driver Drop can wait indefinitely.
+            std::process::exit(if saved { 0 } else { 1 });
+        }
         pacer.wait();
         let began = Instant::now();
         frontend.advance(&mut input);

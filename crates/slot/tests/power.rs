@@ -19,6 +19,137 @@ use slot::link_radio::{RadioJob, RadioJobs};
 const FRAME_MS: Millis = 16;
 const DT: f32 = 1.0 / 60.0;
 
+struct ExitCapture {
+    missing_state: bool,
+    stalled_sram: bool,
+}
+
+impl slot::persist::Snapshot for ExitCapture {
+    fn state(&self) -> Option<Vec<u8>> {
+        (!self.missing_state).then(|| b"exit state".to_vec())
+    }
+
+    fn save_ram(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn save_ram_before(&self, deadline: Option<Instant>) -> Option<Vec<u8>> {
+        if self.stalled_sram {
+            let deadline = deadline.expect("exit deadline");
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        }
+        None
+    }
+
+    fn thumb(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn load(&self, _state: Vec<u8>) {}
+}
+
+#[test]
+fn exit_flush_reports_capture_failures_and_accepts_a_core_without_sram() {
+    for (missing_state, stalled_sram, saved) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let d = tmp_root_with_carts(&["Emerald"]);
+        let mut app = app_playing_in(d.path(), "Emerald");
+        app.set_snapshot(Box::new(ExitCapture {
+            missing_state,
+            stalled_sram,
+        }));
+        assert_eq!(
+            app.flush_resume_before(Instant::now() + Duration::from_millis(20)),
+            saved
+        );
+    }
+}
+
+#[test]
+fn exit_flush_reports_a_persist_write_error() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut app = app_playing_in(d.path(), "Emerald");
+    std::fs::remove_dir_all(d.path().join("States")).unwrap();
+    std::fs::write(d.path().join("States"), b"blocked directory").unwrap();
+    assert!(!app.flush_resume_before(Instant::now() + Duration::from_secs(1)));
+}
+
+struct AwakeHook {
+    awake: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl slot::app::DozePolicy for AwakeHook {
+    fn keep_awake(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        self.awake.load(Ordering::Relaxed)
+    }
+}
+
+#[test]
+fn awake_hook_is_checked_only_at_timeouts_and_shutdown_resumes_after_removal() {
+    let d = tmp_root_with_carts(&["Emerald"]);
+    let mut app = app_playing_in(d.path(), "Emerald");
+    app.set_power(panel(d.path(), Duration::from_secs(2)).0);
+    let awake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    app.set_doze_policy(Box::new(AwakeHook {
+        awake: awake.clone(),
+        checks: checks.clone(),
+    }));
+    app.apply(Action::LidClose);
+    let start = app.now();
+    app.tick_ms(start + 1999);
+    assert_eq!(checks.load(Ordering::Relaxed), 0);
+    app.tick_ms(start + 2000);
+    assert_eq!(checks.load(Ordering::Relaxed), 1);
+    assert!(!app.powering_off());
+    assert!(matches!(app.phase(), Phase::Doze { .. }));
+    for dt in 1..100 {
+        app.tick_ms(start + 2000 + dt);
+    }
+    assert_eq!(checks.load(Ordering::Relaxed), 1);
+    awake.store(false, Ordering::Relaxed);
+    app.tick_ms(start + 4000);
+    assert_eq!(checks.load(Ordering::Relaxed), 2);
+    assert!(app.powering_off());
+}
+
+#[test]
+fn awake_hook_does_not_inhibit_hold_power_or_critical_battery_and_allows_wake() {
+    for critical in [false, true] {
+        let d = tmp_root_with_carts(&["Emerald"]);
+        let mut app = app_playing_in(d.path(), "Emerald");
+        let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        app.set_doze_policy(Box::new(AwakeHook {
+            awake: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            checks: checks.clone(),
+        }));
+        app.apply(Action::LidClose);
+        app.on_doze_timeout();
+        assert!(!app.powering_off());
+        app.apply(Action::LidOpen);
+        assert!(matches!(app.phase(), Phase::Playing { .. }));
+        app.apply(Action::PowerTap);
+        assert!(matches!(app.phase(), Phase::Doze { .. }));
+        app.apply(Action::PowerTap);
+        assert!(matches!(app.phase(), Phase::Playing { .. }));
+        if critical {
+            app.on_battery(slot_power::Battery {
+                percent: 5,
+                charge: slot_power::Charge::Discharging,
+            });
+        } else {
+            app.apply(Action::PowerHold);
+        }
+        assert!(app.powering_off());
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+    }
+}
+
 #[test]
 fn doze_closes_cheats_and_commits_only_the_visible_edits() {
     for doze in [Action::LidClose, Action::PowerTap] {
@@ -71,6 +202,7 @@ fn doze_timeout_powers_off_with_the_cart_still_seated() {
     let mut a = app_playing_in(d.path(), "Emerald");
     a.apply(Action::LidClose);
     a.on_doze_timeout();
+    assert!(a.powering_off());
     assert_eq!(
         read_slot_state(d.path()).cart,
         Some("Emerald".into()),

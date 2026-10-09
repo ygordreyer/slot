@@ -385,6 +385,22 @@ impl EmuHandle {
             shared: self.shared.clone(),
         }
     }
+
+    pub fn stop_before(&mut self, deadline: Instant) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.clocked.notify_all();
+        if let Some(join) = self.join.take() {
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if join.is_finished() {
+                let _ = join.join();
+            } else {
+                // Detach rather than blocking the frontend's exit in Drop.
+                eprintln!("slot: sigterm: emulator stop timed out");
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -404,6 +420,27 @@ impl Snapshot for EmuSnapshot {
         let (tx, rx) = channel();
         request(&self.cmds, &self.shared, Cmd::Sav(tx)).then_some(())?;
         rx.recv().ok().flatten()
+    }
+
+    fn state_before(&self, deadline: Option<Instant>) -> Option<Vec<u8>> {
+        let Some(deadline) = deadline else {
+            return self.state();
+        };
+        let (tx, rx) = channel();
+        request(&self.cmds, &self.shared, Cmd::Save(tx)).then_some(())?;
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    }
+
+    fn save_ram_before(&self, deadline: Option<Instant>) -> Option<Vec<u8>> {
+        let Some(deadline) = deadline else {
+            return self.save_ram();
+        };
+        let (tx, rx) = channel();
+        request(&self.cmds, &self.shared, Cmd::Sav(tx)).then_some(())?;
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+            .flatten()
     }
 
     fn thumb(&self) -> Option<Vec<u8>> {
@@ -893,7 +930,10 @@ impl Worker {
             }
             Cmd::SetCheats(codes) => {
                 if !core.set_cheats(&codes) && !codes.is_empty() {
-                    eprintln!("slot: cheats: this core took none of the {} sent", codes.len());
+                    eprintln!(
+                        "slot: cheats: this core took none of the {} sent",
+                        codes.len()
+                    );
                 } else if crate::session::trace() {
                     eprintln!("slot: cheats: {} running", codes.len());
                 }
@@ -1093,6 +1133,27 @@ fn drain_transport(transport: &mut dyn LinkChannel, link: &Link, cap: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_snapshot_requests_time_out_if_the_worker_never_replies() {
+        let emu = EmuHandle::spawn(
+            Box::new(slot_retro::MockCore::new()),
+            PathBuf::from("mock"),
+            Arc::new(Ring::new(0)),
+            None,
+            None,
+        );
+        let (cmds, pending) = channel();
+        let snapshot = EmuSnapshot {
+            cmds,
+            shared: emu.shared.clone(),
+        };
+        let deadline = Some(Instant::now());
+        assert!(snapshot.state_before(deadline).is_none());
+        assert!(matches!(pending.try_recv(), Ok(Cmd::Save(_))));
+        assert!(snapshot.save_ram_before(deadline).is_none());
+        assert!(matches!(pending.try_recv(), Ok(Cmd::Sav(_))));
+    }
     use slot_retro::LoopbackLink;
 
     const PANEL: Duration = Duration::from_micros(16_760);

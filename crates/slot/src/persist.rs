@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use slot_store::{atomic_write, read_slot_state, write_slot_state, Core, Platform, StateRing};
 
@@ -7,6 +8,14 @@ pub trait Snapshot {
     fn save_ram(&self) -> Option<Vec<u8>>;
     fn thumb(&self) -> Option<Vec<u8>>;
     fn load(&self, state: Vec<u8>);
+
+    fn state_before(&self, _deadline: Option<Instant>) -> Option<Vec<u8>> {
+        self.state()
+    }
+
+    fn save_ram_before(&self, _deadline: Option<Instant>) -> Option<Vec<u8>> {
+        self.save_ram()
+    }
 
     fn resume_trusted(&self) -> bool {
         true

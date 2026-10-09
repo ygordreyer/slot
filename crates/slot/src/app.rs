@@ -2,6 +2,7 @@
 mod shader_params;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use slot_gfx::{OUT_H, OUT_W};
 use slot_input::{Action, Btn, MUTE_CHORD_MS};
@@ -32,6 +33,15 @@ use crate::link_start::{link_port, LinkFail, LinkProgress, LinkStarter, LinkStep
 use crate::persist::{self, Snapshot};
 use crate::video_mode::{self, VideoMode};
 use crate::wifi::{WifiEffect, WifiRadio, WifiScreen, WifiWorker};
+
+/// Platform-owned policy consulted only when a doze timeout expires.
+pub trait DozePolicy {
+    fn keep_awake(&self) -> bool {
+        false
+    }
+}
+
+impl DozePolicy for () {}
 
 pub const INSERT_S: f32 = 0.73;
 const INSERT_HOLD_S: f32 = 0.28;
@@ -414,6 +424,7 @@ pub struct App {
     game_ready: bool,
     clock: f64,
     power: Option<Power>,
+    doze_policy: Box<dyn DozePolicy>,
     dozed_at: Millis,
     woke_on_press: bool,
     autosave_at: Millis,
@@ -540,6 +551,7 @@ impl App {
             game_ready: false,
             clock: 0.0,
             power: None,
+            doze_policy: Box::new(()),
             dozed_at: 0,
             woke_on_press: false,
             autosave_at: AUTOSAVE_MS,
@@ -2851,7 +2863,16 @@ impl App {
         if !matches!(self.phase, Phase::Doze { .. }) {
             return;
         }
+        if self.doze_policy.keep_awake() {
+            // Re-arm the timeout so an inhibited doze does not poll the filesystem per frame.
+            self.dozed_at = self.now();
+            return;
+        }
         self.begin_power_off();
+    }
+
+    pub fn set_doze_policy(&mut self, policy: Box<dyn DozePolicy>) {
+        self.doze_policy = policy;
     }
 
     fn power_press(&mut self) {
@@ -3325,16 +3346,39 @@ impl App {
 
     pub fn flush_resume(&mut self) {
         self.settle_saves();
+        self.flush_resume_inner(None);
+    }
+
+    pub fn flush_resume_before(&mut self, deadline: Instant) -> bool {
+        while self.pending_save.as_ref().is_some_and(|h| !h.is_finished()) {
+            if Instant::now() >= deadline {
+                // An older writer must finish before a newer state can replace its files.
+                eprintln!("slot: sigterm: autosave wait timed out");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.settle_saves();
+        self.flush_resume_inner(Some(deadline))
+    }
+
+    fn flush_resume_inner(&mut self, deadline: Option<Instant>) -> bool {
         self.autosave_at = self.now() + AUTOSAVE_MS;
-        let (Some(root), Some(snapshot), Some(cart)) = (&self.root, &self.snapshot, self.seated())
-        else {
-            return;
+        let Some(cart) = self.seated() else {
+            return true;
         };
-        let Some(state) = snapshot.state() else {
+        let (Some(root), Some(snapshot)) = (&self.root, &self.snapshot) else {
+            return false;
+        };
+        let Some(state) = snapshot.state_before(deadline) else {
             eprintln!("slot: flush: the core gave up no state");
-            return;
+            return false;
         };
-        let (state, sav) = trusted_write(snapshot.as_ref(), state, "flush");
+        let (state, sav) = trusted_write_before(snapshot.as_ref(), state, "flush", deadline);
+        // No SRAM is valid for some cores, but a capture that used up the budget is incomplete.
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return false;
+        }
         if let Err(e) = persist::flush(
             root,
             self.platform,
@@ -3344,7 +3388,9 @@ impl App {
             sav.as_deref(),
         ) {
             eprintln!("slot: flush: {e}");
+            return false;
         }
+        true
     }
 
     fn ring(&self) -> Option<StateRing> {
@@ -3613,6 +3659,15 @@ fn trusted_write(
     state: Vec<u8>,
     verb: &str,
 ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    trusted_write_before(snapshot, state, verb, None)
+}
+
+fn trusted_write_before(
+    snapshot: &dyn Snapshot,
+    state: Vec<u8>,
+    verb: &str,
+    deadline: Option<Instant>,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     let state = if snapshot.resume_trusted() {
         Some(state)
     } else {
@@ -3621,7 +3676,7 @@ fn trusted_write(
         );
         None
     };
-    let sav = snapshot.save_ram();
+    let sav = snapshot.save_ram_before(deadline);
     let sav = if snapshot.save_ram_trusted() {
         sav
     } else {
@@ -3690,6 +3745,24 @@ fn free_stamp(ring: &StateRing, now: i64) -> String {
 #[cfg(test)]
 mod network_time_tests {
     use super::*;
+
+    #[test]
+    fn exit_flush_does_not_wait_forever_on_an_autosave_writer() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = App::boot(d.path());
+        let (release, wait) = std::sync::mpsc::channel();
+        app.pending_save = Some(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        assert!(!app.flush_resume_before(Instant::now()));
+        assert!(app
+            .pending_save
+            .as_ref()
+            .is_some_and(|writer| !writer.is_finished()));
+        release.send(()).unwrap();
+        app.settle_saves();
+    }
+
     #[test]
     fn backward_clock_correction_does_not_evict_the_new_snapshot() {
         let d = tempfile::tempdir().unwrap();

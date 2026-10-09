@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use slot_gfx::{Compositor, Draw, ShaderChoice, TexId, OUT_H, OUT_W};
@@ -24,6 +25,7 @@ use crate::session::Session;
 use crate::wallpaper;
 
 const DOZE_TIMEOUT: Duration = Duration::from_secs(180);
+const EXIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 const ALERT_INK: [u8; 3] = [0xf0, 0xb4, 0x3c];
 
@@ -31,6 +33,7 @@ pub struct Frontend {
     labels: crate::labels::Labels,
     achievements: crate::achievement_ui::Notifications,
     session: Session,
+    exit_saved: Option<bool>,
     start: Instant,
     last: Instant,
     draws: Vec<Draw>,
@@ -136,6 +139,7 @@ impl Frontend {
             labels,
             achievements: crate::achievement_ui::Notifications::new(),
             session,
+            exit_saved: None,
             start: now,
             last: now,
             draws: Vec::new(),
@@ -509,6 +513,28 @@ impl Frontend {
 
     pub fn poweroff(&mut self) {
         self.session.app_mut().poweroff();
+    }
+
+    pub fn set_doze_policy(&mut self, policy: Box<dyn crate::app::DozePolicy>) {
+        self.session.app_mut().set_doze_policy(policy);
+    }
+
+    pub fn stop_requested(&mut self, stop: &AtomicBool) -> bool {
+        if self.exit_saved.is_some() {
+            return true;
+        }
+        if !stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.exit_saved = Some(
+            self.session
+                .flush_before_exit(Instant::now() + EXIT_TIMEOUT),
+        );
+        true
+    }
+
+    pub fn exit_saved(&self) -> Option<bool> {
+        self.exit_saved
     }
 }
 
@@ -904,6 +930,71 @@ mod tests {
     use super::*;
     use slot_input::{Action, Btn, RawEvent};
     use slot_ui::QuickRow;
+
+    struct ExitSnapshot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::persist::Snapshot for ExitSnapshot {
+        fn state(&self) -> Option<Vec<u8>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Some(b"current state".to_vec())
+        }
+        fn save_ram(&self) -> Option<Vec<u8>> {
+            Some(b"current SRAM".to_vec())
+        }
+        fn thumb(&self) -> Option<Vec<u8>> {
+            None
+        }
+        fn load(&self, _state: Vec<u8>) {}
+    }
+
+    #[test]
+    fn stop_flag_flushes_once_without_shutdown_and_is_a_noop_at_the_shelf() {
+        for playing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            crate::root::ensure(root.path());
+            if playing {
+                std::fs::write(root.path().join("Games/GBA/Example.gba"), vec![0; 256]).unwrap();
+            }
+            slot_store::write_slot_state(
+                root.path(),
+                &slot_store::SlotState {
+                    cart: playing.then(|| "Example".into()),
+                    clock_set: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut frontend =
+                Frontend::boot(Box::new(slot_power::SimPlatform::at(root.path().into())));
+            let captures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let app = frontend.session.app_mut();
+            app.set_snapshot(Box::new(ExitSnapshot(captures.clone())));
+            app.on_core_ready();
+            for _ in 0..120 {
+                app.update(1.0 / 60.0);
+            }
+            assert_eq!(matches!(app.phase(), Phase::Playing { .. }), playing);
+            let stop = AtomicBool::new(false);
+            assert!(!frontend.stop_requested(&stop));
+            assert_eq!(frontend.exit_saved(), None);
+            assert_eq!(captures.load(Ordering::Relaxed), 0);
+            stop.store(true, Ordering::Relaxed);
+            assert!(frontend.stop_requested(&stop));
+            assert!(frontend.stop_requested(&stop));
+            assert_eq!(frontend.exit_saved(), Some(true));
+            assert_eq!(captures.load(Ordering::Relaxed), usize::from(playing));
+            assert!(!frontend.app().powering_off());
+            let resume = crate::persist::read_resume(
+                root.path(),
+                slot_store::Platform::Gba,
+                slot_store::Core::Mgba,
+                "Example",
+            );
+            let sav = crate::persist::read_sav(root.path(), slot_store::Platform::Gba, "Example");
+            assert_eq!(resume, playing.then(|| b"current state".to_vec()));
+            assert_eq!(sav, playing.then(|| b"current SRAM".to_vec()));
+        }
+    }
 
     #[test]
     fn parameter_faces_refresh_after_close_and_reopen_in_one_batch() {

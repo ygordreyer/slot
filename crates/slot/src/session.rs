@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slot_input::{Action, Btn, Gestures, Millis, RawEvent};
 use slot_retro::Rumble;
@@ -106,6 +106,28 @@ impl Session {
 
     pub fn achievement_flush_ready(&self) -> bool {
         self.achievements.flush_ready()
+    }
+
+    pub fn flush_before_exit(&mut self, deadline: Instant) -> bool {
+        if let Some(emu) = &self.emu {
+            emu.set_speed(Speed::Paused);
+        }
+        let mut saved = self.app.flush_resume_before(deadline);
+        if let Some(emu) = &mut self.emu {
+            emu.stop_before(deadline);
+            // stop_before detaches at the deadline; do not acknowledge an unconfirmed stop.
+            if Instant::now() >= deadline {
+                saved = false;
+            }
+        }
+        while !self.achievement_flush_ready() {
+            if Instant::now() >= deadline {
+                eprintln!("slot: sigterm: achievement flush timed out");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        saved
     }
 
     pub fn achievement_sync_progress(&self) -> Option<u8> {
