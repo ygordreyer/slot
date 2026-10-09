@@ -11,13 +11,14 @@ use slot_ui::{
     quick_label_face, quick_legend_faces, quick_value_face, set_clock_hint_face, socket_face,
     sticker_face, title_face, toast_face, wallpaper_face, word_face, GbShell, Icon, LinkBadge,
     QuickMenuFaces, QuickRow, QuickValue, StickerFields, Toast, UndoFace, ALERT_PX, BOLT_PX,
-    HUD_ICON_PX, HUD_INK, LEGEND,
+    HUD_ICON_PX, HUD_INK, LEGEND, PLATE_H,
 };
 use slot_ui::{cheat_label_face, cheat_legend_faces, date_time_text_as, hhmm_as, CHEAT_ROWS};
 
 use crate::app::{App, LinkRow, Phase};
 use crate::build_info::Build;
 use crate::face_builder::FaceBuilder;
+use crate::framerate::{RateWindow, Rates};
 use crate::link_art_builder::LinkArtBuilder;
 use crate::link_screen::{LinkSprites, Sprite};
 use crate::link_start::{LinkFail, LinkStep};
@@ -60,6 +61,59 @@ pub struct Frontend {
     account_shown: Option<u64>,
     cheats: CheatFaces,
     shader_params: ParameterFaces,
+    presents: u64,
+    framerate: RateWindow,
+    framerate_face: FramerateFace,
+    effective_shader: EffectiveShader,
+}
+
+#[derive(Default)]
+enum EffectiveShader {
+    #[default]
+    Lcd,
+    Off,
+    Preset(String),
+    Fallback(String),
+}
+
+impl EffectiveShader {
+    fn installed(name: &str, success: bool) -> Self {
+        match name {
+            SHADER_LCD => Self::Lcd,
+            SHADER_OFF => Self::Off,
+            name => {
+                // Legacy top-level GLSL selections store the stem without its extension.
+                let path = if name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("glslp"))
+                {
+                    name.to_string()
+                } else {
+                    format!("{name}.glsl")
+                };
+                if success {
+                    Self::Preset(path)
+                } else {
+                    Self::Fallback(path)
+                }
+            }
+        }
+    }
+
+    fn fallback(&mut self) {
+        if let Self::Preset(path) = self {
+            *self = Self::Fallback(std::mem::take(path));
+        }
+    }
+
+    fn identifier(&self) -> String {
+        match self {
+            Self::Lcd => "LCD".into(),
+            Self::Off => "OFF".into(),
+            Self::Preset(path) => path.clone(),
+            Self::Fallback(path) => format!("LCD(fallback:{path})"),
+        }
+    }
 }
 
 /// The cheat list's faces: one texture per window row, reused as the list scrolls, with which
@@ -99,6 +153,85 @@ struct QuickClock {
     dim: Option<TexId>,
     lit: Option<TexId>,
     shown: String,
+}
+
+#[derive(Default)]
+struct FramerateFace {
+    tex: Option<TexId>,
+    size: (u32, u32),
+    rates: Option<Rates>,
+    shown: String,
+}
+
+impl FramerateFace {
+    fn prepare(&mut self, rates: Option<Rates>) -> bool {
+        let Some(rates) = rates else { return false };
+        if self.rates == Some(rates) {
+            return false;
+        }
+        self.rates = Some(rates);
+        let text = rates.text();
+        if text == self.shown {
+            return false;
+        }
+        self.shown = text;
+        true
+    }
+
+    fn sync(&mut self, rates: Option<Rates>, compositor: &mut Compositor) {
+        if !self.prepare(rates) {
+            return;
+        }
+        let face = framerate_face(&self.shown);
+        self.size = (face.w, face.h);
+        upload(compositor, &mut self.tex, face);
+    }
+
+    fn draw(&self, rates: Option<Rates>, out: &mut Vec<Draw>) {
+        let Some(tex) = self.tex.filter(|_| rates.is_some()) else {
+            return;
+        };
+        let (w, h) = self.size;
+        let x = OUT_W as f32 - w as f32 - 8.0;
+        let y = PLATE_H + 6.0;
+        out.push(Draw::Rect {
+            x,
+            y,
+            w: w as f32,
+            h: h as f32,
+            colour: [0.0, 0.0, 0.0, 0.65],
+        });
+        out.push(Draw::Tex {
+            x,
+            y,
+            w: w as f32,
+            h: h as f32,
+            tex,
+            alpha: 1.0,
+        });
+    }
+}
+
+fn framerate_face(line: &str) -> UndoFace {
+    let h = 28;
+    let Some(font) = slot_ui::text::label_font() else {
+        return UndoFace {
+            rgba: vec![0; (h * 4) as usize],
+            w: 1,
+            h,
+        };
+    };
+    let px = 20.0;
+    let w = slot_ui::text::line_width(font, line, px, 0.0).ceil() as u32 + 12;
+    let mut rgba = vec![0; (w * h * 4) as usize];
+    // Keep the double space in the rate label; the wrapping layout collapses whitespace.
+    let layout = slot_ui::text::Layout {
+        lines: vec![line.into()],
+        px,
+        tracking: 0.0,
+    };
+    slot_ui::text::draw_centred(&mut rgba, w, h, &layout, [255; 3]);
+    UndoFace { rgba, w, h }
 }
 
 #[derive(Default)]
@@ -158,6 +291,10 @@ impl Frontend {
             about: AboutFace::default(),
             quick_clock: QuickClock::default(),
             quick_shader: QuickClock::default(),
+            presents: 0,
+            framerate: RateWindow::default(),
+            framerate_face: FramerateFace::default(),
+            effective_shader: EffectiveShader::default(),
             account_tex: None,
             account_shown: None,
             wifi_shown: None,
@@ -350,6 +487,26 @@ impl Frontend {
         compositor.end_frame(window);
     }
 
+    pub fn presented(&mut self, now: Instant) {
+        self.presents = self.presents.wrapping_add(1);
+        self.sample_framerate(now);
+    }
+
+    fn sample_framerate(&mut self, now: Instant) {
+        let due = self.framerate.observe(
+            now,
+            self.presents,
+            self.session.frames_emulated(),
+            self.session.framerate_active(),
+            self.session.framerate_generation(),
+        );
+        if due {
+            if let Some(rates) = self.framerate.rates {
+                eprintln!("{}", rates.log(&self.effective_shader.identifier()));
+            }
+        }
+    }
+
     pub fn compose(&mut self, compositor: &mut Compositor) {
         compositor.set_blue_light(self.session.app().blue_light());
         compositor.set_shake(self.session.app().screen_shake());
@@ -367,7 +524,7 @@ impl Frontend {
         sync_about(self.session.app_mut(), compositor, &mut self.about);
         sync_quick_clock(self.session.app_mut(), compositor, &mut self.quick_clock);
         sync_quick_shader(self.session.app_mut(), compositor, &mut self.quick_shader);
-        sync_shader(&mut self.session, compositor);
+        sync_shader(&mut self.session, compositor, &mut self.effective_shader);
         sync_cheats(self.session.app_mut(), compositor, &mut self.cheats);
         if let Some(screen) = self.session.app().account_screen() {
             if self.account_shown != Some(screen.revision()) {
@@ -447,9 +604,21 @@ impl Frontend {
         );
         self.draws.clear();
         self.achievements.update(&mut self.session, compositor);
+        self.session
+            .app_mut()
+            .set_achievement_notification_visible(self.achievements.visible());
+        self.sample_framerate(Instant::now());
+        self.framerate_face.sync(self.framerate.rates, compositor);
         self.session.app().draw(&mut self.draws);
+        self.framerate_face.draw(
+            self.framerate
+                .rates
+                .filter(|_| self.session.framerate_active()),
+            &mut self.draws,
+        );
         self.achievements.draw(&self.session, &mut self.draws);
         compositor.draw_list(&self.draws);
+        sync_shader_error(&mut self.session, compositor, &mut self.effective_shader);
     }
 
     pub fn drive_emulator(&mut self) {
@@ -720,13 +889,21 @@ fn shader_display(name: &str) -> String {
     format!("{kept}...")
 }
 
+fn quick_shader_text(app: &App) -> String {
+    if app.shader() == SHADER_OFF {
+        "OFF".into()
+    } else {
+        shader_display(&slot_store::shader_label(app.shader(), app.shaders()))
+    }
+}
+
 /// Shader's value, built like Date & Time's: only while the menu is up, and only when the name
 /// in hand is not the one last built.
 fn sync_quick_shader(app: &mut App, compositor: &mut Compositor, state: &mut QuickClock) {
     if app.quick_menu().is_none() {
         return;
     }
-    let text = shader_display(&slot_store::shader_label(app.shader(), app.shaders()));
+    let text = quick_shader_text(app);
     if text == state.shown {
         return;
     }
@@ -748,13 +925,12 @@ fn sync_quick_shader(app: &mut App, compositor: &mut Compositor, state: &mut Qui
 /// Anything that goes wrong — a file gone since boot, one that will not compile — leaves the
 /// LCD look on the panel and says so. The driver's log goes to stderr, which on the device is
 /// the log on the card, and names the line.
-fn sync_shader(session: &mut Session, compositor: &mut Compositor) {
-    if let Some(error) = compositor.take_shader_error() {
-        eprintln!("slot: shader: {error}");
-        session.set_custom_shader(false);
-        session.app_mut().set_shader_parameters(Vec::new());
-        session.app_mut().shader_failed();
-    }
+fn sync_shader(
+    session: &mut Session,
+    compositor: &mut Compositor,
+    effective: &mut EffectiveShader,
+) {
+    sync_shader_error(session, compositor, effective);
     let Some(name) = session.app_mut().take_shader() else {
         return;
     };
@@ -768,6 +944,7 @@ fn sync_shader(session: &mut Session, compositor: &mut Compositor) {
                 Some(path) => compositor.set_shader(ShaderChoice::Preset(&path, &saved)),
                 None => {
                     let _ = compositor.set_shader(ShaderChoice::Lcd);
+                    *effective = EffectiveShader::installed(file, false);
                     eprintln!("slot: shader: {file}.glsl could not be read");
                     session.set_custom_shader(false);
                     session.app_mut().set_shader_parameters(Vec::new());
@@ -777,12 +954,27 @@ fn sync_shader(session: &mut Session, compositor: &mut Compositor) {
             }
         }
     };
+    *effective = EffectiveShader::installed(&name, result.is_ok());
     session
         .app_mut()
         .set_shader_parameters(compositor.shader_parameters().to_vec());
     session.set_custom_shader(result.is_ok() && !matches!(name.as_str(), SHADER_LCD | SHADER_OFF));
     if let Err(e) = result {
         eprintln!("slot: shader: {name}: {e}");
+        session.app_mut().shader_failed();
+    }
+}
+
+fn sync_shader_error(
+    session: &mut Session,
+    compositor: &mut Compositor,
+    effective: &mut EffectiveShader,
+) {
+    if let Some(error) = compositor.take_shader_error() {
+        effective.fallback();
+        eprintln!("slot: shader: {error}");
+        session.set_custom_shader(false);
+        session.app_mut().set_shader_parameters(Vec::new());
         session.app_mut().shader_failed();
     }
 }
@@ -930,6 +1122,144 @@ mod tests {
     use super::*;
     use slot_input::{Action, Btn, RawEvent};
     use slot_ui::QuickRow;
+
+    #[test]
+    fn framerate_texture_refreshes_only_when_its_formatted_text_changes() {
+        let mut face = FramerateFace::default();
+        let rates = Rates {
+            display: 59.7,
+            emu: 60.0,
+        };
+        assert!(face.prepare(Some(rates)));
+        assert_eq!(face.shown, "FPS 59.7  EMU 60.0");
+        let allocation = face.shown.as_ptr();
+        for _ in 0..120 {
+            assert!(!face.prepare(Some(rates)));
+        }
+        assert_eq!(face.shown.as_ptr(), allocation);
+        assert!(!face.prepare(Some(Rates {
+            display: 59.71,
+            ..rates
+        })));
+        assert!(!face.prepare(None));
+        assert!(!face.prepare(Some(rates)));
+        assert!(face.prepare(Some(Rates {
+            display: 58.0,
+            ..rates
+        })));
+        assert_eq!(face.shown, "FPS 58.0  EMU 60.0");
+    }
+
+    #[test]
+    fn framerate_face_preserves_the_label_and_draws_below_the_hud_at_right() {
+        let rates = Rates {
+            display: 59.7,
+            emu: 60.0,
+        };
+        let line = rates.text();
+        let face = framerate_face(&line);
+        assert_eq!(face.h, 28);
+        assert!(face.w < OUT_W / 2);
+        assert!(face.rgba.chunks_exact(4).any(|p| p[3] > 0));
+        assert!(face
+            .rgba
+            .chunks_exact(4)
+            .filter(|p| p[3] > 0)
+            .all(|p| p[..3] == [255; 3]));
+        let layout = slot_ui::text::Layout {
+            lines: vec![line],
+            px: 20.0,
+            tracking: 0.0,
+        };
+        let coverage = slot_ui::text::coverage(face.w, face.h, &layout);
+        assert!(face
+            .rgba
+            .chunks_exact(4)
+            .zip(coverage)
+            .all(|(p, a)| p[3] == a));
+        let state = FramerateFace {
+            tex: Some(TexId::from_raw(100)),
+            size: (face.w, face.h),
+            ..Default::default()
+        };
+        let mut out = vec![Draw::Game];
+        state.draw(Some(rates), &mut out);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], Draw::Game));
+        assert!(matches!(out[1], Draw::Rect { colour, .. } if colour == [0.0, 0.0, 0.0, 0.65]));
+        assert!(
+            matches!(out[2], Draw::Tex { x, y, w, .. } if x + w == OUT_W as f32 - 8.0 && y == PLATE_H + 6.0)
+        );
+        let (badge_w, badge_h) = (64.0, 24.0);
+        let (badge_x, badge_y) = slot_ui::badge_at(badge_w, badge_h);
+        let Draw::Rect { x, y, w, h, .. } = out[1] else {
+            panic!("the FPS panel has no background");
+        };
+        assert!(
+            x >= badge_x + badge_w
+                || x + w <= badge_x
+                || y >= badge_y + badge_h
+                || y + h <= badge_y,
+            "the FPS panel overlaps the HUD badge"
+        );
+        out.clear();
+        state.draw(None, &mut out);
+        assert!(out.is_empty(), "a paused or disabled counter was drawn");
+    }
+
+    #[test]
+    fn framerate_log_names_the_full_effective_shader_and_lcd_fallback() {
+        let rates = Rates {
+            display: 59.7,
+            emu: 60.0,
+        };
+        for path in ["crt/crt-lite.glslp", "crt/a-very-long-preset-name.GLSLP"] {
+            let mut effective = EffectiveShader::installed(path, true);
+            assert_eq!(
+                rates.log(&effective.identifier()),
+                format!("slot: fps: display=59.7 emu=60.0 shader={path}")
+            );
+            let fallback = format!("slot: fps: display=59.7 emu=60.0 shader=LCD(fallback:{path})");
+            assert_eq!(
+                rates.log(&EffectiveShader::installed(path, false).identifier()),
+                fallback
+            );
+            effective.fallback();
+            assert_eq!(rates.log(&effective.identifier()), fallback);
+        }
+        assert_eq!(EffectiveShader::default().identifier(), "LCD");
+        assert_eq!(
+            EffectiveShader::installed(SHADER_LCD, true).identifier(),
+            "LCD"
+        );
+        assert_eq!(
+            EffectiveShader::installed(SHADER_OFF, true).identifier(),
+            "OFF"
+        );
+        assert_eq!(
+            EffectiveShader::installed("legacy", true).identifier(),
+            "legacy.glsl"
+        );
+    }
+
+    #[test]
+    fn resume_in_one_input_batch_invalidates_the_rate_window() {
+        let root = tempfile::tempdir().unwrap();
+        crate::root::ensure(root.path());
+        slot_store::write_slot_state(
+            root.path(),
+            &slot_store::SlotState {
+                clock_set: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut session = Session::boot(root.path().to_path_buf());
+        let generation = session.framerate_generation();
+        session.feed([RawEvent::Down(Btn::Lid), RawEvent::Up(Btn::Lid)], 100);
+        assert_eq!(session.framerate_generation(), generation + 1);
+        assert!(!session.framerate_active());
+    }
 
     struct ExitSnapshot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 

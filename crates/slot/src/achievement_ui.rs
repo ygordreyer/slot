@@ -90,6 +90,10 @@ impl Notifications {
         }
     }
 
+    pub fn visible(&self) -> bool {
+        self.shown.is_some_and(|time| time.elapsed() < DURATION)
+    }
+
     pub fn update(&mut self, session: &mut Session, compositor: &mut Compositor) {
         if matches!(session.app().phase(), Phase::Doze { .. }) || session.app().shutting_down() {
             return;
@@ -298,6 +302,48 @@ fn face(notice: &Notice) -> CartFace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_tracks_the_shown_banner_until_it_expires() {
+        let mut notifications = Notifications::new();
+        assert!(!notifications.visible());
+        notifications.shown = Some(Instant::now());
+        assert!(notifications.visible());
+        notifications.shown = Some(Instant::now() - DURATION);
+        assert!(!notifications.visible());
+    }
+
+    #[test]
+    fn framerate_is_hidden_while_an_achievement_notification_is_shown() {
+        let root = tempfile::tempdir().unwrap();
+        crate::root::ensure(root.path());
+        std::fs::write(root.path().join("Games/GBA/Example.gba"), vec![0; 256]).unwrap();
+        slot_store::write_slot_state(
+            root.path(),
+            &slot_store::SlotState {
+                cart: Some("Example".into()),
+                clock_set: true,
+                show_framerate: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut app = crate::app::App::boot(root.path());
+        app.on_core_ready();
+        app.set_game_ready(true);
+        for _ in 0..120 {
+            app.update(1.0 / 60.0);
+        }
+        assert!(app.framerate_visible());
+        let mut notifications = Notifications::new();
+        notifications.shown = Some(Instant::now());
+        app.set_achievement_notification_visible(notifications.visible());
+        assert!(!app.framerate_visible());
+        assert!(app.show_framerate());
+        notifications.shown = Some(Instant::now() - DURATION);
+        app.set_achievement_notification_visible(notifications.visible());
+        assert!(app.framerate_visible());
+    }
 
     #[test]
     fn notification_enters_settles_and_is_gone_before_two_seconds() {

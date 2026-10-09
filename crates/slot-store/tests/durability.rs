@@ -204,6 +204,7 @@ fn a_card_from_before_the_settings_keeps_all_its_values() {
             colour_correction: false,
             shader: String::new(),
             twelve_hour: false,
+            show_framerate: false,
         }
     );
 }
@@ -418,4 +419,41 @@ fn shader_clock_and_home_wifi_round_trip_together_in_config() {
         }
     }
     assert!(!root.path().join("System/slot.state").exists());
+}
+
+#[test]
+fn framerate_round_trips_as_a_flag_and_defaults_off_on_older_or_invalid_files() {
+    let root = tmp_root();
+    let path = root.path().join("Config/slot.state");
+    assert!(!SlotState::default().show_framerate);
+    for show_framerate in [false, true] {
+        let state = SlotState {
+            show_framerate,
+            volume: 30,
+            utc_offset_min: 345,
+            ..SlotState::default()
+        };
+        write_slot_state(root.path(), &state).unwrap();
+        assert_eq!(read_slot_state(root.path()), state);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text
+            .lines()
+            .any(|line| line == format!("show_framerate={}", show_framerate as u8)));
+        for replacement in [
+            "",
+            "show_framerate=broken",
+            "show_framerate=2",
+            "show_framerate=-1",
+        ] {
+            let line = format!("show_framerate={}", show_framerate as u8);
+            std::fs::write(&path, text.replace(&line, replacement)).unwrap();
+            assert_eq!(
+                read_slot_state(root.path()),
+                SlotState {
+                    show_framerate: false,
+                    ..state.clone()
+                }
+            );
+        }
+    }
 }

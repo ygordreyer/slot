@@ -142,9 +142,11 @@ pub fn run() {
             eprintln!("slot: {e}");
             return;
         }
-        let swap_took = swap.elapsed();
+        let presented = Instant::now();
+        let swap_took = presented - swap;
         slot::latency::swapped(swap_took.as_secs_f64() * 1000.0);
         let dropped = pacer.swapped(work, swap_took > Duration::from_millis(1));
+        frontend.presented(presented);
         if slot::latency::tracing() {
             frames += 1;
             missed += u32::from(dropped);

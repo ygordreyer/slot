@@ -20,6 +20,7 @@ pub struct Session {
     root: PathBuf,
     app: App,
     emu: Option<EmuHandle>,
+    framerate_generation: u64,
     sink: Box<dyn AudioSink>,
     gestures: Gestures,
     pad: Pad,
@@ -45,6 +46,7 @@ impl Session {
             app: App::boot(&root),
             root,
             emu: None,
+            framerate_generation: 0,
             sink,
             gestures: Gestures::new(),
             pad: Pad::default(),
@@ -203,6 +205,21 @@ impl Session {
         self.emu.as_ref().map_or(0, EmuHandle::published_count)
     }
 
+    pub fn frames_emulated(&self) -> u64 {
+        self.emu.as_ref().map_or(0, EmuHandle::emulated_count)
+    }
+
+    pub fn framerate_generation(&self) -> u64 {
+        self.framerate_generation
+    }
+
+    pub fn framerate_active(&self) -> bool {
+        self.app.framerate_visible()
+            && self.emu.as_ref().is_some_and(|emu| {
+                emu.state() == CoreState::Ready && emu.observed_speed() != Speed::Paused
+            })
+    }
+
     pub fn observed_speed(&self) -> Option<Speed> {
         self.emu.as_ref().map(EmuHandle::observed_speed)
     }
@@ -267,7 +284,11 @@ impl Session {
 
     fn bridge_link(&mut self, f: impl FnOnce(&mut App)) {
         let had_link = self.app.link_active();
+        let was_dozing = self.dozing();
         f(&mut self.app);
+        if was_dozing && !self.dozing() {
+            self.framerate_generation = self.framerate_generation.wrapping_add(1);
+        }
         if had_link && !self.app.link_active() {
             if let Some(emu) = &self.emu {
                 emu.end_link();
@@ -570,6 +591,7 @@ impl Session {
         }
         self.app.set_snapshot(Box::new(emu.snapshot()));
         self.emu = Some(emu);
+        self.framerate_generation = self.framerate_generation.wrapping_add(1);
     }
 
     fn reload_for_link(&mut self, stem: &str, serial: &'static str) {

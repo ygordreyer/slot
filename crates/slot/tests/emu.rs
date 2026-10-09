@@ -195,10 +195,13 @@ fn fast_forward_runs_the_chosen_number_of_core_frames_per_present() {
     ] {
         emu.set_fast_steps(asked);
         let (frames, presents) = held_counts(&emu);
+        let emulated = emu.emulated_count();
+        assert_eq!(emulated, frames);
         emu.set_speed(Speed::Fast);
         std::thread::sleep(Duration::from_millis(150));
         let (frames_after, presents_after) = held_counts(&emu);
         let (ran, shown) = (frames_after - frames, presents_after - presents);
+        assert_eq!(emu.emulated_count() - emulated, ran);
         assert!(shown > 0, "nothing was presented asking for {asked}");
         let want = shown * u64::from(runs);
         assert!(
@@ -211,6 +214,24 @@ fn fast_forward_runs_the_chosen_number_of_core_frames_per_present() {
              for {asked}: the ceiling is not what bound"
         );
     }
+}
+
+#[test]
+fn the_emulated_counter_counts_all_fast_frames_and_stops_when_paused() {
+    let emu = spawn();
+    let (before, _) = held_counts(&emu);
+    assert_eq!(emu.emulated_count(), before);
+    emu.set_fast_steps(6);
+    emu.set_speed(Speed::Fast);
+    assert!(wait_for(|| emu.published_count() >= 20));
+    let (after, published) = held_counts(&emu);
+    assert_eq!(emu.emulated_count(), after);
+    assert!(
+        after > published,
+        "fast frames were counted only once per publish"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(emu.emulated_count(), after);
 }
 
 struct Probe {

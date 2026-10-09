@@ -77,6 +77,10 @@ fn the_fast_forward_row_offers_the_four_ceilings_the_card_can_hold() {
 
 #[test]
 fn the_rows_run_in_the_order_the_user_chose() {
+    assert_eq!(QuickRow::Shader.index(), 3);
+    assert_eq!(QuickRow::Shader.down(), QuickRow::ShowFps);
+    assert_eq!(QuickRow::ShowFps.label(), "Show FPS");
+    assert!(!QuickRow::ShowFps.opens());
     let labels = QuickRow::ALL.map(QuickRow::label);
     assert_eq!(
         labels,
@@ -85,6 +89,7 @@ fn the_rows_run_in_the_order_the_user_chose() {
             "Fast Forward Sound",
             "Colour Correction",
             "Shader",
+            "Show FPS",
             "Rumble",
             "Home Wi-Fi",
             "Wi-Fi Networks",

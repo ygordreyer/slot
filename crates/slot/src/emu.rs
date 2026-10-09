@@ -98,6 +98,7 @@ struct Shared {
     fast_steps: AtomicU32,
     ff_sound: AtomicBool,
     published: AtomicU64,
+    emulated: AtomicU64,
     resume_refused: AtomicBool,
     sav_refused: AtomicBool,
     link_lost: AtomicBool,
@@ -163,6 +164,7 @@ impl EmuHandle {
             fast_steps: AtomicU32::new(FAST_STEPS),
             ff_sound: AtomicBool::new(false),
             published: AtomicU64::new(0),
+            emulated: AtomicU64::new(0),
             resume_refused: AtomicBool::new(false),
             sav_refused: AtomicBool::new(false),
             link_lost: AtomicBool::new(false),
@@ -325,6 +327,10 @@ impl EmuHandle {
 
     pub fn published_count(&self) -> u64 {
         self.shared.published.load(Ordering::Relaxed)
+    }
+
+    pub fn emulated_count(&self) -> u64 {
+        self.shared.emulated.load(Ordering::Relaxed)
     }
 
     pub fn observed_speed(&self) -> Speed {
@@ -656,6 +662,7 @@ impl Worker {
                     }
                     core.set_frame_skip(false);
                     core.run_frame(ButtonMask(0));
+                    self.shared.emulated.fetch_add(1, Ordering::Relaxed);
                     self.publish(core.video_xrgb8888());
                 }
                 self.shared
@@ -720,6 +727,7 @@ impl Worker {
                         }
                         None => core.run_frame(input),
                     }
+                    self.shared.emulated.fetch_add(1, Ordering::Relaxed);
                     let took = frame_began.elapsed();
                     if last {
                         drawn = took;

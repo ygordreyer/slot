@@ -15,6 +15,7 @@ pub enum QuickRow {
     /// what every game looks like. Its value is a name off the card, so like Date & Time's it
     /// is rastered by the binary rather than taken from `QuickValue`.
     Shader,
+    ShowFps,
     Rumble,
     HomeWifi,
     WifiNetworks,
@@ -27,11 +28,12 @@ pub enum QuickRow {
 }
 
 impl QuickRow {
-    pub const ALL: [QuickRow; 11] = [
+    pub const ALL: [QuickRow; 12] = [
         QuickRow::FastForward,
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
         QuickRow::Shader,
+        QuickRow::ShowFps,
         QuickRow::Rumble,
         QuickRow::HomeWifi,
         QuickRow::WifiNetworks,
@@ -51,6 +53,7 @@ impl QuickRow {
             QuickRow::FastForwardSound => "Fast Forward Sound",
             QuickRow::ColourCorrection => "Colour Correction",
             QuickRow::Shader => "Shader",
+            QuickRow::ShowFps => "Show FPS",
             QuickRow::Rumble => "Rumble",
             QuickRow::HomeWifi => "Home Wi-Fi",
             QuickRow::RetroAchievements => "RetroAchievements",

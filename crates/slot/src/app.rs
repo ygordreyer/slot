@@ -396,6 +396,7 @@ pub struct App {
     account_snapshot: slot_achievements::AccountState,
     account_control: Option<slot_achievements::AccountControl>,
     account_face: Option<TexId>,
+    achievement_notification_visible: bool,
     wifi_screen: Option<WifiScreen>,
     wifi_worker: Option<WifiWorker>,
     wifi_generation: u64,
@@ -526,6 +527,7 @@ impl App {
             account_snapshot: slot_achievements::AccountState::default(),
             account_control: None,
             account_face: None,
+            achievement_notification_visible: false,
             wifi_screen: None,
             wifi_worker: None,
             wifi_generation: 0,
@@ -876,6 +878,7 @@ impl App {
             QuickRow::FastForward => QuickValue::speed(self.state.ff_speed),
             QuickRow::FastForwardSound => Some(QuickValue::flag(self.state.ff_sound)),
             QuickRow::ColourCorrection => Some(QuickValue::flag(self.state.colour_correction)),
+            QuickRow::ShowFps => Some(QuickValue::flag(self.state.show_framerate)),
             QuickRow::Rumble => Some(QuickValue::flag(self.state.rumble)),
             QuickRow::HomeWifi => Some(QuickValue::flag(self.state.home_wifi_enabled)),
             QuickRow::TwelveHour => Some(QuickValue::flag(self.state.twelve_hour)),
@@ -945,6 +948,27 @@ impl App {
     /// Whether every clock on the panel reads 3:07 PM rather than 15:07.
     pub fn twelve_hour(&self) -> bool {
         self.state.twelve_hour
+    }
+
+    pub fn show_framerate(&self) -> bool {
+        self.state.show_framerate
+    }
+
+    pub fn framerate_visible(&self) -> bool {
+        self.show_framerate()
+            && !self.achievement_notification_visible
+            && matches!(self.phase, Phase::Playing { .. })
+            && self.game_visible()
+            && !self.shutting_down()
+            && self.game_menu.is_none()
+            && self.cheat_menu.is_none()
+            && !self.shader_params_open()
+            && self.wifi_screen.is_none()
+            && self.account_screen.is_none()
+    }
+
+    pub(crate) fn set_achievement_notification_visible(&mut self, visible: bool) {
+        self.achievement_notification_visible = visible;
     }
 
     /// Puts the cheat list up over the game, one `(title, on)` per cheat, the bar on the first.
@@ -1692,6 +1716,7 @@ impl App {
             QuickRow::FastForward
             | QuickRow::FastForwardSound
             | QuickRow::ColourCorrection
+            | QuickRow::ShowFps
             | QuickRow::Rumble
             | QuickRow::HomeWifi
             | QuickRow::TwelveHour => {}
@@ -1737,6 +1762,7 @@ impl App {
                 s.shader = name.clone();
                 self.shader_pending = Some(name);
             }
+            QuickRow::ShowFps => s.show_framerate = !s.show_framerate,
             QuickRow::Rumble => s.rumble = !s.rumble,
             QuickRow::HomeWifi => {
                 self.wifi_generation = self.wifi_generation.wrapping_add(1);

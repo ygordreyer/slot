@@ -113,6 +113,7 @@ fn up_and_down_move_the_bar_and_wrap_at_the_ends() {
         QuickRow::FastForwardSound,
         QuickRow::ColourCorrection,
         QuickRow::Shader,
+        QuickRow::ShowFps,
         QuickRow::Rumble,
         QuickRow::HomeWifi,
         QuickRow::WifiNetworks,
@@ -168,7 +169,8 @@ fn rumble_and_fast_forward_sound_flip_on_either_arrow_and_save() {
     );
     press(&mut a, Btn::Right);
     assert_eq!(card(&d), (false, true));
-    // Three rows down: Colour Correction and Shader sit between the Fast Forward pair and Rumble.
+    // Colour Correction, Shader and SHOW FPS sit between the Fast Forward pair and Rumble.
+    press(&mut a, Btn::Down);
     press(&mut a, Btn::Down);
     press(&mut a, Btn::Down);
     press(&mut a, Btn::Down);
@@ -670,6 +672,71 @@ fn the_twelve_hour_row_flips_and_saves() {
     assert_eq!(a.quick_value(QuickRow::TwelveHour), Some(QuickValue::On));
     press(&mut a, Btn::Left);
     assert!(!read_slot_state(d.path()).twelve_hour);
+}
+
+#[test]
+fn show_fps_follows_shader_and_flips_and_saves_on_either_arrow() {
+    let (d, mut app, _) = on_carousel();
+    app.apply(Action::QuickMenu);
+    for _ in 0..3 {
+        press(&mut app, Btn::Down);
+    }
+    assert_eq!(app.quick_menu(), Some(QuickRow::Shader));
+    press(&mut app, Btn::Down);
+    assert_eq!(app.quick_menu(), Some(QuickRow::ShowFps));
+    assert!(!app.show_framerate());
+    assert_eq!(app.quick_value(QuickRow::ShowFps), Some(QuickValue::Off));
+    press(&mut app, Btn::Left);
+    assert!(app.show_framerate());
+    assert!(read_slot_state(d.path()).show_framerate);
+    assert_eq!(app.quick_value(QuickRow::ShowFps), Some(QuickValue::On));
+    press(&mut app, Btn::A);
+    assert_eq!(app.quick_menu(), Some(QuickRow::ShowFps));
+    assert!(!app.framerate_visible());
+    press(&mut app, Btn::Right);
+    assert!(!app.show_framerate());
+    assert!(!read_slot_state(d.path()).show_framerate);
+}
+
+#[test]
+fn framerate_visibility_requires_playing_without_a_menu_or_doze() {
+    for show_framerate in [false, true] {
+        let d = tmp_root_with_carts(&["Emerald"]);
+        write_slot_state(
+            d.path(),
+            &SlotState {
+                cart: Some("Emerald".into()),
+                clock_set: true,
+                show_framerate,
+                ..SlotState::default()
+            },
+        )
+        .unwrap();
+        let (mut app, _) = app_booting_at(d.path(), CLOCK_IS_SET);
+        app.on_core_ready();
+        app.set_game_ready(true);
+        for _ in 0..120 {
+            app.update(1.0 / 60.0);
+        }
+        assert!(matches!(app.phase(), Phase::Playing { .. }));
+        assert_eq!(app.framerate_visible(), show_framerate);
+        app.apply(Action::GameMenu);
+        assert!(app.game_menu_open());
+        assert!(!app.framerate_visible());
+        app.apply(Action::GbaDown(Btn::B));
+        assert_eq!(app.framerate_visible(), show_framerate);
+        app.open_cheat_menu(vec![("Test".into(), false)]);
+        assert!(!app.framerate_visible());
+        app.apply(Action::GbaDown(Btn::B));
+        assert_eq!(app.framerate_visible(), show_framerate);
+        app.apply(Action::LidClose);
+        assert!(!app.framerate_visible());
+        app.apply(Action::LidOpen);
+        for _ in 0..120 {
+            app.update(1.0 / 60.0);
+        }
+        assert_eq!(app.framerate_visible(), show_framerate);
+    }
 }
 
 #[test]

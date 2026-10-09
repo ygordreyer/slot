@@ -86,6 +86,13 @@ fn a_cable_session_steps_both_consoles() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    for emu in [&host, &join] {
+        emu.set_speed(Speed::Paused);
+        emu.request_state()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(emu.emulated_count(), emu.linked_frames());
+    }
 }
 
 #[test]
@@ -157,4 +164,11 @@ fn a_peer_that_never_speaks_stalls_rather_than_guessing() {
         "it ran {} frames with nobody on the other end",
         lonely.linked_frames()
     );
+    lonely.set_speed(Speed::Paused);
+    lonely
+        .request_state()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(lonely.emulated_count(), lonely.linked_frames());
+    assert!(lonely.emulated_count() <= slot::cable::DELAY);
 }
