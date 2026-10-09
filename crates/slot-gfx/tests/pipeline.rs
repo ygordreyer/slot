@@ -751,7 +751,7 @@ fn every_bundled_preset_loads_compiles_links_and_draws() {
     }
     let mut paths = Vec::new();
     presets(&root, &mut paths);
-    assert_eq!(paths.len(), 11);
+    assert_eq!(paths.len(), 14);
     for path in paths {
         c.set_shader(ShaderChoice::Preset(&path, &Default::default()))
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -768,4 +768,228 @@ fn every_bundled_preset_loads_compiles_links_and_draws() {
             path.display()
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn profile_overlay_covers_saved_shots_once_and_stays_below_picker_ui() {
+    use slot_gfx::ShaderChoice;
+    let Some((_guard, _surface, mut c)) = compositor() else {
+        eprintln!("saved-shot overlay test skipped: no host GL context");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("slot-overlay-shot-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let file = std::fs::File::create(dir.join("overlay.png")).unwrap();
+    let mut encoder = png::Encoder::new(file, OUT_W, OUT_H);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .unwrap()
+        .write_image_data(&[240, 40, 80, 128].repeat((OUT_W * OUT_H) as usize))
+        .unwrap();
+    std::fs::write(
+        dir.join("invert.glsl"),
+        r#"
+#if defined(VERTEX)
+#if __VERSION__ >= 130
+#define attribute in
+#define varying out
+#endif
+attribute vec4 VertexCoord; attribute vec4 TexCoord; uniform mat4 MVPMatrix; varying vec2 uv;
+void main() {gl_Position=MVPMatrix*VertexCoord;uv=TexCoord.xy;}
+#elif defined(FRAGMENT)
+#if __VERSION__ >= 130
+#define varying in
+#define texture2D texture
+out vec4 colour;
+#define gl_FragColor colour
+#endif
+#ifdef GL_ES
+precision mediump float;
+#endif
+varying vec2 uv; uniform sampler2D Texture;
+void main() {gl_FragColor=vec4(vec3(1.0)-texture2D(Texture,uv).rgb,1.0);}
+#endif
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("shot.glslp"),
+        "shaders=1\nshader0=invert.glsl\nslot_overlay=overlay.png\nslot_overlay_opacity=0.5\nslot_overlay_fit=native\n",
+    )
+    .unwrap();
+    c.set_shader(ShaderChoice::Preset(
+        &dir.join("shot.glslp"),
+        &Default::default(),
+    ))
+    .unwrap();
+    assert!(c.take_overlay_error().is_none());
+    c.set_screen_power(1.0);
+    c.upload_game(&[180, 140, 100, 255].repeat((SRC_W * SRC_H) as usize));
+    let tex = c.create_texture_nearest(SRC_W, SRC_H, &flat_shot([40, 80, 120]));
+    let ui = Draw::Rect {
+        x: 1.0,
+        y: 1.0,
+        w: 2.0,
+        h: 2.0,
+        colour: [0.0, 0.0, 1.0, 1.0],
+    };
+    let alpha = 128.0 / 255.0 * 0.5;
+    for items in [
+        vec![Draw::Shot { tex }, ui],
+        vec![Draw::Game, Draw::Shot { tex }, ui],
+    ] {
+        c.begin_frame();
+        c.draw_list(&items);
+        let frame = c.read_frame();
+        for (x, y) in [(0, 0), (360, 240), (719, 479)] {
+            for (got, (filtered, overlay)) in
+                px(&frame, x, y)
+                    .into_iter()
+                    .zip([(215.0, 240.0), (175.0, 40.0), (135.0, 80.0)])
+            {
+                let expected = filtered * (1.0 - alpha) + overlay * alpha;
+                assert!(
+                    (got as f32 - expected).abs() <= 1.0,
+                    "saved shot at {x},{y}: {got} against one overlay blend {expected}"
+                );
+            }
+        }
+        assert_eq!(px(&frame, 1, 1), [0, 0, 255], "picker UI must be untinted");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn profile_overlay_multiplies_png_alpha_draws_before_ui_and_survives_image_errors() {
+    use slot_gfx::ShaderChoice;
+    let Some((_guard, _surface, mut c)) = compositor() else {
+        eprintln!("overlay render test skipped: no host GL context");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("slot-overlay-render-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let png = |name: &str, w: u32, h: u32| {
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        let mut encoder = png::Encoder::new(file, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&[240, 40, 80, 128].repeat((w * h) as usize))
+            .unwrap();
+    };
+    png("dummy.png", OUT_W, OUT_H);
+    png("small.png", 1, 1);
+    std::fs::write(
+        dir.join("copy.glsl"),
+        r#"
+#if defined(VERTEX)
+#if __VERSION__ >= 130
+#define attribute in
+#define varying out
+#endif
+attribute vec4 VertexCoord; attribute vec4 TexCoord; uniform mat4 MVPMatrix; varying vec2 uv;
+void main() {gl_Position=MVPMatrix*VertexCoord;uv=TexCoord.xy;}
+#elif defined(FRAGMENT)
+#if __VERSION__ >= 130
+#define varying in
+#define texture2D texture
+out vec4 colour;
+#define gl_FragColor colour
+#endif
+#ifdef GL_ES
+precision mediump float;
+#endif
+varying vec2 uv; uniform sampler2D Texture;
+void main() {gl_FragColor=texture2D(Texture,uv);}
+#endif
+"#,
+    )
+    .unwrap();
+    let preset = |image: &str| {
+        std::fs::write(dir.join("owner.glslp"), format!("shaders=1\nshader0=copy.glsl\nslot_overlay={image}\nslot_overlay_opacity=0.14\nslot_overlay_fit=native\nslot_core_options=mgba_color_correction\nmgba_color_correction=GBA\n")).unwrap();
+    };
+    preset("dummy.png");
+    c.set_shader(ShaderChoice::Preset(
+        &dir.join("owner.glslp"),
+        &Default::default(),
+    ))
+    .unwrap();
+    assert!(c.take_overlay_error().is_none());
+    std::fs::remove_file(dir.join("dummy.png")).unwrap();
+    c.upload_game(&[180, 140, 100, 255].repeat((SRC_W * SRC_H) as usize));
+    c.begin_frame();
+    c.draw_list(&[
+        Draw::Game,
+        Draw::Rect {
+            x: 1.0,
+            y: 1.0,
+            w: 2.0,
+            h: 2.0,
+            colour: [0.0, 0.0, 1.0, 1.0],
+        },
+    ]);
+    let frame = c.read_frame();
+    let alpha = 128.0 / 255.0 * 0.14;
+    for (got, (game, overlay)) in
+        px(&frame, 360, 240)
+            .into_iter()
+            .zip([(100.0, 240.0), (140.0, 40.0), (180.0, 80.0)])
+    {
+        let expected = game * (1.0 - alpha) + overlay * alpha;
+        assert!(
+            (got as f32 - expected).abs() <= 1.0,
+            "{got} against {expected}"
+        );
+    }
+    assert_eq!(px(&frame, 1, 1), [0, 0, 255], "UI must not be tinted");
+    for image in ["missing.png", "small.png"] {
+        preset(image);
+        c.set_shader(ShaderChoice::Preset(
+            &dir.join("owner.glslp"),
+            &Default::default(),
+        ))
+        .unwrap();
+        let error = c.take_overlay_error().expect("explicit image error");
+        assert!(error.contains(image), "{error}");
+        if image == "small.png" {
+            assert!(error.contains("720x480"), "{error}");
+        }
+        assert_eq!(
+            c.shader_profile().unwrap().core_options["mgba_color_correction"],
+            "GBA"
+        );
+        c.begin_frame();
+        c.draw_game();
+        assert_eq!(
+            px(&c.read_frame(), 360, 240),
+            [100, 140, 180],
+            "shader chain must keep rendering"
+        );
+        assert!(c.take_shader_error().is_none());
+    }
+    png("dummy.png", OUT_W, OUT_H);
+    preset("dummy.png");
+    c.set_shader(ShaderChoice::Preset(
+        &dir.join("owner.glslp"),
+        &Default::default(),
+    ))
+    .unwrap();
+    assert!(c
+        .set_shader(ShaderChoice::Preset(
+            &dir.join("missing.glslp"),
+            &Default::default()
+        ))
+        .is_err());
+    assert!(c.shader_profile().is_none());
+    c.set_shader(ShaderChoice::Plain).unwrap();
+    c.begin_frame();
+    c.draw_game();
+    assert_eq!(px(&c.read_frame(), 360, 240), [100, 140, 180]);
+    std::fs::remove_dir_all(dir).unwrap();
 }

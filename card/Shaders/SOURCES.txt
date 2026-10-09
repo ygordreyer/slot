@@ -88,3 +88,18 @@ has no license header or accompanying license. The licensed color-motionblur
 variant is included instead.
 No GB/GBC-only presets are included. No candidate exceeded the stated
 sampling budget; exclusions above concern licensing and GLES 2 syntax.
+
+Owner-requested additions (bundle total: 14 presets)
+FILE | UPSTREAM PATH | LICENSE | AUTHOR
+handheld/shaders/color/vba-color.glsl | libretro/glsl-shaders: handheld/shaders/color/vba-color.glsl | Public domain | hunterk, modified by Pokefan531
+handheld/shaders/lcd3x.glsl | libretro/glsl-shaders: handheld/shaders/lcd3x.glsl | Public domain | Gigaherz
+interpolation/shaders/pixellate.glsl | libretro/glsl-shaders: interpolation/shaders/pixellate.glsl | ISC-style permission notice (retained in source) | Fes
+interpolation/shaders/sharp-shimmerless.glsl | zadpos/Sharp-Shimmerless-Shader: shaders_glsl/shaders/sharp-shimmerless.glsl | CC0-1.0 (upstream LICENSE.txt) | zadpos
+interpolation/shaders/sharp-shimmerless.LICENSE.txt | zadpos/Sharp-Shimmerless-Shader: LICENSE.txt | CC0-1.0 | zadpos
+handheld/vba-color-lcd3x.glslp | Local recipe using the VBA-Color and LCD3x paths above | GPL-3.0-or-later local recipe; pass licenses above | slot contributors
+handheld/vba-color-lcd1x.glslp | Local recipe using VBA-Color above and existing handheld/shaders/lcd1x.glsl | GPL-3.0-or-later local recipe; LCD1x GPL-2.0-or-later | slot contributors
+interpolation/pixellate-sharp-shimmerless.glslp | Local recipe using the interpolation paths above | GPL-3.0-or-later local recipe; pass licenses above | slot contributors
+Added shader sources and the CC0 license are copied byte-for-byte from target/ref,
+except pixellate.glsl: COMPAT_PRECISION is matched between stages (highp when
+GL_FRAGMENT_PRECISION_HIGH is available, mediump otherwise) for GLES 2 linking.
+The interpolation recipe carries no profile keys or third-party overlay assets.

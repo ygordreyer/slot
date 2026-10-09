@@ -64,6 +64,13 @@ impl QuickRow {
         }
     }
 
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            QuickRow::Shader => Some("3X INTEGER"),
+            _ => None,
+        }
+    }
+
     pub fn opens(self) -> bool {
         matches!(
             self,
@@ -92,16 +99,20 @@ pub enum QuickValue {
     Speed6,
     On,
     Off,
+    Gba,
+    Auto,
 }
 
 impl QuickValue {
-    pub const ALL: [QuickValue; 6] = [
+    pub const ALL: [QuickValue; 8] = [
         QuickValue::Speed2,
         QuickValue::Speed3,
         QuickValue::Speed4,
         QuickValue::Speed6,
         QuickValue::On,
         QuickValue::Off,
+        QuickValue::Gba,
+        QuickValue::Auto,
     ];
 
     pub fn index(self) -> usize {
@@ -116,6 +127,8 @@ impl QuickValue {
             QuickValue::Speed6 => "6×",
             QuickValue::On => "On",
             QuickValue::Off => "Off",
+            QuickValue::Gba => "GBA",
+            QuickValue::Auto => "Auto",
         }
     }
 
@@ -151,7 +164,42 @@ const LEGEND_Y: f32 = 427.0;
 const DIM_INK: [u8; 3] = [0x9a, 0x9a, 0xa4];
 
 pub fn quick_label_face(row: QuickRow) -> UndoFace {
+    if row == QuickRow::Shader {
+        return shader_scale_face();
+    }
     quick_text_face(row.label(), MENU_INK)
+}
+
+fn shader_scale_face() -> UndoFace {
+    let Some(font) = text::label_font() else {
+        return UndoFace {
+            rgba: Vec::new(),
+            w: 0,
+            h: 0,
+        };
+    };
+    let lines = [
+        (QuickRow::Shader.label(), 24.0, 24u32),
+        (QuickRow::Shader.note().unwrap(), 12.0, 16u32),
+    ];
+    let width = lines
+        .iter()
+        .map(|(line, px, _)| text::line_width(font, line, *px, 0.0))
+        .fold(0.0, f32::max);
+    let w = width.ceil() as u32 + 2 * MENU_PAD;
+    let mut rgba = vec![0u8; (w * MENU_H * 4) as usize];
+    let mut offset = 0;
+    for (line, px, h) in lines {
+        let layout = text::Layout {
+            lines: vec![line.into()],
+            px,
+            tracking: 0.0,
+        };
+        let end = offset + (w * h * 4) as usize;
+        text::draw_centred(&mut rgba[offset..end], w, h, &layout, MENU_INK);
+        offset = end;
+    }
+    UndoFace { rgba, w, h: MENU_H }
 }
 
 pub fn quick_value_face(text: &str, lit: bool) -> UndoFace {

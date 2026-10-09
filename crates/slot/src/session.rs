@@ -30,6 +30,9 @@ pub struct Session {
     reloading: bool,
     driven: bool,
     custom_shader: bool,
+    shader_profile: Option<slot_gfx::preset::Profile>,
+    profile_baseline: std::collections::BTreeMap<String, String>,
+    profile_applied: std::collections::BTreeSet<String>,
     /// The cheats the open list was made from, and whose cart they are. See `open_cheats`.
     cheat_list: Option<(Platform, String, Vec<slot_store::Cheat>)>,
 }
@@ -56,6 +59,9 @@ impl Session {
             reloading: false,
             driven: false,
             custom_shader: false,
+            shader_profile: None,
+            profile_baseline: Default::default(),
+            profile_applied: Default::default(),
             cheat_list: None,
         }
     }
@@ -162,14 +168,37 @@ impl Session {
     }
 
     pub fn set_custom_shader(&mut self, active: bool) {
+        self.set_shader_profile(active, None);
+    }
+
+    pub fn shader_profile(&self) -> Option<&slot_gfx::preset::Profile> {
+        self.shader_profile.as_ref()
+    }
+
+    pub fn set_shader_profile(&mut self, active: bool, profile: Option<slot_gfx::preset::Profile>) {
         self.custom_shader = active;
-        if self.app.core() == slot_store::Core::Mgba {
-            if let Some(emu) = &self.emu {
-                emu.set_option(
-                    "mgba_interframe_blending",
-                    if active { "OFF" } else { "mix" },
-                );
+        self.shader_profile = profile.filter(|_| active);
+        self.apply_shader_profile();
+    }
+
+    fn apply_shader_profile(&mut self) {
+        let plan = crate::shader_profile::options(
+            self.app.core(),
+            self.app.colour_correction(),
+            self.custom_shader,
+            self.shader_profile.as_ref(),
+            &self.profile_baseline,
+            &self.profile_applied,
+        );
+        if let Some(emu) = &self.emu {
+            for (key, value) in &plan.values {
+                emu.set_option(key, value);
             }
+            self.profile_applied = plan.applied;
+        }
+        self.app.set_profile_colour(plan.colour);
+        if plan.mismatch {
+            self.app.show_toast(Toast::ProfileCoreMismatch);
         }
     }
 
@@ -375,12 +404,8 @@ impl Session {
                 None => eprintln!("slot: link: a transport arrived with no core to run it"),
             }
         }
-        if let Some(on) = self.app.take_colour_correction() {
-            if let Some((key, value)) = crate::core::colour_option(self.app.core(), on) {
-                if let Some(emu) = &self.emu {
-                    emu.set_option(key, value);
-                }
-            }
+        if self.app.take_colour_correction().is_some() {
+            self.apply_shader_profile();
         }
         // SELECT+X. Carried here for the same reason colour correction is: `App` never touches
         // the card's cheat files or the core.
@@ -572,6 +597,8 @@ impl Session {
             player,
         );
         self.app.set_named_core(opened.named);
+        self.profile_baseline = crate::shader_profile::capture_baseline(opened.core.as_ref());
+        self.profile_applied.clear();
         let sav = persist::read_sav(&self.root, platform, stem);
         let ring = self.sink.ring();
         let emu = match player.filter(|_| platform == Platform::Gba) {
@@ -587,12 +614,6 @@ impl Session {
         };
         emu.set_volume(self.app.output_volume());
         emu.set_driven(self.driven);
-        if core == slot_store::Core::Mgba {
-            emu.set_option(
-                "mgba_interframe_blending",
-                if self.custom_shader { "OFF" } else { "mix" },
-            );
-        }
         // Queued behind the load, which is the first thing the worker does, so they land on a
         // loaded game. Never for a cable session: both devices run both consoles from the
         // host's state, and a cheat on one is a machine the other is not simulating.
@@ -608,6 +629,7 @@ impl Session {
         }
         self.app.set_snapshot(Box::new(emu.snapshot()));
         self.emu = Some(emu);
+        self.apply_shader_profile();
         self.framerate_generation = self.framerate_generation.wrapping_add(1);
     }
 
@@ -703,4 +725,159 @@ impl Session {
 pub(crate) fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("SLOT_TRACE").is_some())
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use crate::persist::Snapshot;
+    use slot_retro::{AvInfo, ButtonMask, CoreError, MockCore, RetroCore};
+    use slot_store::Core;
+    use slot_ui::{QuickRow, QuickValue};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    struct Recorder {
+        core: MockCore,
+        values: Arc<Mutex<BTreeMap<String, String>>>,
+    }
+    impl RetroCore for Recorder {
+        fn load(&mut self, path: &std::path::Path) -> Result<(), CoreError> {
+            self.core.load(path)
+        }
+        fn run_frame(&mut self, input: ButtonMask) {
+            self.core.run_frame(input);
+        }
+        fn video_xrgb8888(&self) -> &[u8] {
+            self.core.video_xrgb8888()
+        }
+        fn take_audio(&mut self) -> Vec<i16> {
+            self.core.take_audio()
+        }
+        fn serialize(&mut self) -> Result<Vec<u8>, CoreError> {
+            self.core.serialize()
+        }
+        fn unserialize(&mut self, state: &[u8]) -> Result<(), CoreError> {
+            self.core.unserialize(state)
+        }
+        fn save_ram(&self) -> Option<Vec<u8>> {
+            self.core.save_ram()
+        }
+        fn load_save_ram(&mut self, state: &[u8]) -> Result<(), CoreError> {
+            self.core.load_save_ram(state)
+        }
+        fn av_info(&self) -> AvInfo {
+            self.core.av_info()
+        }
+        fn set_option(&mut self, key: &str, value: &str) {
+            self.values.lock().unwrap().insert(key.into(), value.into());
+        }
+        fn option(&self, key: &str) -> Option<String> {
+            self.values.lock().unwrap().get(key).cloned()
+        }
+    }
+
+    fn game_open(session: &mut Session, which: Core) -> Arc<Mutex<BTreeMap<String, String>>> {
+        session.emu = None;
+        session.app.set_core(which);
+        let values = Arc::new(Mutex::new(BTreeMap::from([
+            ("mgba_audio_low_pass_filter".into(), "disabled".into()),
+            ("mgba_audio_low_pass_range".into(), "75".into()),
+        ])));
+        let core = Recorder {
+            core: MockCore::new(),
+            values: values.clone(),
+        };
+        session.profile_baseline = crate::shader_profile::capture_baseline(&core);
+        session.profile_applied.clear();
+        session.emu = Some(EmuHandle::spawn(
+            Box::new(core),
+            "mock".into(),
+            session.sink.ring(),
+            None,
+            None,
+        ));
+        session.apply_shader_profile();
+        flush(session);
+        values
+    }
+
+    fn flush(session: &Session) {
+        assert!(session.emu().unwrap().snapshot().state().is_some());
+    }
+
+    fn owner_profile() -> slot_gfx::preset::Profile {
+        slot_gfx::preset::parse_preset("shaders=1\nshader0=copy.glsl\nslot_core=mgba\nslot_core_options=mgba_color_correction;mgba_interframe_blending;mgba_audio_low_pass_filter;mgba_audio_low_pass_range\nmgba_color_correction=GBA\nmgba_interframe_blending=mix_smart\nmgba_audio_low_pass_filter=enabled\nmgba_audio_low_pass_range=30", std::path::Path::new("owner.glslp")).unwrap().profile
+    }
+
+    #[test]
+    fn profile_options_apply_on_select_and_game_open_and_restore_on_leave_or_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::boot(root.path().into());
+        let first = game_open(&mut session, Core::Mgba);
+        session.set_shader_profile(true, Some(owner_profile()));
+        flush(&session);
+        for (key, value) in &owner_profile().core_options {
+            assert_eq!(first.lock().unwrap()[key], *value);
+        }
+        assert_eq!(
+            session.app.quick_value(QuickRow::ColourCorrection),
+            Some(QuickValue::Gba)
+        );
+        let next = game_open(&mut session, Core::Mgba);
+        for (key, value) in &owner_profile().core_options {
+            assert_eq!(next.lock().unwrap()[key], *value);
+        }
+        session.set_shader_profile(true, None);
+        flush(&session);
+        {
+            let values = next.lock().unwrap();
+            assert_eq!(
+                values["mgba_color_correction"],
+                if session.app.colour_correction() {
+                    "Auto"
+                } else {
+                    "OFF"
+                }
+            );
+            assert_eq!(values["mgba_interframe_blending"], "OFF");
+            assert_eq!(values["mgba_audio_low_pass_filter"], "disabled");
+            assert_eq!(
+                values["mgba_audio_low_pass_range"], "75",
+                "restore actual core baseline"
+            );
+        }
+        assert_eq!(
+            session.app.quick_value(QuickRow::ColourCorrection),
+            Some(QuickValue::flag(session.app.colour_correction()))
+        );
+        session.set_shader_profile(true, Some(owner_profile()));
+        session.set_custom_shader(false);
+        flush(&session);
+        assert!(session.shader_profile().is_none());
+        let values = next.lock().unwrap();
+        assert_eq!(values["mgba_interframe_blending"], "mix");
+        assert_eq!(values["mgba_audio_low_pass_filter"], "disabled");
+        assert_eq!(values["mgba_audio_low_pass_range"], "75");
+    }
+
+    #[test]
+    fn profile_options_skip_mismatched_core_and_report_a_nonfatal_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::boot(root.path().into());
+        let values = game_open(&mut session, Core::Gpsp);
+        session.set_shader_profile(true, Some(owner_profile()));
+        flush(&session);
+        assert!(session.shader_profile().is_some() && session.custom_shader);
+        assert_eq!(session.app.core(), Core::Gpsp);
+        assert_eq!(session.app.toast(), Some(Toast::ProfileCoreMismatch));
+        let values = values.lock().unwrap();
+        assert!(!values.contains_key("mgba_color_correction"));
+        assert!(!values.contains_key("mgba_interframe_blending"));
+        assert_eq!(values["mgba_audio_low_pass_filter"], "disabled");
+        assert_eq!(
+            session.app.quick_value(QuickRow::ColourCorrection),
+            Some(QuickValue::flag(session.app.colour_correction()))
+        );
+    }
 }

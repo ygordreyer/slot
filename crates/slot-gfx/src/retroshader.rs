@@ -460,6 +460,7 @@ unsafe fn sampling(size: [u32; 2], linear: bool, wrap: Wrap, mipmap: bool, caps:
 }
 
 pub struct RetroShader {
+    pub profile: preset::Profile,
     passes: Vec<Pass>,
     luts: Vec<Lut>,
     parameters: Vec<Parameter>,
@@ -569,52 +570,24 @@ impl RetroShader {
         }
         let mut luts = Vec::new();
         for spec in preset.textures {
-            let file = std::fs::File::open(&spec.path).map_err(error)?;
-            let mut decoder = png::Decoder::new(file);
-            decoder
-                .set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-            let mut reader = decoder.read_info().map_err(error)?;
-            let mut bytes = vec![0; reader.output_buffer_size()];
-            let info = reader.next_frame(&mut bytes).map_err(error)?;
-            let channels = info.color_type.samples();
-            let mut rgba = Vec::with_capacity((info.width * info.height * 4) as usize);
-            for pixel in bytes[..info.buffer_size()].chunks(channels) {
-                match info.color_type {
-                    png::ColorType::Rgba => rgba.extend_from_slice(pixel),
-                    png::ColorType::Rgb => {
-                        rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255])
-                    }
-                    png::ColorType::Grayscale => {
-                        rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255])
-                    }
-                    png::ColorType::GrayscaleAlpha => {
-                        rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]])
-                    }
-                    _ => return Err(error("unsupported LUT PNG format")),
-                }
-            }
-            if info.width > caps.max_size || info.height > caps.max_size {
+            let image = crate::png_image::load(&spec.path).map_err(error)?;
+            let (width, height) = (image.width, image.height);
+            if width > caps.max_size || height > caps.max_size {
                 return Err(error("LUT exceeds GL_MAX_TEXTURE_SIZE"));
             }
             let id = crate::gl::texture(
-                info.width,
-                info.height,
+                width,
+                height,
                 gl::NEAREST,
                 gl::CLAMP_TO_EDGE,
                 gl::RGBA,
-                Some(&rgba),
+                Some(&image.rgba),
             );
             unsafe {
-                sampling(
-                    [info.width, info.height],
-                    spec.linear,
-                    spec.wrap,
-                    spec.mipmap,
-                    &caps,
-                );
+                sampling([width, height], spec.linear, spec.wrap, spec.mipmap, &caps);
             }
             luts.push(Lut {
-                tex: Texture::full(id, [info.width, info.height]),
+                tex: Texture::full(id, [width, height]),
                 spec,
             });
         }
@@ -667,6 +640,7 @@ impl RetroShader {
             }
         }
         let shader = Self {
+            profile: preset.profile,
             passes,
             luts,
             parameters,

@@ -378,6 +378,7 @@ pub struct App {
     snapshot: Option<Box<dyn Snapshot>>,
     core: Core,
     colour_pending: Option<bool>,
+    profile_colour: Option<QuickValue>,
     /// Every look the Shader row steps through: the two built in, then `Shaders/` by name.
     /// Read once at boot, as the carts are.
     shaders: Vec<String>,
@@ -545,6 +546,7 @@ impl App {
             snapshot: None,
             core: Core::default(),
             colour_pending: None,
+            profile_colour: None,
             shader_screen: shader_params::ParameterScreen::default(),
             shaders: vec![SHADER_LCD.to_string(), SHADER_OFF.to_string()],
             shader_pending: None,
@@ -937,7 +939,9 @@ impl App {
         match row {
             QuickRow::FastForward => QuickValue::speed(self.state.ff_speed),
             QuickRow::FastForwardSound => Some(QuickValue::flag(self.state.ff_sound)),
-            QuickRow::ColourCorrection => Some(QuickValue::flag(self.state.colour_correction)),
+            QuickRow::ColourCorrection => self
+                .profile_colour
+                .or(Some(QuickValue::flag(self.state.colour_correction))),
             QuickRow::ShowFps => Some(QuickValue::flag(self.state.show_framerate)),
             QuickRow::Rumble => Some(QuickValue::flag(self.state.rumble)),
             QuickRow::HomeWifi => Some(QuickValue::flag(self.state.home_wifi_enabled)),
@@ -1576,6 +1580,10 @@ impl App {
         self.state.ff_sound
     }
 
+    pub fn set_profile_colour(&mut self, value: Option<QuickValue>) {
+        self.profile_colour = value;
+    }
+
     pub fn colour_correction(&self) -> bool {
         self.state.colour_correction
     }
@@ -1976,6 +1984,10 @@ impl App {
             }
             QuickRow::FastForwardSound => s.ff_sound = !s.ff_sound,
             QuickRow::ColourCorrection => {
+                if self.profile_colour.is_some() {
+                    self.hud.toast(Toast::ProfileColourLocked, self.now());
+                    return;
+                }
                 s.colour_correction = !s.colour_correction;
                 self.colour_pending = Some(s.colour_correction);
             }
@@ -2033,6 +2045,10 @@ impl App {
             return true;
         }
         if action == Action::ColourCorrectionToggle {
+            if self.profile_colour.is_some() {
+                self.hud.toast(Toast::ProfileColourLocked, self.now());
+                return true;
+            }
             self.change_setting(QuickRow::ColourCorrection, true);
             let said = match self.state.colour_correction {
                 true => Toast::ColourOn,

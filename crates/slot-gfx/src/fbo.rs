@@ -33,6 +33,9 @@ pub struct Compositor {
     quad: Quad,
     game: GamePass,
     sprites: Sprites,
+    profile: Option<crate::preset::Profile>,
+    overlay: Option<(TexId, f32)>,
+    overlay_error: Option<String>,
 }
 
 impl Compositor {
@@ -73,6 +76,9 @@ impl Compositor {
                 quad: Quad::new(),
                 game: GamePass::new()?,
                 sprites: Sprites::new()?,
+                profile: None,
+                overlay: None,
+                overlay_error: None,
             })
         }
     }
@@ -81,11 +87,15 @@ impl Compositor {
     /// not compile or link puts the built-in LCD look back, so a bad file on the card never
     /// leaves the panel black, and hands the driver's log back for whoever wants to show it.
     pub fn set_shader(&mut self, choice: ShaderChoice) -> Result<(), GfxError> {
+        self.clear_profile();
         let look = match choice {
             ShaderChoice::Lcd => Look::Lcd,
             ShaderChoice::Plain => Look::Plain,
             ShaderChoice::Preset(path, saved) => match RetroShader::load(path, saved) {
-                Ok(shader) => Look::Retro(Box::new(shader)),
+                Ok(shader) => {
+                    self.install_profile(shader.profile.clone());
+                    Look::Retro(Box::new(shader))
+                }
                 Err(e) => {
                     self.game.set_look(Look::Lcd);
                     return Err(e);
@@ -103,6 +113,53 @@ impl Compositor {
         Ok(())
     }
 
+    fn clear_profile(&mut self) {
+        if let Some((tex, _)) = self.overlay.take() {
+            self.sprites.remove_texture(tex);
+        }
+        self.profile = None;
+        self.overlay_error = None;
+    }
+
+    fn install_profile(&mut self, profile: crate::preset::Profile) {
+        if let Some(path) = &profile.overlay {
+            match crate::png_image::overlay(path) {
+                Ok(image) => {
+                    let tex =
+                        self.sprites
+                            .create_texture_nearest(image.width, image.height, &image.rgba);
+                    self.overlay = Some((tex, profile.overlay_opacity));
+                }
+                Err(e) => self.overlay_error = Some(e),
+            }
+        }
+        self.profile = Some(profile);
+    }
+
+    pub fn shader_profile(&self) -> Option<&crate::preset::Profile> {
+        self.profile.as_ref()
+    }
+
+    pub fn take_overlay_error(&mut self) -> Option<String> {
+        self.overlay_error.take()
+    }
+
+    fn draw_overlay(&self) {
+        if let Some((tex, alpha)) = self.overlay {
+            self.sprites.draw(
+                &[Draw::Tex {
+                    x: 0.0,
+                    y: 0.0,
+                    w: OUT_W as f32,
+                    h: OUT_H as f32,
+                    tex,
+                    alpha,
+                }],
+                &self.quad,
+            );
+        }
+    }
+
     pub fn shader_parameters(&self) -> &[crate::preset::Parameter] {
         self.game.parameters()
     }
@@ -113,7 +170,11 @@ impl Compositor {
         self.game.set_rewinding(rewinding);
     }
     pub fn take_shader_error(&mut self) -> Option<String> {
-        self.game.take_shader_error()
+        let error = self.game.take_shader_error();
+        if error.is_some() {
+            self.clear_profile();
+        }
+        error
     }
 
     pub fn upload_game(&mut self, xrgb8888: &[u8]) {
@@ -122,6 +183,7 @@ impl Compositor {
 
     pub fn draw_game(&mut self) {
         self.game.draw(&self.quad);
+        self.draw_overlay();
     }
 
     pub fn draw_list(&mut self, items: &[Draw]) {
@@ -130,12 +192,13 @@ impl Compositor {
             match *item {
                 Draw::Game => {
                     self.sprites.draw(&items[from..i], &self.quad);
-                    self.game.draw(&self.quad);
+                    self.draw_game();
                 }
                 Draw::Shot { tex } => {
                     self.sprites.draw(&items[from..i], &self.quad);
                     if let Some(tex) = self.sprites.source(tex) {
                         self.game.draw_still(tex, &self.quad);
+                        self.draw_overlay();
                     }
                 }
                 _ => continue,

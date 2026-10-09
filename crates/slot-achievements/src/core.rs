@@ -106,6 +106,9 @@ impl RetroCore for Tracked {
     fn set_option(&mut self, key: &str, value: &str) {
         self.core.set_option(key, value);
     }
+    fn option(&self, key: &str) -> Option<String> {
+        self.core.option(key)
+    }
     fn set_frame_skip(&mut self, skip: bool) {
         self.core.set_frame_skip(skip);
     }

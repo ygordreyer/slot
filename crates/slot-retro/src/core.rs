@@ -84,6 +84,10 @@ pub trait RetroCore: Send {
         self.run_frame(p1);
     }
     fn set_option(&mut self, _key: &str, _value: &str) {}
+    /// Includes the declared default when an option has not been explicitly set.
+    fn option(&self, _key: &str) -> Option<String> {
+        None
+    }
     fn set_frame_skip(&mut self, _skip: bool) {}
     fn video_xrgb8888(&self) -> &[u8];
     fn take_audio(&mut self) -> Vec<i16>;

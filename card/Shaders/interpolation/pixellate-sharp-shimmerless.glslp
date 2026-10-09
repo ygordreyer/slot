@@ -1,0 +1,7 @@
+shaders = "2"
+shader0 = "shaders/pixellate.glsl"
+filter_linear0 = "true"
+wrap_mode0 = "clamp_to_edge"
+shader1 = "shaders/sharp-shimmerless.glsl"
+filter_linear1 = "true"
+wrap_mode1 = "clamp_to_edge"

@@ -46,6 +46,102 @@ pub struct Preset {
     pub passes: Vec<PassSpec>,
     pub textures: Vec<LutSpec>,
     pub overrides: BTreeMap<String, f32>,
+    pub profile: Profile,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverlayFit {
+    #[default]
+    Native,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Profile {
+    pub version: Option<u32>,
+    pub overlay: Option<PathBuf>,
+    pub overlay_opacity: f32,
+    pub overlay_fit: OverlayFit,
+    pub core: Option<String>,
+    pub core_options: BTreeMap<String, String>,
+    /// Values are deliberately opaque to the graphics and core lanes.
+    pub audio: BTreeMap<String, String>,
+    pub directory: PathBuf,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            version: None,
+            overlay: None,
+            overlay_opacity: 1.0,
+            overlay_fit: OverlayFit::Native,
+            core: None,
+            core_options: BTreeMap::new(),
+            audio: BTreeMap::new(),
+            directory: PathBuf::new(),
+        }
+    }
+}
+
+fn profile(kv: &BTreeMap<String, (String, PathBuf)>, path: &Path) -> Result<Profile, String> {
+    let get = |key: &str| kv.get(key).map(|(v, _)| v.as_str());
+    let version = match get("slot_profile_version") {
+        None => None,
+        Some("1") => Some(1),
+        Some(v) => return Err(format!("unsupported slot_profile_version={v}; expected 1")),
+    };
+    let opacity: f32 = get("slot_overlay_opacity")
+        .unwrap_or("1.0")
+        .parse()
+        .map_err(|_| "invalid slot_overlay_opacity; expected 0.0 to 1.0")?;
+    if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+        return Err("invalid slot_overlay_opacity; expected 0.0 to 1.0".into());
+    }
+    if get("slot_overlay_fit").is_some_and(|v| v != "native") {
+        return Err("unsupported slot_overlay_fit; expected native (720x480)".into());
+    }
+    let mut core_options = BTreeMap::new();
+    for key in get("slot_core_options")
+        .unwrap_or("")
+        .split(';')
+        .filter(|k| !k.is_empty())
+    {
+        let value = get(key)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("missing value for slot_core_options key {key}"))?;
+        let valid = match key {
+            "mgba_color_correction" => ["OFF", "GBA", "Auto"].contains(&value),
+            "mgba_interframe_blending" => [
+                "OFF",
+                "mix",
+                "mix_smart",
+                "lcd_ghosting",
+                "lcd_ghosting_fast",
+            ]
+            .contains(&value),
+            "mgba_audio_low_pass_filter" => ["disabled", "enabled"].contains(&value),
+            "mgba_audio_low_pass_range" => (5..=95).step_by(5).any(|n| n.to_string() == value),
+            _ => return Err(format!("unsupported slot_core_options key {key}")),
+        };
+        if !valid {
+            return Err(format!("invalid core option {key}={value}"));
+        }
+        core_options.insert(key.to_string(), value.to_string());
+    }
+    Ok(Profile {
+        version,
+        overlay: kv.get("slot_overlay").map(|(file, base)| base.join(file)),
+        overlay_opacity: opacity,
+        overlay_fit: OverlayFit::Native,
+        core: get("slot_core").map(str::to_string),
+        core_options,
+        audio: kv
+            .iter()
+            .filter(|(key, _)| key.starts_with("slot_audio_"))
+            .map(|(key, (value, _))| (key.clone(), value.clone()))
+            .collect(),
+        directory: path.parent().unwrap_or(Path::new("")).to_path_buf(),
+    })
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Parameter {
@@ -128,7 +224,7 @@ fn kind(v: &str) -> Result<ScaleType, String> {
         _ => Err(format!("unknown scale type {v}")),
     }
 }
-fn from_entries(kv: BTreeMap<String, (String, PathBuf)>) -> Result<Preset, String> {
+fn from_entries(kv: BTreeMap<String, (String, PathBuf)>, path: &Path) -> Result<Preset, String> {
     let get = |key: &str| kv.get(key).map(|(v, _)| v.as_str());
     let flag = |key: &str| -> Result<bool, String> {
         match get(key) {
@@ -155,7 +251,10 @@ fn from_entries(kv: BTreeMap<String, (String, PathBuf)>) -> Result<Preset, Strin
     if count == 0 || count > 64 {
         return Err("shaders count must be 1 to 64".into());
     }
-    let mut preset = Preset::default();
+    let mut preset = Preset {
+        profile: profile(&kv, path)?,
+        ..Default::default()
+    };
     for n in 0..count {
         let key = format!("shader{n}");
         let (file, base) = kv.get(&key).ok_or_else(|| format!("missing {key}"))?;
@@ -222,7 +321,7 @@ fn from_entries(kv: BTreeMap<String, (String, PathBuf)>) -> Result<Preset, Strin
 }
 
 pub fn parse_preset(text: &str, path: &Path) -> Result<Preset, String> {
-    from_entries(entries(text, path)?)
+    from_entries(entries(text, path)?, path)
 }
 
 /// The reader is injected so reference traversal is testable without a filesystem or GL.
@@ -274,7 +373,7 @@ pub fn resolve_preset(
         });
         Ok(preset)
     } else {
-        from_entries(visit(path, 0, read)?)
+        from_entries(visit(path, 0, read)?, path)
     }
 }
 
@@ -365,6 +464,163 @@ pub fn collect_parameters<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn with_profile(text: &str) -> Result<Preset, String> {
+        parse_preset(
+            &format!("shaders=1\nshader0=copy.glsl\n{text}"),
+            Path::new("Shaders/private/owner.glslp"),
+        )
+    }
+
+    #[test]
+    fn profile_full_owner_set_and_empty_defaults() {
+        let p = with_profile(r#"
+slot_profile_version = "1"
+slot_overlay = "../../Config/overlays/dummy.png"
+slot_overlay_opacity = "0.14"
+slot_overlay_fit = "native"
+slot_core = "mgba"
+slot_core_options = "mgba_color_correction;mgba_interframe_blending;mgba_audio_low_pass_filter;mgba_audio_low_pass_range"
+mgba_color_correction = "GBA"
+mgba_interframe_blending = "mix_smart"
+mgba_audio_low_pass_filter = "enabled"
+mgba_audio_low_pass_range = "30"
+slot_audio_rate = "48000"
+slot_audio_latency_ms = "256"
+slot_audio_resampler = "sinc"
+slot_audio_resampler_quality = "higher"
+slot_audio_sync = "true"
+slot_audio_gain_db = "-2.0"
+slot_audio_dsp = "../../Audio/ChipTuneEnhance.dsp"
+slot_audio_future = "  uninterpreted value  "
+"#).unwrap().profile;
+        assert_eq!(p.version, Some(1));
+        assert_eq!(p.directory, Path::new("Shaders/private"));
+        assert_eq!(
+            p.overlay.as_deref(),
+            Some(Path::new("Shaders/private/../../Config/overlays/dummy.png"))
+        );
+        assert_eq!(p.overlay_opacity, 0.14);
+        assert_eq!(p.overlay_fit, OverlayFit::Native);
+        assert_eq!(p.core.as_deref(), Some("mgba"));
+        assert_eq!(
+            p.core_options,
+            BTreeMap::from([
+                ("mgba_color_correction".into(), "GBA".into()),
+                ("mgba_interframe_blending".into(), "mix_smart".into()),
+                ("mgba_audio_low_pass_filter".into(), "enabled".into()),
+                ("mgba_audio_low_pass_range".into(), "30".into()),
+            ])
+        );
+        assert_eq!(p.audio.len(), 8);
+        for (key, value) in [
+            ("rate", "48000"),
+            ("latency_ms", "256"),
+            ("resampler", "sinc"),
+            ("resampler_quality", "higher"),
+            ("sync", "true"),
+            ("gain_db", "-2.0"),
+            ("dsp", "../../Audio/ChipTuneEnhance.dsp"),
+            ("future", "  uninterpreted value  "),
+        ] {
+            assert_eq!(p.audio[&format!("slot_audio_{key}")], value);
+        }
+        assert_eq!(
+            with_profile("").unwrap().profile,
+            Profile {
+                directory: "Shaders/private".into(),
+                ..Default::default()
+            }
+        );
+        for opacity in ["0", "1"] {
+            assert!(with_profile(&format!("slot_overlay_opacity={opacity}")).is_ok());
+        }
+    }
+
+    #[test]
+    fn profile_rejects_each_invalid_extension_value() {
+        for (text, expected) in [
+            ("slot_profile_version=2", "slot_profile_version"),
+            ("slot_profile_version=", "slot_profile_version"),
+            ("slot_overlay_opacity=no", "slot_overlay_opacity"),
+            ("slot_overlay_opacity=NaN", "slot_overlay_opacity"),
+            ("slot_overlay_opacity=inf", "slot_overlay_opacity"),
+            ("slot_overlay_opacity=-0.1", "slot_overlay_opacity"),
+            ("slot_overlay_opacity=1.1", "slot_overlay_opacity"),
+            ("slot_overlay_fit=stretch", "slot_overlay_fit"),
+            ("slot_core_options=mgba_color_correction", "missing value"),
+            (
+                "slot_core_options=mgba_color_correction\nmgba_color_correction=",
+                "missing value",
+            ),
+            (
+                "slot_core_options=unknown\nunknown=a",
+                "unsupported slot_core_options key",
+            ),
+        ] {
+            let error = with_profile(text).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
+        for (key, value) in [
+            ("mgba_color_correction", "enabled"),
+            ("mgba_interframe_blending", "Smart"),
+            ("mgba_audio_low_pass_filter", "on"),
+            ("mgba_audio_low_pass_range", "0"),
+            ("mgba_audio_low_pass_range", "100"),
+            ("mgba_audio_low_pass_range", "31"),
+        ] {
+            let error =
+                with_profile(&format!("slot_core_options={key}\n{key}={value}")).unwrap_err();
+            assert!(error.contains(&format!("invalid core option {key}={value}")));
+        }
+    }
+
+    #[test]
+    fn profile_accepts_all_pinned_mgba_option_values() {
+        for (key, values) in [
+            ("mgba_color_correction", vec!["OFF", "GBA", "Auto"]),
+            (
+                "mgba_interframe_blending",
+                vec![
+                    "OFF",
+                    "mix",
+                    "mix_smart",
+                    "lcd_ghosting",
+                    "lcd_ghosting_fast",
+                ],
+            ),
+            ("mgba_audio_low_pass_filter", vec!["disabled", "enabled"]),
+        ] {
+            for value in values {
+                assert!(with_profile(&format!("slot_core_options={key}\n{key}={value}")).is_ok());
+            }
+        }
+        for value in (5..=95).step_by(5) {
+            assert!(with_profile(&format!(
+                "slot_core_options=mgba_audio_low_pass_range\nmgba_audio_low_pass_range={value}"
+            ))
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn referenced_overlay_retains_origin_and_audio_exposes_selected_directory() {
+        let p = resolve_preset(Path::new("custom/owner.glslp"), &|path| {
+            Ok(if path == Path::new("custom/owner.glslp") {
+                "#reference ../base/look.glslp\nslot_audio_dsp=../Audio/filter.dsp"
+            } else {
+                "shaders=1\nshader0=copy.glsl\nslot_overlay=overlay.png"
+            }
+            .into())
+        })
+        .unwrap();
+        assert_eq!(
+            p.profile.overlay.unwrap(),
+            Path::new("custom/../base/overlay.png")
+        );
+        assert_eq!(p.profile.directory, Path::new("custom"));
+        assert_eq!(p.profile.audio["slot_audio_dsp"], "../Audio/filter.dsp");
+    }
+
     #[test]
     fn quoted_bare_paths_options_and_unknown_keys() {
         let p = parse_preset("shaders = \"1\"\nshader0 = \"../passes/a.glsl\"\nfilter_linear0 = true\nwrap_mode0 = repeat\nscale_type_x0 = viewport\nscale_y0 = 2\nframe_count_mod0 = 8\nalias0 = A\nfloat_framebuffer0 = true\nsrgb_framebuffer0 = true\nmipmap_input0 = true\ntextures = L\nL = lut.png\nL_linear = true\nparameters = P\nP = \"0.4\"\nunknown = ignored", Path::new("pack/look.glslp")).unwrap();
@@ -454,7 +710,7 @@ mod bundled_tests {
     fn bundled_shader_stages_compile_and_link_for_gles2_and_desktop() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../card/Shaders");
         let mut shaders = std::collections::BTreeSet::new();
-        for dir in ["crt", "handheld", "motionblur"] {
+        for dir in ["crt", "handheld", "interpolation", "motionblur"] {
             for entry in std::fs::read_dir(root.join(dir)).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|e| e == "glslp") {
@@ -529,6 +785,53 @@ mod bundled_tests {
         )
         .unwrap();
         (preset, parameters)
+    }
+
+    #[test]
+    fn owner_recipes_keep_parameters_filtering_and_three_times_presentation() {
+        for n in [1, 3] {
+            let (p, parameters) = bundled(&format!("handheld/vba-color-lcd{n}x.glslp"));
+            let value = |name: &str| parameters.iter().find(|p| p.name == name).unwrap().value;
+            assert_eq!(value("darken_screen"), 0.40);
+            assert_eq!(
+                value(if n == 1 {
+                    "BRIGHTEN_SCANLINES"
+                } else {
+                    "brighten_scanlines"
+                }),
+                26.50
+            );
+            assert_eq!(
+                value(if n == 1 {
+                    "BRIGHTEN_LCD"
+                } else {
+                    "brighten_lcd"
+                }),
+                5.20
+            );
+            assert!(p.passes.iter().all(|p| !p.linear && p.wrap == Wrap::Edge));
+            assert_eq!(
+                output_size(p.passes[0].scale, [240, 160], [720, 480], false).unwrap(),
+                [240, 160]
+            );
+            assert_eq!(
+                output_size(p.passes[1].scale, [240, 160], [720, 480], true).unwrap(),
+                [720, 480]
+            );
+            assert_eq!(p.profile.core_options["mgba_color_correction"], "OFF");
+        }
+        let (p, _) = bundled("interpolation/pixellate-sharp-shimmerless.glslp");
+        assert!(p.passes.iter().all(|p| p.linear && p.wrap == Wrap::Edge));
+        assert!(
+            p.profile.core_options.is_empty()
+                && p.profile.audio.is_empty()
+                && p.profile.overlay.is_none()
+        );
+        assert_eq!(p.passes[0].path.file_name().unwrap(), "pixellate.glsl");
+        assert_eq!(
+            p.passes[1].path.file_name().unwrap(),
+            "sharp-shimmerless.glsl"
+        );
     }
 
     #[test]
@@ -618,7 +921,7 @@ mod bundled_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../card/Shaders");
         let mut paths = Vec::new();
         walk(&root, &mut paths);
-        assert_eq!(paths.len(), 11);
+        assert_eq!(paths.len(), 14);
         for path in paths {
             let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| e.to_string());
             let preset = resolve_preset(&path, &read).unwrap();

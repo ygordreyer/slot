@@ -808,3 +808,32 @@ fn shader_a_opens_parameters_and_b_returns_with_edits_applied() {
     assert!(!app.shader_params_open());
     assert_eq!(app.quick_menu(), Some(QuickRow::Shader));
 }
+
+#[test]
+fn preset_colour_is_effective_and_locked_until_the_preset_is_left() {
+    let (d, mut app, _) = on_carousel();
+    open_at(&mut app, QuickRow::ColourCorrection);
+    for value in [QuickValue::Gba, QuickValue::Auto, QuickValue::Off] {
+        app.set_profile_colour(Some(value));
+        assert_eq!(app.quick_value(QuickRow::ColourCorrection), Some(value));
+        let global = app.colour_correction();
+        for button in [Btn::Left, Btn::Right] {
+            press(&mut app, button);
+        }
+        app.apply(Action::ColourCorrectionToggle);
+        assert_eq!(app.colour_correction(), global);
+        assert_eq!(read_slot_state(d.path()).colour_correction, global);
+        assert!(app.take_colour_correction().is_none());
+    }
+    app.set_profile_colour(None);
+    let before = app.colour_correction();
+    press(&mut app, Btn::Right);
+    assert_eq!(app.colour_correction(), !before);
+    assert_eq!(app.take_colour_correction(), Some(!before));
+}
+
+#[test]
+fn shader_row_exposes_exact_gba_presentation_scale() {
+    assert_eq!(QuickRow::Shader.label(), "Shader");
+    assert_eq!(QuickRow::Shader.note(), Some("3X INTEGER"));
+}
