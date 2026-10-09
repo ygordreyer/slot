@@ -7,7 +7,8 @@ use slot_store::Platform;
 use slot_ui::{FfState, Toast};
 
 use crate::app::{App, Phase};
-use crate::audio::{open_sink, AudioSink, Ring, Sfx, GBA_HZ};
+use crate::audio::look::BASELINE_LATENCY_MS;
+use crate::audio::{open_sink, AudioLook, AudioLookError, AudioSink, Ring, Sfx, GBA_HZ};
 use crate::core::open_core;
 use crate::emu::{CoreState, EmuHandle, Speed};
 use crate::frames::FrameRef;
@@ -22,6 +23,7 @@ pub struct Session {
     emu: Option<EmuHandle>,
     framerate_generation: u64,
     sink: Box<dyn AudioSink>,
+    audio_look: Option<AudioLook>,
     gestures: Gestures,
     pad: Pad,
     rewinding: bool,
@@ -39,7 +41,10 @@ pub struct Session {
 
 impl Session {
     pub fn boot(root: PathBuf) -> Self {
-        let mut sink: Box<dyn AudioSink> = open_sink();
+        Self::boot_with_sink(root, open_sink())
+    }
+
+    fn boot_with_sink(root: PathBuf, mut sink: Box<dyn AudioSink>) -> Self {
         if let Err(e) = sink.open(GBA_HZ) {
             eprintln!("slot: audio: {e}");
         }
@@ -51,6 +56,7 @@ impl Session {
             emu: None,
             framerate_generation: 0,
             sink,
+            audio_look: None,
             gestures: Gestures::new(),
             pad: Pad::default(),
             rewinding: false,
@@ -64,6 +70,65 @@ impl Session {
             profile_applied: Default::default(),
             cheat_list: None,
         }
+    }
+
+    pub fn audio_look(&self) -> Option<&AudioLook> {
+        self.audio_look.as_ref()
+    }
+
+    pub fn set_audio_look(&mut self, look: Option<AudioLook>) -> Result<(), AudioLookError> {
+        if self.audio_look == look {
+            return Ok(());
+        }
+        if let Some(emu) = &self.emu {
+            if let Err(error) = emu.suspend_audio() {
+                let _ = emu.set_audio_look(self.audio_look.clone());
+                return Err(error);
+            }
+        }
+        let config = |look: Option<&AudioLook>| {
+            (
+                look.map_or(GBA_HZ, AudioLook::output_rate),
+                look.map_or(BASELINE_LATENCY_MS, AudioLook::output_latency_ms),
+            )
+        };
+        let requested = config(look.as_ref());
+        let previous = config(self.audio_look.as_ref());
+        let result = (|| {
+            if requested != previous {
+                self.sink
+                    .open_with_latency(requested.0, requested.1)
+                    .map_err(|e| AudioLookError(e.to_string()))?;
+            }
+            if let Some(emu) = &self.emu {
+                emu.set_audio_look(look.clone())?;
+            } else if let Some(dsp) = look.as_ref().and_then(|l| l.dsp.as_ref()) {
+                dsp.build(GBA_HZ as f32)?;
+            }
+            if self.emu.is_none() {
+                self.sink.ring().clear();
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.audio_look = None;
+            let sink_restore = self.sink.open_with_latency(GBA_HZ, BASELINE_LATENCY_MS);
+            let worker_restore = self
+                .emu
+                .as_ref()
+                .map_or(Ok(()), |emu| emu.set_audio_look(None));
+            if self.emu.is_none() {
+                self.sink.ring().clear();
+            }
+            return match (sink_restore, worker_restore) {
+                (Ok(()), Ok(())) => Err(error),
+                (sink, worker) => Err(AudioLookError(format!(
+                    "{error}; baseline restore: sink {sink:?}, worker {worker:?}"
+                ))),
+            };
+        }
+        self.audio_look = look;
+        Ok(())
     }
 
     pub fn play_sfx(&mut self, sfx: Sfx) {
@@ -612,6 +677,14 @@ impl Session {
                 EmuHandle::spawn(tracked, rom, ring, sav, resume)
             }
         };
+        if let Some(look) = &self.audio_look {
+            if let Err(error) = emu.set_audio_look(Some(look.clone())) {
+                eprintln!("slot: audio look: {error}");
+                self.audio_look = None;
+                let _ = self.sink.open_with_latency(GBA_HZ, BASELINE_LATENCY_MS);
+                let _ = emu.set_audio_look(None);
+            }
+        }
         emu.set_volume(self.app.output_volume());
         emu.set_driven(self.driven);
         // Queued behind the load, which is the first thing the worker does, so they land on a
@@ -879,5 +952,225 @@ mod profile_tests {
             session.app.quick_value(QuickRow::ColourCorrection),
             Some(QuickValue::flag(session.app.colour_correction()))
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_look_tests {
+    use super::*;
+    use crate::audio::look::ResamplerKind;
+    use crate::audio::sinc::SincQuality;
+    use crate::audio::{AudioError, StubSink};
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingSink {
+        stub: StubSink,
+        calls: Arc<Mutex<Vec<(u32, u32)>>>,
+        fail: bool,
+    }
+    impl AudioSink for RecordingSink {
+        fn open(&mut self, rate: u32) -> Result<(), AudioError> {
+            self.open_with_latency(rate, 40)
+        }
+        fn open_with_latency(&mut self, rate: u32, latency: u32) -> Result<(), AudioError> {
+            self.calls.lock().unwrap().push((rate, latency));
+            if self.fail && rate == 48000 {
+                return Err(AudioError::Device("requested rate refused".into()));
+            }
+            self.stub.open(rate)
+        }
+        fn ring(&self) -> Arc<Ring> {
+            self.stub.ring()
+        }
+    }
+    fn look() -> AudioLook {
+        AudioLook {
+            rate: Some(48000),
+            latency_ms: Some(256),
+            resampler: Some(ResamplerKind::Sinc),
+            quality: Some(SincQuality::Higher),
+            gain_db: Some(-2.0),
+            ..AudioLook::default()
+        }
+    }
+    fn session(fail: bool) -> (tempfile::TempDir, Session, Arc<Mutex<Vec<(u32, u32)>>>) {
+        let root = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = RecordingSink {
+            stub: StubSink::new(),
+            calls: calls.clone(),
+            fail,
+        };
+        let session = Session::boot_with_sink(root.path().into(), Box::new(sink));
+        (root, session, calls)
+    }
+    #[test]
+    fn apply_and_restore_baseline() {
+        let (_root, mut session, calls) = session(false);
+        session.audio_ring().push(&[1234; 100]);
+        session.set_audio_look(Some(look())).unwrap();
+        assert_eq!(session.audio_ring().sample_rate(), 48000);
+        assert_eq!(session.audio_ring().queued_frames(), 0);
+        assert_eq!(session.audio_look().unwrap().gain_db, Some(-2.0));
+        session.set_audio_look(None).unwrap();
+        assert_eq!(session.audio_ring().sample_rate(), 32768);
+        assert_eq!(session.audio_ring().queued_frames(), 0);
+        assert_eq!(session.audio_look(), None);
+        let baseline = AudioLook::default();
+        assert_eq!(baseline.output_latency_ms(), 40);
+        assert_eq!(
+            baseline.resampler.unwrap_or_default(),
+            ResamplerKind::Linear
+        );
+        assert_eq!(baseline.gain(), 1.0);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [(32768, 40), (48000, 256), (32768, 40)]
+        );
+    }
+    #[test]
+    fn failed_reopen_restores_baseline() {
+        let (_root, mut session, calls) = session(true);
+        session.emu = Some(EmuHandle::spawn(
+            Box::new(slot_retro::MockCore::new()),
+            PathBuf::from("mock"),
+            session.audio_ring(),
+            None,
+            None,
+        ));
+        session
+            .set_audio_look(Some(AudioLook {
+                gain_db: Some(-2.0),
+                ..AudioLook::default()
+            }))
+            .unwrap();
+        let error = session.set_audio_look(Some(look())).unwrap_err();
+        assert!(error.to_string().contains("requested rate refused"));
+        assert_eq!(session.audio_ring().sample_rate(), 32768);
+        assert_eq!(session.audio_look(), None);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [(32768, 40), (48000, 256), (32768, 40)]
+        );
+    }
+    #[test]
+    fn gain_only_does_not_reopen_sink() {
+        let (_root, mut session, calls) = session(false);
+        session
+            .set_audio_look(Some(AudioLook {
+                gain_db: Some(-2.0),
+                ..AudioLook::default()
+            }))
+            .unwrap();
+        session.set_audio_look(None).unwrap();
+        assert_eq!(*calls.lock().unwrap(), [(32768, 40)]);
+    }
+    #[test]
+    fn worker_reconfigures_while_paused_then_restores() {
+        let (_root, mut session, calls) = session(false);
+        let emu = EmuHandle::spawn(
+            Box::new(slot_retro::MockCore::new()),
+            PathBuf::from("mock"),
+            session.audio_ring(),
+            None,
+            None,
+        );
+        session.emu = Some(emu);
+        session.set_audio_look(Some(look())).unwrap();
+        assert_eq!(session.audio_ring().sample_rate(), 48000);
+        assert_eq!(session.emu().unwrap().observed_speed(), Speed::Paused);
+        session.set_audio_look(None).unwrap();
+        assert_eq!(session.audio_ring().sample_rate(), 32768);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [(32768, 40), (48000, 256), (32768, 40)]
+        );
+    }
+    fn mock_cart() -> slot_store::Cart {
+        slot_store::Cart {
+            stem: "mock".into(),
+            title: "Mock".into(),
+            rom: PathBuf::from("mock"),
+            platform: Platform::Gba,
+            label: None,
+            code: String::new(),
+            shell: None,
+        }
+    }
+
+    #[test]
+    fn updates_and_volume_preserve_active_look_and_queued_audio() {
+        let (_root, mut session, calls) = session(false);
+        session.app = App::new(vec![mock_cart()]);
+        session.app.apply(Action::Insert);
+        session.app.take_sfx();
+        session.emu = Some(EmuHandle::spawn(
+            Box::new(slot_retro::MockCore::new()),
+            PathBuf::from("mock"),
+            session.audio_ring(),
+            None,
+            None,
+        ));
+        session.set_audio_look(Some(look())).unwrap();
+        session.audio_ring().push(&[1234; 100]);
+        // Keep the worker paused while exercising per-frame and volume handling.
+        for _ in 0..8 {
+            session.update(0.0);
+        }
+        for action in [
+            Action::VolumeUp,
+            Action::VolumeDown,
+            Action::MuteToggle,
+            Action::MuteToggle,
+        ] {
+            session.act(action);
+        }
+        session.set_audio_look(Some(look())).unwrap();
+        assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
+        assert_eq!(session.audio_ring().queued_frames(), 50);
+        assert_eq!(*calls.lock().unwrap(), [(32768, 40), (48000, 256)]);
+        session
+            .set_audio_look(Some(AudioLook {
+                gain_db: Some(-3.0),
+                ..look()
+            }))
+            .unwrap();
+        assert_eq!(session.emu().unwrap().audio_look_commands(), 2);
+        session.set_audio_look(None).unwrap();
+        assert_eq!(session.emu().unwrap().audio_look_commands(), 3);
+    }
+
+    #[test]
+    fn new_game_workers_each_receive_the_look_once() {
+        let (_root, mut session, _calls) = session(false);
+        session.set_audio_look(Some(look())).unwrap();
+        for stem in ["first", "second"] {
+            let mut cart = mock_cart();
+            cart.stem = stem.into();
+            session.app = App::new(vec![cart]);
+            session.app.apply(Action::Insert);
+            session.spawn_core(stem, "off");
+            assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
+            session.update(0.0);
+            assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
+            session.emu = None;
+        }
+    }
+
+    #[test]
+    fn ui_sound_bypasses_look_gain_and_dsp() {
+        let (_root, mut session, _calls) = session(false);
+        session.set_audio_look(Some(AudioLook {
+            gain_db:Some(-120.0),
+            dsp:Some(crate::audio::dsp::DspConfig::parse("filters=1\nfilter0=panning\npanning_left_mix=\"0 0\"\npanning_right_mix=\"0 0\"").unwrap()),
+            ..AudioLook::default()
+        })).unwrap();
+        let mut expected = vec![12000i16, -12000, 5000, -5000];
+        crate::audio::volume::apply(&mut expected, session.app.output_volume());
+        session.mix_sfx(vec![12000, -12000, 5000, -5000]);
+        let mut got = vec![0i16; 4];
+        session.audio_ring().fill(&mut got);
+        assert_eq!(got, expected);
+        assert!(got.iter().any(|&x| x != 0));
     }
 }

@@ -1,8 +1,12 @@
 mod alsa;
+pub mod dsp;
+mod fft;
 #[cfg(feature = "host")]
 mod host;
+pub mod look;
 mod ring;
 mod sfx;
+pub mod sinc;
 mod sink;
 mod stub;
 pub mod volume;
@@ -10,6 +14,7 @@ pub mod volume;
 pub use alsa::{AlsaSink, Silence};
 #[cfg(feature = "host")]
 pub use host::HostAudio;
+pub use look::{AudioLook, AudioLookError};
 pub use ring::{ring_capacity, Ring};
 pub use sfx::Sfx;
 pub use sink::{AudioError, AudioSink};
