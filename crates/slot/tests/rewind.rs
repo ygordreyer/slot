@@ -1,17 +1,170 @@
 mod common;
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use slot::app::Phase;
+use slot::audio::Ring;
+use slot::emu::{EmuHandle, Speed};
 use slot::rewind::{Rewind, RewindThread};
 use slot::session::Session;
 use slot_input::{Action, Btn, Millis, RawEvent};
+use slot_retro::{AvInfo, ButtonMask, CoreError, RetroCore};
 use slot_store::{write_slot_state, SlotState};
 use slot_ui::{Draw, QuickRow};
 
 const STATE_LEN: usize = 400_000;
 const CHURN: usize = 12_000;
+
+struct FrameOriginCore {
+    frame: u64,
+    video: [u8; 8],
+    snapshots: Arc<AtomicBool>,
+    saved: Arc<AtomicU64>,
+    presents: Arc<AtomicU64>,
+    refuse_restore: bool,
+}
+
+impl RetroCore for FrameOriginCore {
+    fn load(&mut self, _rom: &std::path::Path) -> Result<(), CoreError> {
+        Ok(())
+    }
+    fn run_frame(&mut self, _input: ButtonMask) {
+        self.frame += 1;
+        self.video = self.frame.to_le_bytes();
+    }
+    fn video_xrgb8888(&self) -> &[u8] {
+        &self.video
+    }
+    fn take_audio(&mut self) -> Vec<i16> {
+        Vec::new()
+    }
+    fn serialize(&mut self) -> Result<Vec<u8>, CoreError> {
+        if !self.snapshots.load(Ordering::Relaxed) {
+            return Err(CoreError::State("no snapshot yet".into()));
+        }
+        self.saved.fetch_add(1, Ordering::Relaxed);
+        Ok(self.frame.to_le_bytes().to_vec())
+    }
+    fn unserialize(&mut self, data: &[u8]) -> Result<(), CoreError> {
+        if self.refuse_restore {
+            return Err(CoreError::State("restore refused".into()));
+        }
+        self.frame = u64::from_le_bytes(data.try_into().unwrap());
+        Ok(())
+    }
+    fn save_ram(&self) -> Option<Vec<u8>> {
+        None
+    }
+    fn load_save_ram(&mut self, _data: &[u8]) -> Result<(), CoreError> {
+        Ok(())
+    }
+    fn av_info(&self) -> AvInfo {
+        AvInfo {
+            fps: 60.0,
+            sample_rate: 32768.0,
+        }
+    }
+    fn pump_link(&mut self) {
+        self.presents.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn await_origin(condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "frame origin transition timed out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn origin_worker(
+    refuse_restore: bool,
+) -> (EmuHandle, Arc<AtomicBool>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    let snapshots = Arc::new(AtomicBool::new(false));
+    let saved = Arc::new(AtomicU64::new(0));
+    let presents = Arc::new(AtomicU64::new(0));
+    let emu = EmuHandle::spawn(
+        Box::new(FrameOriginCore {
+            frame: 0,
+            video: [0; 8],
+            snapshots: snapshots.clone(),
+            saved: saved.clone(),
+            presents: presents.clone(),
+            refuse_restore,
+        }),
+        "mock".into(),
+        Arc::new(Ring::new(0)),
+        None,
+        None,
+    );
+    emu.set_speed(Speed::Normal);
+    (emu, snapshots, saved, presents)
+}
+
+fn await_presents(presents: &AtomicU64, count: u64) {
+    let target = presents.load(Ordering::Relaxed) + count;
+    await_origin(|| presents.load(Ordering::Relaxed) >= target);
+}
+
+#[test]
+fn published_frame_origin_tracks_empty_history_rewind_exhaustion_pause_and_release() {
+    let (emu, snapshots, saved, presents) = origin_worker(false);
+    await_origin(|| emu.has_published());
+    emu.set_rewinding(true);
+    await_presents(&presents, 3);
+    let forward = emu.latest_frame().unwrap();
+    assert!(
+        !forward.rewound(),
+        "an empty rewind marked forward pixels as reverse"
+    );
+    let published = emu.published_count();
+    await_presents(&presents, 3);
+    assert_eq!(emu.published_count(), published);
+    assert!(emu.latest_frame().is_none());
+
+    snapshots.store(true, Ordering::Relaxed);
+    emu.set_rewinding(false);
+    await_origin(|| saved.load(Ordering::Relaxed) >= 3);
+    snapshots.store(false, Ordering::Relaxed);
+    emu.set_rewinding(true);
+    await_presents(&presents, 3);
+    let reverse = emu.latest_frame().unwrap();
+    assert!(reverse.rewound());
+    await_presents(&presents, saved.load(Ordering::Relaxed) + 3);
+    let last_reverse = emu.latest_frame().unwrap_or(reverse);
+    assert!(last_reverse.rewound());
+    let at_reverse = u64::from_le_bytes(last_reverse[..].try_into().unwrap());
+    let published = emu.published_count();
+    await_presents(&presents, 3);
+    assert_eq!(emu.published_count(), published);
+    assert!(emu.latest_frame().is_none());
+    assert!(last_reverse.rewound());
+
+    emu.set_speed(Speed::Paused);
+    await_presents(&presents, 3);
+    assert_eq!(emu.published_count(), published);
+    emu.set_rewinding(false);
+    emu.set_speed(Speed::Normal);
+    await_origin(|| emu.published_count() > published);
+    let resumed = emu.latest_frame().unwrap();
+    assert!(!resumed.rewound());
+    assert!(u64::from_le_bytes(resumed[..].try_into().unwrap()) > at_reverse);
+}
+
+#[test]
+fn a_failed_state_restore_publishes_forward_frame_origin() {
+    let (emu, snapshots, saved, presents) = origin_worker(true);
+    snapshots.store(true, Ordering::Relaxed);
+    await_origin(|| saved.load(Ordering::Relaxed) >= 2);
+    emu.set_rewinding(true);
+    await_presents(&presents, 3);
+    assert!(!emu.latest_frame().unwrap().rewound());
+}
 
 fn noise(seed: u32, len: usize) -> Vec<u8> {
     let mut x = seed;

@@ -4,7 +4,7 @@ fn publish(frames: &Frames, value: u8, size: usize) {
     let mut buf = frames.take_write();
     buf.clear();
     buf.resize(size, value);
-    frames.publish(buf);
+    frames.publish(buf, false);
 }
 
 #[test]
@@ -41,4 +41,25 @@ fn buffers_are_recycled_rather_than_reallocated_per_frame() {
         "{} buffers in flight, the pool is leaking",
         f.allocated()
     );
+}
+
+#[test]
+fn rewind_origin_stays_with_its_pixels_when_frames_are_replaced_and_recycled() {
+    let frames = Frames::new(4);
+    frames.publish(vec![1; 4], true);
+    let held = frames.latest().unwrap();
+    frames.publish(vec![2; 4], false);
+    frames.publish(vec![3; 4], true);
+    let latest = frames.latest().unwrap();
+    assert_eq!(&latest[..], &[3; 4]);
+    assert!(latest.rewound());
+    assert_eq!(&held[..], &[1; 4]);
+    assert!(held.rewound());
+    drop(held);
+    drop(latest);
+
+    publish(&frames, 4, 4);
+    let forward = frames.latest().unwrap();
+    assert_eq!(&forward[..], &[4; 4]);
+    assert!(!forward.rewound());
 }
