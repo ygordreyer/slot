@@ -353,6 +353,10 @@ pub struct App {
     core_legend_faces: Vec<(TexId, u32)>,
     /// than a phase: `Phase::Playing` is
     game_menu: Option<GameMenu>,
+    game_picker: Option<bool>,
+    achievement_screen: Option<crate::achievement_screen::Selection>,
+    achievement_count: usize,
+    achievement_description_pages: usize,
     link_sprites: Option<LinkSprites>,
     link_hardware: LinkKind,
     last_role: LinkRow,
@@ -516,6 +520,10 @@ impl App {
             core_chip_shadow_face: None,
             core_legend_faces: Vec::new(),
             game_menu: None,
+            game_picker: None,
+            achievement_screen: None,
+            achievement_count: 0,
+            achievement_description_pages: 1,
             link_sprites: None,
             link_hardware: LinkKind::Cable,
             last_role: LinkRow::Host,
@@ -1028,7 +1036,7 @@ impl App {
     /// a moment after SELECT+X, and a great deal can have happened in that moment.
     pub fn open_cheat_menu(&mut self, cheats: Vec<(String, bool)>) {
         let playing = matches!(self.phase, Phase::Playing { .. });
-        if !playing || cheats.is_empty() || self.game_menu.is_some() {
+        if !playing || cheats.is_empty() || self.game_menu_open() {
             return;
         }
         let (titles, enabled): (Vec<String>, Vec<bool>) = cheats.into_iter().unzip();
@@ -1594,7 +1602,77 @@ impl App {
     }
 
     pub fn game_menu_open(&self) -> bool {
-        self.game_menu.is_some()
+        self.game_menu.is_some() || self.game_picker.is_some() || self.achievement_screen.is_some()
+    }
+
+    pub fn game_picker(&self) -> Option<bool> {
+        self.game_picker
+    }
+
+    pub fn achievement_screen(&self) -> Option<crate::achievement_screen::Selection> {
+        self.achievement_screen
+    }
+
+    pub fn achievement_platform_supported(&self) -> bool {
+        self.platform == Platform::Gba
+    }
+
+    pub fn observe_achievement_description_pages(&mut self, pages: usize) {
+        self.achievement_description_pages = pages.max(1);
+        if let Some(selection) = self.achievement_screen.as_mut() {
+            selection.description_page = selection.description_page.min(pages.saturating_sub(1));
+        }
+    }
+
+    pub fn observe_achievement_count(&mut self, count: usize) {
+        self.achievement_count = count;
+        if let Some(selection) = self.achievement_screen.as_mut() {
+            selection.clamp(count);
+        }
+    }
+
+    fn game_picker_input(&mut self, action: Action) {
+        match action {
+            Action::GbaDown(Btn::Up) | Action::GbaDown(Btn::Down) => {
+                self.game_picker = self.game_picker.map(|link| !link);
+            }
+            Action::GbaDown(Btn::A) => {
+                if self.game_picker.take() == Some(true) {
+                    self.open_link_menu();
+                } else {
+                    self.achievement_screen = Some(Default::default());
+                }
+            }
+            Action::GbaDown(Btn::B) | Action::GameMenu => self.close_game_menu(),
+            _ => {}
+        }
+    }
+
+    fn achievement_input(&mut self, action: Action) {
+        if action == Action::GameMenu {
+            return self.close_game_menu();
+        }
+        let Some(selection) = self.achievement_screen.as_mut() else {
+            return;
+        };
+        if action == Action::GbaDown(Btn::B) {
+            if selection.detail {
+                selection.detail = false;
+                selection.description_page = 0;
+            } else {
+                self.close_game_menu();
+            }
+            return;
+        }
+        let was_detail = selection.detail;
+        selection.input(action, self.achievement_count);
+        if was_detail {
+            selection.description_page = selection
+                .description_page
+                .min(self.achievement_description_pages.saturating_sub(1));
+        } else if selection.detail {
+            self.achievement_description_pages = 1;
+        }
     }
 
     pub fn game_menu(&self) -> Option<GameMenu> {
@@ -1743,6 +1821,18 @@ impl App {
                 self.wifi_input(Btn::B);
             }
             return;
+        }
+        if action == Action::Eject
+            && (self.game_picker.is_some() || self.achievement_screen.is_some())
+        {
+            self.close_game_menu();
+            return self.eject();
+        }
+        if self.game_picker.is_some() {
+            return self.game_picker_input(action);
+        }
+        if self.achievement_screen.is_some() {
+            return self.achievement_input(action);
         }
         if self.game_menu.is_some() {
             return self.game_menu_input(action);
@@ -3194,6 +3284,10 @@ impl App {
     }
 
     fn game_menu_shortcut(&mut self) {
+        self.game_picker = Some(false);
+    }
+
+    fn open_link_menu(&mut self) {
         let Some(client_id) = self.link_client_id() else {
             return self.open_game_menu();
         };
@@ -3397,6 +3491,8 @@ impl App {
     }
 
     fn close_game_menu(&mut self) {
+        self.game_picker = None;
+        self.achievement_screen = None;
         self.game_menu = None;
         if let Some(mut starting) = self.starting.take() {
             starting.starter.cancel();

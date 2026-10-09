@@ -547,3 +547,12 @@ fn seated(root: &Path, snapshot: Box<dyn Snapshot>, state: SlotState) -> App {
     }
     a
 }
+
+/// Enter the LINK child of the root picker, or close an existing link overlay.
+pub fn toggle_link_menu(app: &mut slot::app::App) {
+    app.apply(slot_input::Action::GameMenu);
+    if app.game_picker().is_some() {
+        app.apply(slot_input::Action::GbaDown(slot_input::Btn::Down));
+        app.apply(slot_input::Action::GbaDown(slot_input::Btn::A));
+    }
+}

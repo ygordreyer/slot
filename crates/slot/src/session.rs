@@ -102,6 +102,23 @@ impl Session {
         &self.app
     }
 
+    pub fn achievement_account_state(&self) -> slot_achievements::AccountState {
+        self.achievements.account_state()
+    }
+
+    pub fn achievement_snapshot_key(&self) -> (u64, u64) {
+        (
+            self.achievements.game_generation(),
+            self.achievements.snapshot_epoch(),
+        )
+    }
+
+    pub fn achievement_snapshot(
+        &self,
+    ) -> Option<std::sync::Arc<slot_achievements::GameAchievementSnapshot>> {
+        self.achievements.game_snapshot()
+    }
+
     pub fn take_achievement_notice(&self) -> Option<slot_achievements::Notice> {
         self.achievements.take_notice()
     }

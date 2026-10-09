@@ -23,7 +23,7 @@ fn applied_cheats_refuse_both_direct_and_reload_link_attempts() {
                 let (_root, mut app) = playing(core);
                 app.set_link_loaded(loaded);
                 app.set_cheats_applied(true);
-                app.apply(Action::GameMenu);
+                common::toggle_link_menu(&mut app);
                 if role == LinkRow::Join {
                     app.apply(Action::GbaDown(Btn::Right));
                 }
@@ -45,7 +45,7 @@ fn turning_cheats_off_allows_the_reload_again() {
     let (_root, mut app) = playing(Core::Gpsp);
     app.set_link_loaded("rfu");
     app.set_cheats_applied(true);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::A));
     assert_eq!(app.take_link_reload(), None);
     app.set_cheats_applied(false);
@@ -59,7 +59,7 @@ fn turning_cheats_off_allows_the_reload_again() {
 fn cheats_applied_by_a_reload_refuse_the_link_before_its_starter() {
     let (_root, mut app) = playing(Core::Gpsp);
     app.set_link_loaded("rfu");
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::A));
     assert_eq!(app.take_link_reload(), Some(("Emerald".into(), "auto")));
     assert_eq!(app.link_player(), None);
@@ -78,7 +78,7 @@ fn cheats_applied_by_a_reload_refuse_the_link_before_its_starter() {
 fn cancelling_a_reload_does_not_allow_cheat_changes_before_it_finishes() {
     let (_root, mut app) = playing(Core::Gpsp);
     app.set_link_loaded("rfu");
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::A));
     assert_eq!(app.take_link_reload(), Some(("Emerald".into(), "auto")));
     app.apply(Action::GbaDown(Btn::B));

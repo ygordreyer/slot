@@ -5,6 +5,10 @@ mod core;
 mod library;
 mod network;
 mod runtime;
+mod snapshot;
+pub use snapshot::{
+    AchievementSummary, AchievementView, GameAchievementSnapshot, GameAchievementState,
+};
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -69,6 +73,8 @@ pub enum SyncStatus {
 #[derive(Default)]
 struct Status {
     account: Mutex<AccountState>,
+    snapshot: Mutex<snapshot::Published>,
+    epoch: AtomicU64,
     network: AtomicU8,
     unsaved: AtomicBool,
     reconnect: AtomicBool,
@@ -221,11 +227,28 @@ impl Service {
             AccountControl::SetEnabled(_) => "Saving...",
         }
         .into();
+        self.status.epoch.fetch_add(1, Ordering::AcqRel);
         self.enabled.store(false, Ordering::Release);
         if self.controls.send(Control::Account(control)).is_err() {
             account.busy = false;
             account.message = "Achievements worker unavailable".into();
         }
+    }
+
+    pub fn game_generation(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    pub fn snapshot_epoch(&self) -> u64 {
+        self.status.epoch.load(Ordering::Acquire)
+    }
+
+    /// Never waits for evaluation, filesystem work, or the store mutex.
+    pub fn game_snapshot(&self) -> Option<Arc<GameAchievementSnapshot>> {
+        let published = self.status.snapshot.try_lock().ok()?;
+        (published.snapshot.generation == self.game_generation()
+            && published.epoch == self.snapshot_epoch())
+        .then(|| published.snapshot.clone())
     }
 
     pub fn sync_progress(&self) -> Option<u8> {
@@ -284,6 +307,11 @@ struct Playing {
     achievements: BTreeMap<u32, storage::Achievement>,
     previous: Option<(u64, u64)>,
     warned_gap: bool,
+    catalog: storage::Game,
+    unlocked: std::collections::BTreeSet<u32>,
+    unsupported: std::collections::BTreeSet<u32>,
+    state: GameAchievementState,
+    dirty: bool,
 }
 
 fn run(
@@ -365,6 +393,16 @@ fn run(
         return;
     }
     let mut generation = 0;
+    let mut epoch = status.epoch.load(Ordering::Acquire);
+    let mut current_load: Option<network::Load> = None;
+    let mut account_pending = false;
+    let mut snapshot_state = GameAchievementState::Disabled;
+    let mut snapshot_title = String::new();
+    let mut snapshot_dirty = true;
+    let mut revision = 0;
+    let mut last_snapshot = status.snapshot.lock().unwrap().snapshot.clone();
+    let mut last_epoch = epoch;
+    let mut snapshot_updated = Instant::now();
     let mut playing: Option<Playing> = None;
     let mut unsaved = BTreeMap::new();
     let mut retried = Instant::now();
@@ -395,6 +433,8 @@ fn run(
                 }
                 Ok(Control::Account(control)) => {
                     retry_unsaved(&mut unsaved, &store, &notices);
+                    epoch = status.epoch.load(Ordering::Acquire);
+                    snapshot_dirty = true;
                     if !unsaved.is_empty() && !matches!(&control, AccountControl::SetEnabled(_)) {
                         let mut account = status.account.lock().unwrap();
                         account.busy = false;
@@ -403,18 +443,40 @@ fn run(
                         continue;
                     }
                     generation = 0;
+                    account_pending = true;
+                    snapshot_state = GameAchievementState::SigningIn;
+                    snapshot_dirty = true;
                     playing = None;
                     *status.presence.lock().unwrap() = None;
                     let _ = loads.send(network::Command::Account(control));
                 }
-                Ok(Control::Load(load)) => {
+                Ok(Control::Load(mut load)) => {
+                    epoch = status.epoch.load(Ordering::Acquire);
+                    load.epoch = epoch;
+                    current_load = Some(load.clone());
+                    snapshot_title = load
+                        .path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    snapshot_state = if !load.supported {
+                        GameAchievementState::NotSupportedPlatform
+                    } else {
+                        GameAchievementState::Loading
+                    };
+                    snapshot_dirty = true;
                     generation = load.generation;
                     playing = None;
                     *status.presence.lock().unwrap() = None;
                     // Cached games can start evaluating even while the HTTP worker is
                     // waiting on a timeout or preparing another ROM in the library.
                     let dir = store.lock().unwrap().dir.clone();
-                    if storage::read::<storage::Auth>(&dir.join("auth.json")).is_ok() {
+                    if load.supported
+                        && !account_pending
+                        && !status.account.lock().unwrap().busy
+                        && storage::read::<storage::Auth>(&dir.join("auth.json")).is_ok()
+                    {
                         if let Ok(hash) = library::hash(&dir, &load.path) {
                             if let Ok((game, unlocked)) =
                                 storage::read::<(storage::Game, std::collections::BTreeSet<u32>)>(
@@ -424,6 +486,8 @@ fn run(
                                 if game.console == 5 {
                                     let _ = cached_prepared.send(network::Prepared {
                                         generation,
+                                        epoch,
+                                        error: None,
                                         hash,
                                         game,
                                         unlocked,
@@ -434,10 +498,17 @@ fn run(
                         }
                     }
                     let _ = loads.send(network::Command::Load(
-                        enabled.load(Ordering::Acquire).then_some(load),
+                        (load.supported && enabled.load(Ordering::Acquire)).then_some(load),
                     ));
                 }
-                Ok(Control::Unload(id)) if id == generation => {
+                Ok(Control::Unload(id))
+                    if current_load
+                        .as_ref()
+                        .is_some_and(|load| load.generation == id) =>
+                {
+                    current_load = None;
+                    snapshot_title.clear();
+                    snapshot_dirty = true;
                     generation = 0;
                     playing = None;
                     *status.presence.lock().unwrap() = None;
@@ -448,93 +519,95 @@ fn run(
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
-        for prepared in prepared_rx.try_iter() {
-            if prepared.generation != generation || !enabled.load(Ordering::Acquire) {
-                continue;
-            }
-            if let Some(game) = playing.as_mut() {
-                // Preserve hits for unchanged definitions. Retire removed/unlocked entries
-                // and activate new or revised definitions when online data arrives.
-                game.runtime.activate_presence(&prepared.game.presence);
-                let store = store.lock().unwrap();
-                let mut updated = BTreeMap::new();
-                for achievement in prepared.game.achievements {
-                    if achievement.flags != 3
-                        || prepared.unlocked.contains(&achievement.id)
-                        || store.unlocks.contains_key(&achievement.id)
-                        || unsaved.contains_key(&achievement.id)
-                    {
-                        continue;
-                    }
-                    let unchanged = game
-                        .achievements
-                        .get(&achievement.id)
-                        .is_some_and(|old| old.definition == achievement.definition);
-                    if unchanged
-                        || game
-                            .runtime
-                            .activate(achievement.id, &achievement.definition)
-                    {
-                        updated.insert(achievement.id, achievement);
-                    }
-                }
-                for id in game
-                    .achievements
-                    .keys()
-                    .filter(|id| !updated.contains_key(id))
-                {
-                    game.runtime.deactivate(*id);
-                }
-                game.achievements = updated;
-                continue;
-            }
-            let Some(mut runtime) = runtime::Runtime::new() else {
-                continue;
-            };
-            runtime.activate_presence(&prepared.game.presence);
-            let store = store.lock().unwrap();
-            let mut achievements = BTreeMap::new();
-            let mut unsupported = 0;
-            for achievement in prepared.game.achievements {
-                if achievement.flags != 3
-                    || prepared.unlocked.contains(&achievement.id)
-                    || store.unlocks.contains_key(&achievement.id)
-                {
-                    continue;
-                }
-                if runtime.activate(achievement.id, &achievement.definition) {
-                    achievements.insert(achievement.id, achievement);
+        if account_pending && !status.account.lock().unwrap().busy {
+            account_pending = false;
+            if let Some(load) = current_load.clone() {
+                let mut load = load;
+                load.epoch = epoch;
+                generation = load.generation;
+                current_load = Some(load.clone());
+                snapshot_state = if load.supported {
+                    GameAchievementState::Loading
                 } else {
-                    unsupported += 1;
-                }
+                    GameAchievementState::NotSupportedPlatform
+                };
+                let _ = loads.send(network::Command::Load(
+                    (load.supported && enabled.load(Ordering::Acquire)).then_some(load),
+                ));
             }
-            drop(store);
+            snapshot_dirty = true;
+        }
+        for prepared in prepared_rx.try_iter() {
+            if prepared.generation != generation
+                || prepared.epoch != epoch
+                || !enabled.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            if let Some(error) = prepared.error {
+                if let Some(game) = playing.as_mut() {
+                    game.state = if error == GameAchievementState::Ready {
+                        snapshot::catalog_state(&game.catalog)
+                    } else {
+                        error.clone()
+                    };
+                    game.dirty = true;
+                }
+                snapshot_state = playing.as_ref().map_or(error, |game| game.state.clone());
+                snapshot_dirty = true;
+                continue;
+            }
+            if playing.is_none() {
+                let Some(runtime) = runtime::Runtime::new() else {
+                    snapshot_state =
+                        GameAchievementState::Error("Achievement runtime unavailable".into());
+                    snapshot_dirty = true;
+                    continue;
+                };
+                playing = Some(Playing {
+                    generation,
+                    hash: prepared.hash.clone(),
+                    runtime,
+                    achievements: BTreeMap::new(),
+                    previous: None,
+                    warned_gap: false,
+                    catalog: prepared.game.clone(),
+                    unlocked: Default::default(),
+                    unsupported: Default::default(),
+                    state: GameAchievementState::Loading,
+                    dirty: true,
+                });
+            }
+            let game = playing.as_mut().unwrap();
+            snapshot::prepare(
+                game,
+                prepared.game,
+                prepared.unlocked,
+                &store.lock().unwrap(),
+                &unsaved,
+            );
+            snapshot_state = game.state.clone();
             let state = if prepared.cached { "cached" } else { "online" };
-            let title = if prepared.game.id == 0 {
-                "No achievements for this ROM".into()
-            } else {
-                format!("Achievements ready ({state}, softcore)")
-            };
-            let detail = if unsupported == 0 {
-                prepared.game.title
-            } else {
-                format!("{} - {unsupported} unsupported", prepared.game.title)
-            };
             let _ = notices.send(Notice {
                 badge: None,
                 generation,
-                title,
-                detail,
+                title: if game.catalog.id == 0 {
+                    "No achievements for this ROM".into()
+                } else {
+                    format!("Achievements ready ({state}, softcore)")
+                },
+                detail: if game.unsupported.is_empty() {
+                    game.catalog.title.clone()
+                } else {
+                    format!(
+                        "{} - {} unsupported",
+                        game.catalog.title,
+                        game.unsupported.len()
+                    )
+                },
                 kind: NoticeKind::Status,
             });
-            playing = Some(Playing {
-                generation,
-                hash: prepared.hash,
-                runtime,
-                achievements,
-                previous: None,
-                warned_gap: false,
-            });
+            snapshot_dirty = true;
         }
         if !enabled.load(Ordering::Acquire) {
             playing = None;
@@ -554,6 +627,54 @@ fn run(
                 .as_ref()
                 .map(|game| (game.generation, game.runtime.presence()));
             presence_updated = Instant::now();
+        }
+        if snapshot_dirty
+            || playing.as_ref().is_some_and(|game| game.dirty)
+            || snapshot_updated.elapsed() >= Duration::from_secs(1)
+        {
+            let account = status.account.lock().unwrap().clone();
+            let state = if current_load.as_ref().is_some_and(|load| !load.supported) {
+                GameAchievementState::NotSupportedPlatform
+            } else if account.busy || account_pending {
+                GameAchievementState::SigningIn
+            } else if !account.enabled {
+                GameAchievementState::Disabled
+            } else if !account.signed_in {
+                GameAchievementState::SignedOut
+            } else {
+                snapshot_state.clone()
+            };
+            let mut next = if let Some(game) = playing.as_ref() {
+                snapshot::build(game, &store.lock().unwrap(), &unsaved)
+            } else {
+                GameAchievementSnapshot::empty(
+                    current_load.as_ref().map_or(0, |load| load.generation),
+                    state.clone(),
+                    snapshot_title.clone(),
+                )
+            };
+            next.state = state;
+            if next.game_title.is_empty() {
+                next.game_title = snapshot_title.clone();
+            }
+            // All allocation, runtime queries and filesystem checks precede publication.
+            next.revision = last_snapshot.revision;
+            if last_epoch != epoch || *last_snapshot != next {
+                revision += 1;
+                next.revision = revision;
+                let next = Arc::new(next);
+                *status.snapshot.lock().unwrap() = snapshot::Published {
+                    epoch,
+                    snapshot: next.clone(),
+                };
+                last_snapshot = next;
+                last_epoch = epoch;
+            }
+            if let Some(game) = playing.as_mut() {
+                game.dirty = false;
+            }
+            snapshot_dirty = false;
+            snapshot_updated = Instant::now();
         }
         status.unsaved.store(!unsaved.is_empty(), Ordering::Release);
     }
@@ -620,6 +741,8 @@ fn evaluate(
                     }
                 }
                 game.runtime.deactivate(id);
+                game.unlocked.insert(id);
+                game.dirty = true;
             }
         }
     }

@@ -12,6 +12,12 @@ unsafe extern "C" {
         funcs: c_int,
     ) -> c_int;
     fn rc_runtime_deactivate_achievement(runtime: *mut c_void, id: u32);
+    fn rc_runtime_get_achievement_measured(
+        runtime: *const c_void,
+        id: u32,
+        value: *mut u32,
+        target: *mut u32,
+    ) -> c_int;
     fn rc_runtime_reset(runtime: *mut c_void);
     fn rc_runtime_activate_richpresence(
         runtime: *mut c_void,
@@ -110,6 +116,14 @@ impl Runtime {
         unsafe {
             rc_runtime_deactivate_achievement(self.ptr.as_ptr(), id);
         }
+    }
+
+    pub fn measured(&self, id: u32) -> Option<(u32, u32)> {
+        let (mut value, mut target) = (0, 0);
+        let result = unsafe {
+            rc_runtime_get_achievement_measured(self.ptr.as_ptr(), id, &mut value, &mut target)
+        };
+        (result != 0 && target != 0).then_some((value, target))
     }
 
     pub fn reset(&mut self) {

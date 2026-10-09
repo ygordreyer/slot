@@ -1,3 +1,4 @@
+pub mod achievement_screen;
 mod achievement_ui;
 pub mod app;
 pub mod audio;

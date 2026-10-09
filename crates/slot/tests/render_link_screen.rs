@@ -352,7 +352,7 @@ fn legend_pixels(title: &str, code: &str, name: &str) -> Vec<u8> {
     }
     let faces = legend_faces();
     app.set_link_legend_faces(faces.iter().map(|(t, f)| (*t, f.w)).collect());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(app.game_menu_open(), "{code} never opened its link screen");
     let mut out = Vec::new();
     app.draw(&mut out);
@@ -378,7 +378,7 @@ fn connected_legend_pixels(name: &str) -> Vec<u8> {
     let faces = legend_faces();
     app.set_link_legend_faces(faces.iter().map(|(t, f)| (*t, f.w)).collect());
     app.begin_link(0);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         matches!(app.game_menu(), Some(GameMenu::Linked { opened: true, .. })),
         "the shortcut did not open the connected screen over a live session"
@@ -439,7 +439,7 @@ fn banner_pixels(core: Core, title: &str, code: &str, name: &str) -> Vec<u8> {
     }
     let faces = toast_faces();
     app.set_toast_faces(faces.iter().map(|(t, _)| *t).collect());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         !app.game_menu_open(),
         "{code} on {core:?} opened a link screen instead of refusing"
@@ -595,7 +595,7 @@ fn first_step_pixels(warm: bool, name: &str) -> (Vec<u8>, Vec<RadioJob>) {
     app.set_radio_jobs(Box::new(radio.clone()));
     let faces = step_faces();
     app.set_link_step_faces(faces.iter().map(|(t, f)| (*t, f.w, f.h)).collect());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(app.game_menu_open(), "the link screen never opened");
     let (release, held) = channel::<()>();
     app.start_link(

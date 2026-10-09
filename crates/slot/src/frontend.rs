@@ -33,6 +33,7 @@ const ALERT_INK: [u8; 3] = [0xf0, 0xb4, 0x3c];
 pub struct Frontend {
     labels: crate::labels::Labels,
     achievements: crate::achievement_ui::Notifications,
+    achievement_screen: crate::achievement_screen::Screen,
     session: Session,
     exit_saved: Option<bool>,
     start: Instant,
@@ -271,6 +272,7 @@ impl Frontend {
         Frontend {
             labels,
             achievements: crate::achievement_ui::Notifications::new(),
+            achievement_screen: crate::achievement_screen::Screen::new(),
             session,
             exit_saved: None,
             start: now,
@@ -615,9 +617,12 @@ impl Frontend {
         self.session
             .app_mut()
             .set_achievement_notification_visible(self.achievements.visible());
+        self.achievement_screen
+            .update(&mut self.session, compositor);
         self.sample_framerate(Instant::now());
         self.framerate_face.sync(self.framerate.rates, compositor);
         self.session.app().draw(&mut self.draws);
+        self.achievement_screen.draw(&self.session, &mut self.draws);
         self.framerate_face.draw(
             self.framerate
                 .rates
