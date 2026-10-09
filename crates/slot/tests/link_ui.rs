@@ -74,7 +74,7 @@ fn fake_roles(app: &mut App) -> Vec<(TexId, u32, u32)> {
 #[test]
 fn select_and_menu_open_the_link_screen_on_host() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(app.game_menu(), Some(GameMenu::Pick(LinkRow::Host)));
     assert!(matches!(app.phase(), Phase::Playing { .. }));
 }
@@ -82,7 +82,7 @@ fn select_and_menu_open_the_link_screen_on_host() {
 #[test]
 fn the_link_screen_opens_under_mgba_on_its_own_cable() {
     let (mut app, _d) = playing_on(Core::Mgba);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(
         app.game_menu(),
         Some(GameMenu::Pick(LinkRow::Host)),
@@ -98,7 +98,7 @@ fn the_link_screen_opens_under_mgba_on_its_own_cable() {
 #[test]
 fn the_link_screen_on_gpsp_says_nothing_in_the_banner() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(app.game_menu_open());
     assert_eq!(app.toast(), None);
 }
@@ -106,7 +106,7 @@ fn the_link_screen_on_gpsp_says_nothing_in_the_banner() {
 #[test]
 fn left_and_right_swap_host_and_join_and_the_screen_remembers() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::Right));
     assert_eq!(app.game_menu(), Some(GameMenu::Pick(LinkRow::Join)));
     app.apply(Action::GbaDown(Btn::Left));
@@ -114,7 +114,7 @@ fn left_and_right_swap_host_and_join_and_the_screen_remembers() {
     app.apply(Action::GbaDown(Btn::Right));
     app.apply(Action::GbaDown(Btn::B));
     assert!(!app.game_menu_open());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(
         app.game_menu(),
         Some(GameMenu::Pick(LinkRow::Join)),
@@ -125,7 +125,7 @@ fn left_and_right_swap_host_and_join_and_the_screen_remembers() {
 #[test]
 fn b_on_pick_hands_the_game_back() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::B));
     assert!(!app.game_menu_open());
     assert!(matches!(app.phase(), Phase::Playing { .. }));
@@ -135,7 +135,7 @@ fn b_on_pick_hands_the_game_back() {
 fn the_game_menu_does_not_open_on_the_shelf() {
     let d = common::tmp_root_with_carts(&["Emerald", "Zzz"]);
     let mut app = common::boot(d.path());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(!app.game_menu_open(), "the shelf raised the in-game menu");
     assert!(matches!(app.phase(), Phase::Shelf));
     app.apply(Action::QuickMenu);
@@ -159,7 +159,7 @@ fn the_host_is_client_zero_and_the_joiner_client_one() {
 #[test]
 fn a_on_pick_starts_the_link_in_the_picked_role() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::Right));
     app.apply(Action::GbaDown(Btn::A));
     assert!(
@@ -185,7 +185,7 @@ fn each_failure_says_which_one_it_was() {
         (io::ErrorKind::ConnectionRefused, LinkFail::PeerVanished),
     ] {
         let (mut app, _d) = playing_on(Core::Gpsp);
-        app.apply(Action::GameMenu);
+        common::toggle_link_menu(&mut app);
         app.start_link(fake_starter(move |_, _| Err(io_err(kind))), 0);
         settle(&mut app);
         assert!(matches!(app.game_menu(), Some(GameMenu::Failed { fail, .. }) if fail == want));
@@ -208,7 +208,7 @@ fn each_failure_says_which_one_it_was() {
 #[test]
 fn b_on_a_failure_puts_the_player_back_in_the_game() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.start_link(fake_starter(|_, _| Err(io_err(io::ErrorKind::TimedOut))), 0);
     settle(&mut app);
     assert!(matches!(
@@ -230,7 +230,7 @@ fn b_on_a_failure_puts_the_player_back_in_the_game() {
 #[test]
 fn a_cancelled_link_says_nothing_and_returns_to_the_game() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.start_link(
         fake_starter(|_, cancel: &Cancel| {
             let deadline = Instant::now() + BAIL;
@@ -251,7 +251,7 @@ fn a_cancelled_link_says_nothing_and_returns_to_the_game() {
 #[test]
 fn a_link_that_comes_up_holds_linked_for_a_second_then_hands_the_game_back() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let port = common::free_port();
     let far = std::thread::spawn(move || TcpLink::host("127.0.0.1", port).expect("host"));
     std::thread::sleep(Duration::from_millis(150));
@@ -279,7 +279,7 @@ fn a_link_that_comes_up_holds_linked_for_a_second_then_hands_the_game_back() {
     for press in [Btn::A, Btn::B] {
         app.apply(Action::GbaDown(press));
     }
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         matches!(app.game_menu(), Some(GameMenu::Linked { .. })),
         "the hold took a press"
@@ -300,7 +300,7 @@ fn a_link_that_comes_up_holds_linked_for_a_second_then_hands_the_game_back() {
 #[test]
 fn a_peer_lost_during_the_hold_closes_the_screen_and_breaks_the_badge() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let port = common::free_port();
     let far = std::thread::spawn(move || TcpLink::host("127.0.0.1", port).expect("host"));
     std::thread::sleep(Duration::from_millis(150));
@@ -322,7 +322,7 @@ fn a_peer_lost_during_the_hold_closes_the_screen_and_breaks_the_badge() {
 #[test]
 fn b_during_the_radio_step_does_not_hand_the_game_back_early() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let (release, held) = channel::<()>();
     app.start_link(
         LinkStarter::spawn_with(
@@ -362,7 +362,7 @@ fn b_during_the_radio_step_does_not_hand_the_game_back_early() {
 #[test]
 fn a_shut_lid_cancels_the_link_it_interrupted() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let cancelled = Arc::new(AtomicBool::new(false));
     let seen = cancelled.clone();
     app.start_link(
@@ -397,7 +397,7 @@ fn the_shortcut_opens_the_connected_screen_over_a_live_session() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     let log = watched(&mut app);
     app.begin_link(0);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         matches!(app.game_menu(), Some(GameMenu::Linked { opened: true, .. })),
         "the shortcut did not open the connected screen"
@@ -414,7 +414,7 @@ fn the_shortcut_opens_the_connected_screen_over_a_live_session() {
 fn b_leaves_the_session_running() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     app.begin_link(0);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let log = watched(&mut app);
     app.apply(Action::GbaDown(Btn::B));
     assert!(!app.game_menu_open(), "B did not leave the screen");
@@ -429,7 +429,7 @@ fn b_leaves_the_session_running() {
 fn a_ends_the_session_and_says_so() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     app.begin_link(0);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let log = watched(&mut app);
     app.apply(Action::GbaDown(Btn::A));
     assert!(!app.link_active(), "A left the session running");
@@ -478,7 +478,7 @@ fn a_peer_ending_the_link_unplugs_on_this_device_too() {
 fn the_link_screen_draws_its_role_over_the_game() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     let roles = fake_roles(&mut app);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let mut out = Vec::new();
     app.draw(&mut out);
     let scrim = out
@@ -777,7 +777,7 @@ fn seated_on_platform(d: &TempDir, core: Core, platform: Platform) -> App {
 
 fn open_link_screen(d: &TempDir) -> Vec<Draw> {
     let mut app = seated_on_gpsp(d);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let mut out = Vec::new();
     app.draw(&mut out);
     out
@@ -870,7 +870,7 @@ fn idle(app: &mut App, ms: u64) {
 
 fn switched_and_picked() -> (App, TempDir) {
     let (mut app, d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::Right));
     select(&mut app);
     app.apply(Action::GbaDown(Btn::A));
@@ -881,7 +881,7 @@ fn switched_and_picked() -> (App, TempDir) {
 fn select_on_pick_switches_the_hardware_and_the_cart_keeps_it() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     app.set_link_sprites(fake_link_sprites());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(
         drawn_hardware(&app),
         LinkKind::Cable,
@@ -899,7 +899,7 @@ fn select_on_pick_switches_the_hardware_and_the_cart_keeps_it() {
         "SELECT did more than switch the hardware"
     );
     app.apply(Action::GbaDown(Btn::B));
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(
         drawn_hardware(&app),
         LinkKind::Wireless,
@@ -917,7 +917,7 @@ fn select_on_pick_switches_the_hardware_and_the_cart_keeps_it() {
 fn a_in_the_mode_the_game_already_runs_starts_the_link_straight_away() {
     let _link = common::link_port_lock();
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::Right));
     select(&mut app);
     select(&mut app);
@@ -1046,7 +1046,7 @@ fn a_reload_that_fails_goes_back_to_the_mode_the_game_came_from() {
     idle(&mut app, 150);
     assert!(!app.game_menu_open(), "a link started anyway");
     assert!(!app.link_active());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(
         drawn_hardware(&app),
         LinkKind::Cable,
@@ -1107,7 +1107,7 @@ fn select_is_refused_where_gpsp_would_link_the_same_either_way() {
     let d = common::tmp_root_with_carts(&["Zzz"]);
     common::write_retail_header(&d, "Mario Golf", "MARIO GOLF", "BMGE");
     let mut app = seated_on_gpsp(&d);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(drawn_hardware(&app), LinkKind::Wireless);
     app.apply(Action::GbaDown(Btn::Right));
     select(&mut app);
@@ -1134,7 +1134,7 @@ fn a_reloads_only_for_a_serial_the_core_was_not_loaded_with() {
     let _link = common::link_port_lock();
     let (mut app, _d) = playing_on(Core::Gpsp);
     app.set_link_loaded("rfu");
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::Right));
     select(&mut app);
     app.apply(Action::GbaDown(Btn::A));
@@ -1146,7 +1146,7 @@ fn a_reloads_only_for_a_serial_the_core_was_not_loaded_with() {
     assert!(reaches_waiting(&mut app), "A started no link");
     app.apply(Action::GbaDown(Btn::B));
     settle(&mut app);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     select(&mut app);
     app.apply(Action::GbaDown(Btn::A));
     assert_eq!(
@@ -1183,7 +1183,7 @@ fn a_switch_is_refused_over_a_resume_the_core_would_not_take() {
     let _link = common::link_port_lock();
     let (mut app, _d) = playing_on(Core::Gpsp);
     app.set_snapshot(Box::new(RefusedResume));
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::Right));
     select(&mut app);
     app.apply(Action::GbaDown(Btn::A));
@@ -1225,7 +1225,7 @@ fn pick_names_cancel_mode_swap_and_link_across_the_strip() {
         .map(|k| (TexId::from_raw(900 + k.index()), width(*k)))
         .collect();
     app.set_link_legend_faces(faces.clone());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let mut out = Vec::new();
     app.draw(&mut out);
     let mut keys: Vec<(f32, f32, LinkLegend)> = out
@@ -1293,6 +1293,10 @@ fn a_link_in_a_switched_mode_reloads_the_game_and_then_starts_the_link() {
         runs_at(&mut s, &mut now, Speed::Paused),
         "the game ran on behind the menu"
     );
+    step(&mut s, &mut now, &[RawEvent::Down(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Up(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Down(Btn::A)]);
+    step(&mut s, &mut now, &[RawEvent::Up(Btn::A)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Right)]);
     step(&mut s, &mut now, &[RawEvent::Up(Btn::Right)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Select)]);
@@ -1399,6 +1403,10 @@ fn a_game_that_will_not_load_again_comes_back_out_of_the_slot() {
         &[RawEvent::Up(Btn::Menu), RawEvent::Up(Btn::Select)],
     );
     assert!(s.app().game_menu_open(), "the chord never reached the app");
+    step(&mut s, &mut now, &[RawEvent::Down(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Up(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Down(Btn::A)]);
+    step(&mut s, &mut now, &[RawEvent::Up(Btn::A)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Right)]);
     step(&mut s, &mut now, &[RawEvent::Up(Btn::Right)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Select)]);
@@ -1445,7 +1453,7 @@ fn a_cart_gpsp_cannot_carry_is_refused_the_link_screen_and_told_why() {
     let d = common::tmp_root_with_carts(&["Apotris", "Zzz"]);
     common::write_retail_header(&d, "Apotris", "APOTRIS", "2ATE");
     let mut app = seated_on_gpsp(&d);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         !app.game_menu_open(),
         "a cart gpSP has no protocol for was offered a link screen"
@@ -1476,7 +1484,7 @@ fn a_cart_gpsp_carries_still_opens_the_link_screen() {
         let d = common::tmp_root_with_carts(&["Zzz"]);
         common::write_retail_header(&d, stem, title, code);
         let mut app = seated_on_gpsp(&d);
-        app.apply(Action::GameMenu);
+        common::toggle_link_menu(&mut app);
         assert!(app.game_menu_open(), "{code} was refused its link screen");
         assert_eq!(
             app.toast(),
@@ -1492,7 +1500,7 @@ fn a_cart_gpsp_cannot_link_is_refused_on_gpsp_and_carried_by_mgbas_cable() {
         let d = common::tmp_root_with_carts(&["Apotris", "Zzz"]);
         common::write_retail_header(&d, "Apotris", "APOTRIS", "2ATE");
         let mut app = seated_on(&d, core);
-        app.apply(Action::GameMenu);
+        common::toggle_link_menu(&mut app);
         assert_eq!(
             app.game_menu_open(),
             open,
@@ -1509,7 +1517,7 @@ fn a_wireless_adapter_cart_on_mgba_still_says_to_switch_to_gpsp() {
     let d = common::tmp_root_with_carts(&["Emerald", "Zzz"]);
     common::write_retail_header(&d, "Emerald", "POKEMON EMER", "BPEE");
     let mut app = seated_on(&d, Core::Mgba);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         !app.game_menu_open(),
         "mGBA offered a cable to a cart that talks to the Wireless Adapter"
@@ -1526,7 +1534,7 @@ fn a_game_boy_cart_links_on_mgba_and_is_refused_on_gpsp() {
     for (core, open) in [(Core::Mgba, true), (Core::Gpsp, false)] {
         let d = common::tmp_root_with_gb_carts(&["Pokemon Red", "Zzz"]);
         let mut app = seated_on_platform(&d, core, Platform::Gb);
-        app.apply(Action::GameMenu);
+        common::toggle_link_menu(&mut app);
         assert_eq!(
             app.game_menu_open(),
             open,
@@ -1572,7 +1580,7 @@ fn the_pick_legend_names_mode_only_where_the_hardware_can_be_switched() {
 
     let (mut app, _d) = playing_on(Core::Gpsp);
     app.set_link_legend_faces(faces.clone());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(
         drawn(&app)
             .iter()
@@ -1584,7 +1592,7 @@ fn the_pick_legend_names_mode_only_where_the_hardware_can_be_switched() {
     common::write_retail_header(&d, "Mario Golf", "MARIO GOLF", "BMGE");
     let mut app = seated_on_gpsp(&d);
     app.set_link_legend_faces(faces.clone());
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let out = drawn(&app);
     assert!(
         !out.iter()
@@ -1630,7 +1638,7 @@ fn watched(app: &mut App) -> RadioLog {
 fn opening_the_link_screen_warms_the_radio() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     let log = watched(&mut app);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert_eq!(log.jobs(), vec![RadioJob::Warm]);
 }
 
@@ -1638,7 +1646,7 @@ fn opening_the_link_screen_warms_the_radio() {
 fn leaving_the_link_screen_without_a_session_cools_it() {
     let (mut app, _d) = playing_on(Core::Gpsp);
     let log = watched(&mut app);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     app.apply(Action::GbaDown(Btn::B));
     assert_eq!(log.jobs(), vec![RadioJob::Warm, RadioJob::Cool]);
 }
@@ -1646,7 +1654,7 @@ fn leaving_the_link_screen_without_a_session_cools_it() {
 #[test]
 fn a_screen_that_closes_over_a_live_session_leaves_the_radio_alone() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     let log = watched(&mut app);
     app.begin_link(0);
     app.apply(Action::GbaDown(Btn::B));
@@ -1659,7 +1667,107 @@ fn a_screen_that_closes_over_a_live_session_leaves_the_radio_alone() {
 #[test]
 fn the_shortcut_still_opens_the_screen_when_nothing_is_linked() {
     let (mut app, _d) = playing_on(Core::Gpsp);
-    app.apply(Action::GameMenu);
+    common::toggle_link_menu(&mut app);
     assert!(app.game_menu_open());
     assert_eq!(app.toast(), None);
+}
+
+#[test]
+fn root_picker_opens_on_a_non_link_game_and_achievements_close_to_play() {
+    let d = common::tmp_root_with_carts(&["Apotris", "Zzz"]);
+    common::write_retail_header(&d, "Apotris", "APOTRIS", "2ATE");
+    let mut app = seated_on_gpsp(&d);
+    app.apply(Action::GameMenu);
+    assert_eq!(app.game_picker(), Some(false));
+    assert_eq!(app.toast(), None);
+    app.apply(Action::GbaDown(Btn::A));
+    assert!(app.achievement_screen().is_some());
+    assert!(app.game_menu_open());
+    app.apply(Action::GbaDown(Btn::B));
+    assert!(!app.game_menu_open());
+    assert!(matches!(app.phase(), Phase::Playing { .. }));
+    app.apply(Action::GameMenu);
+    app.apply(Action::GbaDown(Btn::Down));
+    app.apply(Action::GbaDown(Btn::A));
+    assert_eq!(app.toast(), Some(Toast::NoLink));
+    assert!(!app.game_menu_open());
+}
+
+#[test]
+fn achievements_pause_solo_and_isolate_menu_input() {
+    let (mut session, _d, mut now) = session_playing_on_gpsp();
+    assert!(runs_at(&mut session, &mut now, Speed::Normal));
+    step(
+        &mut session,
+        &mut now,
+        &[RawEvent::Down(Btn::Select), RawEvent::Down(Btn::Menu)],
+    );
+    assert_eq!(session.app().game_picker(), Some(false));
+    step(&mut session, &mut now, &[RawEvent::Down(Btn::A)]);
+    assert!(session.app().achievement_screen().is_some());
+    assert!(runs_at(&mut session, &mut now, Speed::Paused));
+    step(
+        &mut session,
+        &mut now,
+        &[RawEvent::Down(Btn::Down), RawEvent::Down(Btn::R1)],
+    );
+    assert_eq!(session.emu().unwrap().input(), ButtonMask(0));
+    step(&mut session, &mut now, &[RawEvent::Down(Btn::B)]);
+    assert!(!session.app().game_menu_open());
+    assert!(runs_at(&mut session, &mut now, Speed::Normal));
+    assert_eq!(session.emu().unwrap().input(), ButtonMask(0));
+}
+
+#[test]
+fn achievement_detail_back_returns_to_list_and_chord_closes_it() {
+    let (mut app, _d) = playing_on(Core::Gpsp);
+    app.observe_achievement_count(20);
+    app.apply(Action::GameMenu);
+    app.apply(Action::GbaDown(Btn::A));
+    app.apply(Action::GbaDown(Btn::R1));
+    assert_eq!(app.achievement_screen().unwrap().row, 5);
+    app.apply(Action::GbaDown(Btn::A));
+    assert!(app.achievement_screen().unwrap().detail);
+    app.observe_achievement_description_pages(3);
+    for _ in 0..10 {
+        app.apply(Action::GbaDown(Btn::R1));
+    }
+    assert_eq!(app.achievement_screen().unwrap().description_page, 2);
+    app.apply(Action::GbaDown(Btn::B));
+    assert!(!app.achievement_screen().unwrap().detail);
+    assert_eq!(app.achievement_screen().unwrap().row, 5);
+    app.apply(Action::GameMenu);
+    assert!(!app.game_menu_open());
+}
+
+#[test]
+fn eject_doze_and_shutdown_close_the_achievement_overlay() {
+    for action in [Action::Eject, Action::PowerTap, Action::PowerHold] {
+        let (mut app, _d) = playing_on(Core::Gpsp);
+        app.apply(Action::GameMenu);
+        app.apply(Action::GbaDown(Btn::A));
+        assert!(app.achievement_screen().is_some());
+        app.apply(action);
+        assert!(!app.game_menu_open(), "{action:?} left the overlay open");
+    }
+}
+
+#[test]
+fn achievements_keep_linked_sessions_running_and_clear_their_inputs() {
+    let (mut session, _d, mut now) = session_playing_on_gpsp();
+    session.app_mut().begin_link(0);
+    step(
+        &mut session,
+        &mut now,
+        &[RawEvent::Down(Btn::Select), RawEvent::Down(Btn::Menu)],
+    );
+    step(&mut session, &mut now, &[RawEvent::Down(Btn::A)]);
+    assert!(session.app().achievement_screen().is_some());
+    assert!(runs_at(&mut session, &mut now, Speed::Normal));
+    step(&mut session, &mut now, &[RawEvent::Down(Btn::Down)]);
+    assert_eq!(session.emu().unwrap().input(), ButtonMask(0));
+    assert!(session.app().link_active());
+    step(&mut session, &mut now, &[RawEvent::Down(Btn::B)]);
+    assert!(!session.app().game_menu_open());
+    assert!(session.app().link_active());
 }

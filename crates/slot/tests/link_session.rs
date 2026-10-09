@@ -610,7 +610,7 @@ fn the_link_screen_over_a_session_leaves_the_core_running() {
     }
 
     s.app_mut().begin_link(0);
-    s.app_mut().apply(Action::GameMenu);
+    common::toggle_link_menu(s.app_mut());
     assert!(s.app().game_menu_open(), "the screen never opened");
     for _ in 0..5 {
         step(&mut s, &mut now, None);

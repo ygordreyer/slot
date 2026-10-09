@@ -19,6 +19,7 @@ pub(crate) struct Tracked {
     enabled: Arc<AtomicBool>,
     current: Arc<AtomicU64>,
     generation: u64,
+    supported: bool,
     sequence: u64,
     timeline: u64,
     allocated: usize,
@@ -36,6 +37,7 @@ impl Tracked {
             enabled: service.enabled.clone(),
             current: service.current.clone(),
             generation: 0,
+            supported: true,
             sequence: 0,
             timeline: 0,
             allocated: 0,
@@ -44,7 +46,7 @@ impl Tracked {
 
     fn snapshot(&mut self) {
         self.sequence += 1;
-        if !self.enabled.load(Ordering::Acquire) {
+        if !self.supported || !self.enabled.load(Ordering::Acquire) {
             return;
         }
         let mut ram = match self.recycled.try_recv() {
@@ -79,9 +81,14 @@ impl RetroCore for Tracked {
         self.core.load(rom)?;
         self.generation = NEXT_GAME.fetch_add(1, Ordering::Relaxed);
         self.current.store(self.generation, Ordering::Release);
+        self.supported = rom
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gba"));
         let _ = self.controls.send(Control::Load(network::Load {
             generation: self.generation,
             path: rom.to_path_buf(),
+            epoch: 0,
+            supported: self.supported,
         }));
         Ok(())
     }

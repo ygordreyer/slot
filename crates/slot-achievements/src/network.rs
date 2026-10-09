@@ -18,17 +18,44 @@ pub(crate) enum Command {
 const API: &str = "https://retroachievements.org/dorequest.php";
 const VERSION: &str = "12.2.1";
 
+#[derive(Clone)]
 pub(crate) struct Load {
     pub generation: u64,
     pub path: PathBuf,
+    pub epoch: u64,
+    pub supported: bool,
 }
 
 pub(crate) struct Prepared {
+    pub epoch: u64,
+    pub error: Option<crate::GameAchievementState>,
     pub generation: u64,
     pub hash: String,
     pub game: Game,
     pub unlocked: BTreeSet<u32>,
     pub cached: bool,
+}
+
+fn empty_game() -> Game {
+    Game {
+        id: 0,
+        console: 5,
+        title: String::new(),
+        presence: String::new(),
+        achievements: Vec::new(),
+    }
+}
+
+fn failed(load: &Load, state: crate::GameAchievementState) -> Prepared {
+    Prepared {
+        generation: load.generation,
+        epoch: load.epoch,
+        error: Some(state),
+        hash: String::new(),
+        game: empty_game(),
+        unlocked: BTreeSet::new(),
+        cached: false,
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -388,6 +415,7 @@ fn unlocked(response: &Value) -> Result<BTreeSet<u32>, Failure> {
 
 struct Active {
     generation: u64,
+    epoch: u64,
     hash: String,
     ready: bool,
     online: bool,
@@ -464,6 +492,7 @@ pub(crate) fn run(
     let mut verified = false;
     let mut save_settings_after_login = false;
     let mut active: Option<Active> = None;
+    let mut failure_reported = false;
     let mut next_attempt = Instant::now();
     let mut delay = 30;
     let mut warned = false;
@@ -476,12 +505,23 @@ pub(crate) fn run(
     loop {
         match loads.recv_timeout(Duration::from_millis(200)) {
             Ok(Command::Load(load)) => {
+                failure_reported = false;
                 active = load.and_then(|load| {
                     // GBA identification is the MD5 of the complete uncompressed ROM.
                     // File I/O and hashing happen here, never on the emulator/UI threads.
-                    let hash = crate::library::hash(&dir, &load.path).ok()?;
+                    let hash = match crate::library::hash(&dir, &load.path) {
+                        Ok(hash) => hash,
+                        Err(_) => {
+                            let _ = prepared.send(failed(
+                                &load,
+                                crate::GameAchievementState::Error("Cannot read game".into()),
+                            ));
+                            return None;
+                        }
+                    };
                     let mut game = Active {
                         generation: load.generation,
+                        epoch: load.epoch,
                         hash,
                         ready: false,
                         online: false,
@@ -494,6 +534,8 @@ pub(crate) fn run(
                                 badges.enqueue(&data);
                                 let _ = prepared.send(Prepared {
                                     generation: game.generation,
+                                    epoch: game.epoch,
+                                    error: None,
                                     hash: game.hash.clone(),
                                     game: data,
                                     unlocked: ids,
@@ -510,6 +552,7 @@ pub(crate) fn run(
             }
             Ok(Command::Account(command)) => {
                 active = None;
+                failure_reported = false;
                 let result = (|| -> Result<(), String> {
                     match command {
                         AccountControl::SignIn {
@@ -749,6 +792,15 @@ pub(crate) fn run(
                     let resolved = call(&mut http, auth, "gameid", &[("m", game.hash.clone())])?;
                     let id = resolved["GameID"].as_u64().ok_or(Failure::Invalid)?;
                     if id == 0 {
+                        let _ = prepared.send(Prepared {
+                            generation: game.generation,
+                            epoch: game.epoch,
+                            error: None,
+                            hash: game.hash.clone(),
+                            game: empty_game(),
+                            unlocked: BTreeSet::new(),
+                            cached: false,
+                        });
                         let _ = notices.send(Notice::status(
                             game.generation,
                             "No achievements for this ROM",
@@ -780,6 +832,8 @@ pub(crate) fn run(
                         ping(&mut http, auth, &status, game, &data)?;
                         let _ = prepared.send(Prepared {
                             generation: game.generation,
+                            epoch: game.epoch,
+                            error: None,
                             hash: game.hash.clone(),
                             game: data,
                             unlocked: ids,
@@ -853,6 +907,20 @@ pub(crate) fn run(
         }
         match result {
             Ok(()) => {
+                if failure_reported {
+                    if let Some(game) = active.as_ref().filter(|game| game.online) {
+                        let _ = prepared.send(Prepared {
+                            generation: game.generation,
+                            epoch: game.epoch,
+                            error: Some(crate::GameAchievementState::Ready),
+                            hash: game.hash.clone(),
+                            game: empty_game(),
+                            unlocked: BTreeSet::new(),
+                            cached: false,
+                        });
+                        failure_reported = false;
+                    }
+                }
                 status.set(if library_failed || badges.waiting {
                     SyncStatus::Attention
                 } else if !library.is_empty()
@@ -868,6 +936,32 @@ pub(crate) fn run(
                 next_attempt = Instant::now() + Duration::from_secs(1);
             }
             Err(error) => {
+                if let Some(game) = active.as_ref() {
+                    failure_reported = true;
+                    let state = if error == Failure::Network {
+                        crate::GameAchievementState::Offline(
+                            "Cannot reach RetroAchievements".into(),
+                        )
+                    } else {
+                        crate::GameAchievementState::Error(
+                            match error {
+                                Failure::Authentication => "Sign in again",
+                                Failure::Rejected => "Achievement sync needs attention",
+                                _ => "Achievement data or storage error",
+                            }
+                            .into(),
+                        )
+                    };
+                    let _ = prepared.send(Prepared {
+                        generation: game.generation,
+                        epoch: game.epoch,
+                        error: Some(state),
+                        hash: game.hash.clone(),
+                        game: empty_game(),
+                        unlocked: BTreeSet::new(),
+                        cached: false,
+                    });
+                }
                 status.set(if error == Failure::Network {
                     SyncStatus::Offline
                 } else {
@@ -1025,6 +1119,7 @@ mod presence_tests {
         };
         let status = Status::default();
         let active = Active {
+            epoch: 0,
             generation: 2,
             hash: "rom-hash".into(),
             ready: true,

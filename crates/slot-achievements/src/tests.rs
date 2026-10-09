@@ -467,6 +467,11 @@ fn dropped_frames_and_rewinds_reset_partial_hit_counts() {
             achievements: [(7, a)].into(),
             previous: None,
             warned_gap: false,
+            catalog: game(),
+            unlocked: Default::default(),
+            unsupported: Default::default(),
+            state: GameAchievementState::Ready,
+            dirty: false,
         });
         let (notices, _) = mpsc::channel();
         let mut unsaved = BTreeMap::new();
@@ -589,6 +594,11 @@ fn unsaved_unlocks_retry_with_the_original_time_after_storage_recovers() {
         achievements: [(7, a)].into(),
         previous: None,
         warned_gap: false,
+        catalog: game(),
+        unlocked: Default::default(),
+        unsupported: Default::default(),
+        state: GameAchievementState::Ready,
+        dirty: false,
     });
     let (notices, received) = mpsc::channel();
     let mut unsaved = BTreeMap::new();
@@ -1235,4 +1245,506 @@ fn login_body_encodes_fields_without_extra_capacity_or_plaintext_temporaries() {
     );
     assert_eq!(body.len(), body.capacity());
     assert!(network::login_body(&[]).is_empty());
+}
+
+fn snapshot_game() -> Playing {
+    Playing {
+        generation: 42,
+        hash: "hash".into(),
+        runtime: runtime::Runtime::new().unwrap(),
+        achievements: BTreeMap::new(),
+        previous: None,
+        warned_gap: false,
+        catalog: game(),
+        unlocked: Default::default(),
+        unsupported: Default::default(),
+        state: GameAchievementState::Loading,
+        dirty: false,
+    }
+}
+
+#[test]
+fn snapshots_keep_the_official_catalog_and_union_all_unlock_sources() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = Store::open(root.path(), "Player").unwrap();
+    let mut catalog = game();
+    catalog.achievements = (7..14)
+        .map(|id| {
+            let mut a = achievement("0xH000000=1");
+            a.id = id;
+            a.points = id;
+            if id == 10 {
+                a.definition = "invalid trigger".into();
+            }
+            if id == 11 {
+                a.flags = 5;
+            }
+            if id == 12 {
+                a.definition = "M:0xH000000=50".into();
+            }
+            a
+        })
+        .collect();
+    store
+        .record(Unlock {
+            id: 8,
+            hash: "hash".into(),
+            earned_at: 100,
+            synced: true,
+        })
+        .unwrap();
+    let pending = [(
+        9,
+        (
+            Unlock {
+                id: 9,
+                hash: "hash".into(),
+                earned_at: 200,
+                synced: false,
+            },
+            Notice::status(42, "pending"),
+        ),
+    )]
+    .into();
+    let mut playing = snapshot_game();
+    snapshot::prepare(&mut playing, catalog, [7].into(), &store, &pending);
+    let mut ram = vec![0; RAM_SIZE];
+    playing.runtime.frame(&ram, &[0x8000, 0x40000, 0]);
+    ram[0] = 12;
+    playing.runtime.frame(&ram, &[0x8000, 0x40000, 0]);
+    let view = snapshot::build(&playing, &store, &pending);
+    assert_eq!(
+        view.achievements.iter().map(|a| a.id).collect::<Vec<_>>(),
+        [7, 8, 9, 10, 12, 13]
+    );
+    assert_eq!(
+        view.summary,
+        AchievementSummary {
+            unlocked: 3,
+            total: 6,
+            points_earned: 24,
+            points_total: 59,
+            unsupported: 1
+        }
+    );
+    assert!(view.achievements[..3].iter().all(|a| a.unlocked));
+    assert_eq!(view.achievements[0].unlocked_at, None);
+    assert_eq!(view.achievements[1].unlocked_at, Some(100));
+    assert_eq!(view.achievements[2].unlocked_at, Some(200));
+    assert!(!view.achievements[3].supported);
+    assert_eq!(view.achievements[4].progress, Some((12, 50)));
+    assert_eq!(view.achievements[5].progress, None);
+    assert!(view.achievements.iter().all(|a| a.badge_path.is_none()));
+    let badge = badges::path(&store.dir, "12345").unwrap();
+    std::fs::create_dir_all(badge.parent().unwrap()).unwrap();
+    std::fs::write(&badge, badge_png()).unwrap();
+    assert_eq!(
+        snapshot::build(&playing, &store, &pending).achievements[0].badge_path,
+        Some(badge)
+    );
+    assert_eq!(playing.achievements.len(), 2);
+}
+
+#[test]
+fn catalog_states_distinguish_unrecognised_zero_official_and_other_platforms() {
+    let mut catalog = game();
+    assert_eq!(
+        snapshot::catalog_state(&catalog),
+        GameAchievementState::Ready
+    );
+    catalog.achievements[0].flags = 5;
+    assert_eq!(
+        snapshot::catalog_state(&catalog),
+        GameAchievementState::NoAchievements
+    );
+    catalog.achievements.clear();
+    assert_eq!(
+        snapshot::catalog_state(&catalog),
+        GameAchievementState::NoAchievements
+    );
+    catalog.id = 0;
+    assert_eq!(
+        snapshot::catalog_state(&catalog),
+        GameAchievementState::Unrecognized
+    );
+    catalog.console = 4;
+    assert_eq!(
+        snapshot::catalog_state(&catalog),
+        GameAchievementState::NotSupportedPlatform
+    );
+}
+
+#[test]
+fn snapshot_reads_are_nonblocking_and_reject_stale_games_and_accounts() {
+    let (controls, _control_rx) = mpsc::channel();
+    let (frames, _frame_rx) = mpsc::sync_channel(QUEUE_SIZE);
+    let (_, notices) = mpsc::channel();
+    let service = Service {
+        controls,
+        frames,
+        notices,
+        enabled: Arc::new(AtomicBool::new(true)),
+        current: Arc::new(AtomicU64::new(42)),
+        flushing: AtomicBool::new(false),
+        flushed: Arc::new(AtomicBool::new(false)),
+        status: Arc::new(Status::default()),
+    };
+    let view = Arc::new(GameAchievementSnapshot::empty(
+        42,
+        GameAchievementState::Ready,
+        "Test".into(),
+    ));
+    *service.status.snapshot.lock().unwrap() = snapshot::Published {
+        epoch: 0,
+        snapshot: view.clone(),
+    };
+    assert!(Arc::ptr_eq(&service.game_snapshot().unwrap(), &view));
+    let locked = service.status.snapshot.lock().unwrap();
+    assert!(service.game_snapshot().is_none());
+    drop(locked);
+    service.current.store(0, Ordering::Release);
+    assert!(service.game_snapshot().is_none());
+    service.current.store(43, Ordering::Release);
+    assert!(service.game_snapshot().is_none());
+    service.current.store(42, Ordering::Release);
+    service.status.epoch.store(1, Ordering::Release);
+    assert!(service.game_snapshot().is_none());
+}
+
+#[test]
+fn worker_snapshots_report_disabled_signed_out_and_unsupported_loads() {
+    for (enabled, extension, expected) in [
+        (false, "gba", GameAchievementState::Disabled),
+        (true, "gba", GameAchievementState::SignedOut),
+        (false, "gb", GameAchievementState::NotSupportedPlatform),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Config")).unwrap();
+        std::fs::write(
+            root.path().join("Config/retroachievements.toml"),
+            format!("enabled = {enabled}\n"),
+        )
+        .unwrap();
+        let rom = root.path().join(format!("Test.{extension}"));
+        std::fs::write(&rom, b"ROM").unwrap();
+        let service = Service::start_with(root.path().into(), Offline);
+        let mut core = service.wrap(Box::<TestCore>::default());
+        core.load(&rom).unwrap();
+        wait_for(|| service.game_snapshot().is_some_and(|s| s.state == expected));
+        assert_eq!(
+            service.game_snapshot().unwrap().generation,
+            service.game_generation()
+        );
+    }
+}
+
+#[test]
+fn online_unrecognised_and_empty_catalog_results_reach_the_snapshot() {
+    struct CatalogServer {
+        id: u32,
+        empty: bool,
+    }
+    impl network::Transport for CatalogServer {
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            let request = fields.iter().find(|(k, _)| *k == "r").unwrap().1.as_str();
+            Ok(match request {
+                "login2" => json!({"Success":true,"User":"Player","Token":"fixture-token"}),
+                "gameid" => json!({"Success":true,"GameID":self.id}),
+                "patch" => {
+                    let mut catalog = game();
+                    if self.empty {
+                        catalog.achievements.clear();
+                    }
+                    json!({"Success":true,"PatchData":catalog})
+                }
+                "startsession" | "ping" => json!({"Success":true}),
+                "unlocks" => json!({"Success":true,"UserUnlocks":[]}),
+                _ => panic!("unexpected API {request}"),
+            })
+        }
+    }
+    for (id, empty, state) in [
+        (0, false, GameAchievementState::Unrecognized),
+        (1, true, GameAchievementState::NoAchievements),
+        (1, false, GameAchievementState::Ready),
+    ] {
+        let root = configured();
+        let rom = root.path().join("Games/GBA/Test.gba");
+        std::fs::write(&rom, b"fixture ROM").unwrap();
+        let service = Service::start_with(root.path().into(), CatalogServer { id, empty });
+        let mut core = service.wrap(Box::<TestCore>::default());
+        core.load(&rom).unwrap();
+        wait_for(|| service.game_snapshot().is_some_and(|s| s.state == state));
+        assert_eq!(
+            service.game_snapshot().unwrap().game_id,
+            (id != 0).then_some(id)
+        );
+    }
+}
+
+#[test]
+fn an_online_game_publishes_ready_after_a_failed_sync_recovers() {
+    struct Recovering {
+        fail_next: Arc<AtomicBool>,
+        server: Server,
+    }
+    impl network::Transport for Recovering {
+        fn badge(&mut self, name: &str) -> Result<Vec<u8>, network::Failure> {
+            self.server.badge(name)
+        }
+
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            if fields
+                .iter()
+                .any(|(key, value)| *key == "r" && value == "awardachievement")
+                && self.fail_next.swap(false, Ordering::AcqRel)
+            {
+                return Err(network::Failure::Network);
+            }
+            self.server.call(fields)
+        }
+    }
+    let root = configured();
+    let rom = root.path().join("Test.gba");
+    std::fs::write(&rom, b"ROM").unwrap();
+    let fail_next = Arc::new(AtomicBool::new(true));
+    let (calls, requests) = mpsc::channel();
+    let service = Service::start_with(
+        root.path().into(),
+        Recovering {
+            fail_next,
+            server: Server { calls },
+        },
+    );
+    let mut core = service.wrap(Box::<TestCore>::default());
+    core.load(&rom).unwrap();
+    wait_for(|| {
+        service.sync_status() == SyncStatus::Ready
+            && service
+                .game_snapshot()
+                .is_some_and(|s| s.state == GameAchievementState::Ready)
+    });
+    let generation = service.game_generation();
+    core.run_frame(ButtonMask(0));
+    core.run_frame(ButtonMask(1));
+    wait_for(|| {
+        service.sync_status() == SyncStatus::Offline
+            && service
+                .game_snapshot()
+                .is_some_and(|s| matches!(s.state, GameAchievementState::Offline(_)))
+    });
+    let failed = service.game_snapshot().unwrap();
+    service.network_available();
+    wait_for(|| {
+        service.sync_status() == SyncStatus::Ready
+            && service
+                .game_snapshot()
+                .is_some_and(|s| s.state == GameAchievementState::Ready)
+    });
+    let recovered = service.game_snapshot().unwrap();
+    assert_eq!(recovered.generation, generation);
+    assert_eq!(recovered.game_id, Some(1));
+    assert_eq!(recovered.summary.unlocked, 1);
+    assert!(recovered.revision > failed.revision);
+    let requests: Vec<_> = requests.try_iter().collect();
+    for request in ["gameid", "patch", "startsession"] {
+        assert_eq!(requests.iter().filter(|r| r.as_str() == request).count(), 1);
+    }
+    assert_eq!(requests.iter().filter(|r| *r == "login2").count(), 2);
+}
+
+#[test]
+fn loading_and_transport_errors_are_visible_without_a_catalog() {
+    struct Stalled {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        failure: network::Failure,
+    }
+    impl network::Transport for Stalled {
+        fn call(&mut self, _fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+            Err(match self.failure {
+                network::Failure::Network => network::Failure::Network,
+                _ => network::Failure::Invalid,
+            })
+        }
+    }
+    for failure in [network::Failure::Network, network::Failure::Invalid] {
+        let root = configured();
+        let store = Store::open(root.path(), "Player").unwrap();
+        storage::write(
+            &store.dir.join("auth.json"),
+            &Auth {
+                username: "Player".into(),
+                token: "fixture-token".into(),
+            },
+        )
+        .unwrap();
+        let rom = root.path().join("Games/GBA/Test.gba");
+        std::fs::write(&rom, b"ROM").unwrap();
+        let (started, requests) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let service = Service::start_with(
+            root.path().into(),
+            Stalled {
+                started,
+                release: waiting,
+                failure,
+            },
+        );
+        let mut core = service.wrap(Box::<TestCore>::default());
+        core.load(&rom).unwrap();
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        wait_for(|| {
+            service
+                .game_snapshot()
+                .is_some_and(|s| s.state == GameAchievementState::Loading)
+        });
+        release.send(()).unwrap();
+        wait_for(|| {
+            service.game_snapshot().is_some_and(|s| {
+                matches!(
+                    s.state,
+                    GameAchievementState::Offline(_) | GameAchievementState::Error(_)
+                )
+            })
+        });
+        drop(release);
+    }
+}
+
+#[test]
+fn delayed_http_results_cannot_restore_an_ejected_game_or_signed_out_account() {
+    struct Delayed {
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        delayed: bool,
+    }
+    impl network::Transport for Delayed {
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            let request = fields.iter().find(|(k, _)| *k == "r").unwrap().1.as_str();
+            Ok(match request {
+                "login2" => json!({"Success":true,"User":"Player","Token":"fixture-token"}),
+                "gameid" if !self.delayed => {
+                    self.delayed = true;
+                    self.started.send(()).unwrap();
+                    self.release.recv().unwrap();
+                    json!({"Success":true,"GameID":0})
+                }
+                "gameid" => json!({"Success":true,"GameID":1}),
+                "patch" => json!({"Success":true,"PatchData":game()}),
+                "startsession" | "ping" => json!({"Success":true}),
+                "unlocks" => json!({"Success":true,"UserUnlocks":[]}),
+                _ => panic!("unexpected API {request}"),
+            })
+        }
+    }
+    for sign_out in [false, true] {
+        let root = configured();
+        let rom = root.path().join("Games/GBA/Test.gba");
+        std::fs::write(&rom, b"ROM").unwrap();
+        // Keep background prefetch out of the request we deliberately stall.
+        let store = Store::open(root.path(), "Player").unwrap();
+        library::checked(&store.dir, &rom, network::now());
+        storage::write(
+            &store.dir.join("auth.json"),
+            &Auth {
+                username: "Player".into(),
+                token: "fixture-token".into(),
+            },
+        )
+        .unwrap();
+        let (started, requests) = mpsc::channel();
+        let (release, waiting) = mpsc::channel();
+        let service = Service::start_with(
+            root.path().into(),
+            Delayed {
+                started,
+                release: waiting,
+                delayed: false,
+            },
+        );
+        let mut core = service.wrap(Box::<TestCore>::default());
+        core.load(&rom).unwrap();
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        wait_for(|| {
+            service
+                .game_snapshot()
+                .is_some_and(|s| s.state == GameAchievementState::Loading)
+        });
+        let old_generation = service.game_generation();
+        if sign_out {
+            service.account_control(AccountControl::SignOut);
+            assert!(service.game_snapshot().is_none());
+            wait_for(|| {
+                service
+                    .game_snapshot()
+                    .is_some_and(|s| s.state == GameAchievementState::SigningIn)
+            });
+        } else {
+            drop(core);
+            assert_eq!(service.game_generation(), 0);
+            assert!(service.game_snapshot().is_none());
+            core = service.wrap(Box::<TestCore>::default());
+            core.load(&rom).unwrap();
+            assert_ne!(service.game_generation(), old_generation);
+        }
+        release.send(()).unwrap();
+        let state = if sign_out {
+            GameAchievementState::SignedOut
+        } else {
+            GameAchievementState::Ready
+        };
+        wait_for(|| service.game_snapshot().is_some_and(|s| s.state == state));
+        assert_eq!(
+            service.game_snapshot().unwrap().generation,
+            service.game_generation()
+        );
+    }
+}
+
+#[test]
+fn unlocks_publish_a_new_revision_without_mutating_the_previous_snapshot() {
+    let root = configured();
+    let rom = root.path().join("Games/GBA/Test.gba");
+    std::fs::write(&rom, b"ROM").unwrap();
+    let store = Store::open(root.path(), "Player").unwrap();
+    let hash = library::hash(&store.dir, &rom).unwrap();
+    storage::write(
+        &store.dir.join("auth.json"),
+        &Auth {
+            username: "Player".into(),
+            token: "fixture-token".into(),
+        },
+    )
+    .unwrap();
+    storage::write(
+        &store.dir.join(format!("{hash}.json")),
+        &(game(), std::collections::BTreeSet::<u32>::new()),
+    )
+    .unwrap();
+    let service = Service::start_with(root.path().into(), Offline);
+    let mut core = service.wrap(Box::<TestCore>::default());
+    core.load(&rom).unwrap();
+    wait_for(|| {
+        service.game_snapshot().is_some_and(|s| {
+            s.summary.total == 1 && matches!(s.state, GameAchievementState::Offline(_))
+        })
+    });
+    let before = service.game_snapshot().unwrap();
+    core.run_frame(ButtonMask(0));
+    core.run_frame(ButtonMask(1));
+    wait_for(|| {
+        service
+            .game_snapshot()
+            .is_some_and(|s| s.summary.unlocked == 1)
+    });
+    let after = service.game_snapshot().unwrap();
+    assert!(after.revision > before.revision);
+    assert_eq!(after.summary.points_earned, 5);
+    assert!(after.achievements[0].unlocked_at.is_some());
+    assert!(!before.achievements[0].unlocked);
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(Arc::ptr_eq(&after, &service.game_snapshot().unwrap()));
 }
