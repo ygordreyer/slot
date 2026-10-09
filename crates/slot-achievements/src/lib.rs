@@ -77,7 +77,7 @@ struct Status {
     snapshot: Mutex<snapshot::Published>,
     epoch: AtomicU64,
     network: AtomicU8,
-    reported: AtomicU8,
+    reported: Mutex<u8>,
     unsaved: AtomicBool,
     reconnect: AtomicBool,
     // Zero means unknown; otherwise percent + 1, keeping Default valid.
@@ -89,35 +89,49 @@ struct Status {
 
 impl Status {
     fn set(&self, value: SyncStatus) {
-        self.set_diagnostic(
-            value,
-            match value {
-                SyncStatus::Disabled => "disabled",
-                SyncStatus::Syncing => "syncing",
-                SyncStatus::Ready => "signed in, sync ok",
-                SyncStatus::Offline => "failed: network (connection)",
-                SyncStatus::Attention => "sync needs attention",
-                SyncStatus::ServerBusy => "server busy, retrying",
-            },
-        );
+        self.set_diagnostic(value, Self::diagnostic(value));
     }
 
-    fn set_diagnostic(&self, value: SyncStatus, diagnostic: &str) {
-        self.network.store(value as u8, Ordering::Release);
-        let effective = self.get();
-        if self.reported.swap(effective as u8, Ordering::AcqRel) != effective as u8 {
-            let diagnostic = if effective == value {
-                diagnostic
-            } else {
-                "local unlock save failed"
-            };
-            eprintln!("slot: achievements: {diagnostic}");
+    fn diagnostic(value: SyncStatus) -> &'static str {
+        match value {
+            SyncStatus::Disabled => "disabled",
+            SyncStatus::Syncing => "syncing",
+            SyncStatus::Ready => "signed in, sync ok",
+            SyncStatus::Offline => "failed: network (connection)",
+            SyncStatus::Attention => "sync needs attention",
+            SyncStatus::ServerBusy => "server busy, retrying",
         }
     }
 
+    fn set_diagnostic(&self, value: SyncStatus, diagnostic: &str) {
+        let mut reported = self.reported.lock().unwrap();
+        self.network.store(value as u8, Ordering::Release);
+        let effective = self.get();
+        let diagnostic = if effective == value {
+            diagnostic
+        } else {
+            "local unlock save failed"
+        };
+        Self::report(&mut reported, effective, diagnostic);
+    }
+
     fn set_unsaved(&self, value: bool) {
+        let mut reported = self.reported.lock().unwrap();
         if self.unsaved.swap(value, Ordering::AcqRel) != value {
-            self.set(self.network_status());
+            let effective = self.get();
+            let diagnostic = if value {
+                "local unlock save failed"
+            } else {
+                Self::diagnostic(effective)
+            };
+            Self::report(&mut reported, effective, diagnostic);
+        }
+    }
+
+    fn report(reported: &mut u8, effective: SyncStatus, diagnostic: &str) {
+        if *reported != effective as u8 {
+            *reported = effective as u8;
+            eprintln!("slot: achievements: {diagnostic}");
         }
     }
 
@@ -423,6 +437,7 @@ fn run(
         .is_err()
     {
         status.set(SyncStatus::Attention);
+        eprintln!("slot: achievements: network worker failed");
         let _ = notices.send(Notice::status(0, "Achievements network worker failed"));
         return;
     }
@@ -735,6 +750,7 @@ fn evaluate(
             if timeline != frame.timeline || sequence + 1 != frame.sequence {
                 game.runtime.reset();
                 if timeline == frame.timeline && !game.warned_gap {
+                    eprintln!("slot: achievements: tracking interrupted");
                     let _ = notices.send(Notice::status(
                         game.generation,
                         "Achievement tracking interrupted",
@@ -746,6 +762,7 @@ fn evaluate(
         game.previous = Some((frame.sequence, frame.timeline));
         if frame.valid[0] == 0 || frame.valid[1] == 0 {
             if !game.warned_gap {
+                eprintln!("slot: achievements: core does not expose achievement RAM");
                 let _ = notices.send(Notice::status(
                     game.generation,
                     "Core does not expose achievement RAM",

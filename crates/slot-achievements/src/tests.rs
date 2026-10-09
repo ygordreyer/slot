@@ -1540,6 +1540,117 @@ fn background_library_failures_leave_a_verified_active_game_online() {
 }
 
 #[test]
+fn background_authentication_failure_reauthenticates_and_retries_the_queued_rom() {
+    struct ExpiredToken {
+        fail_next: bool,
+        server: Server,
+    }
+    impl network::Transport for ExpiredToken {
+        fn badge(&mut self, name: &str) -> Result<Vec<u8>, network::Failure> {
+            self.server.badge(name)
+        }
+
+        fn call(&mut self, fields: &[(&str, String)]) -> Result<Value, network::Failure> {
+            if self.fail_next
+                && fields
+                    .iter()
+                    .any(|(key, value)| *key == "r" && value == "unlocks")
+            {
+                self.fail_next = false;
+                let _ = self.server.calls.send("unlocks".into());
+                return Err(network::Failure::Authentication);
+            }
+            self.server.call(fields)
+        }
+    }
+
+    let root = configured();
+    let rom = root.path().join("Active.gba");
+    let other = root.path().join("Games/GBA/Other.gba");
+    std::fs::write(&rom, b"active ROM").unwrap();
+    std::fs::write(&other, b"background ROM").unwrap();
+    let store = Store::open(root.path(), "Player").unwrap();
+    let other_hash = library::hash(&store.dir, &other).unwrap();
+    let cache = store.dir.join(format!("{other_hash}.json"));
+    let config = Config::read(&root.path().join("Config/retroachievements.toml")).unwrap();
+    let (controls, commands) = mpsc::channel();
+    controls
+        .send(network::Command::Load(Some(network::Load {
+            generation: 1,
+            epoch: 0,
+            path: rom,
+            supported: true,
+        })))
+        .unwrap();
+    let (prepared, received) = mpsc::channel();
+    let (notices, notifications) = mpsc::channel();
+    let (calls, requests) = mpsc::channel();
+    let status = Arc::new(Status::default());
+    let worker_status = status.clone();
+    let worker_root = root.path().to_path_buf();
+    let worker = std::thread::spawn(move || {
+        network::run(
+            worker_root,
+            config,
+            Arc::new(Mutex::new(store)),
+            commands,
+            prepared,
+            notices,
+            worker_status,
+            Arc::new(AtomicBool::new(true)),
+            ExpiredToken {
+                fail_next: true,
+                server: Server { calls },
+            },
+        );
+    });
+
+    let active = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(active.game.id, 1);
+    assert_eq!(active.error, None);
+    assert!(!active.cached);
+    let failed = received.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(failed.generation, active.generation);
+    assert_eq!(
+        failed.error,
+        Some(GameAchievementState::Error("Sign in again".into()))
+    );
+    wait_for(|| status.get() == SyncStatus::Attention);
+    assert!(status.pending.load(Ordering::Acquire));
+    assert!(!cache.exists());
+
+    status.reconnect.store(true, Ordering::Release);
+    wait_for(|| status.get() == SyncStatus::Ready && !status.pending.load(Ordering::Acquire));
+    drop(controls);
+    worker.join().unwrap();
+    let requests: Vec<_> = requests.try_iter().collect();
+    assert_eq!(requests.iter().filter(|r| *r == "login2").count(), 2);
+    assert_eq!(requests.iter().filter(|r| *r == "unlocks").count(), 2);
+    assert!(cache.exists());
+    assert_eq!(
+        notifications
+            .try_iter()
+            .filter(|notice| notice.title == "Achievements: sign in again")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn unsaved_unlock_status_preserves_offline_and_server_busy_network_status() {
+    for network in [SyncStatus::Offline, SyncStatus::ServerBusy] {
+        let status = Status::default();
+        status.set(network);
+        status.set_unsaved(true);
+        assert_eq!(status.network_status(), network);
+        assert_eq!(status.get(), SyncStatus::Attention);
+        status.set_unsaved(false);
+        assert_eq!(status.network_status(), network);
+        assert_eq!(status.get(), network);
+    }
+}
+
+#[test]
 fn an_online_game_publishes_ready_after_a_failed_sync_recovers() {
     struct Recovering {
         fail_next: Arc<AtomicBool>,

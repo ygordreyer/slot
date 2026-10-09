@@ -977,6 +977,7 @@ pub(crate) fn run(
                             unlocked: BTreeSet::new(),
                             cached: false,
                         });
+                        eprintln!("slot: achievements: no achievements for this ROM");
                         let _ = notices.send(Notice::status(
                             game.generation,
                             "No achievements for this ROM",
@@ -1040,6 +1041,7 @@ pub(crate) fn run(
                             crate::library::checked(&dir, path, now());
                             badges.enqueue(&game);
                         }
+                        Err(Failure::Authentication) => return Err(Failure::Authentication),
                         Err(error) => {
                             library_failed |= !matches!(error, Failure::Network | Failure::Server);
                             background_error = Some((error, http.diagnostic.clone()));
