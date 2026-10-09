@@ -328,6 +328,17 @@ impl ShelfKind {
 
 pub const EMPTY_FAVORITES_TEXT: &str = "PRESS Y ON A GAME TO ADD IT TO FAVORITES";
 
+enum QuickSettingChange {
+    FastForward(u8),
+    FastForwardSound(bool),
+    ColourCorrection(bool),
+    Shader(usize),
+    ShowFps(bool),
+    Rumble(bool),
+    HomeWifi(bool),
+    TwelveHour(bool),
+}
+
 pub struct App {
     phase: Phase,
     shelves: Vec<(ShelfKind, Shelf)>,
@@ -953,6 +964,10 @@ impl App {
             | QuickRow::DateTime
             | QuickRow::About => None,
         }
+    }
+
+    pub fn quick_carets(&self, row: QuickRow) -> [bool; 2] {
+        [false, true].map(|right| self.quick_setting_change(row, right).is_some())
     }
 
     pub fn set_quick_menu_faces(&mut self, faces: QuickMenuFaces) {
@@ -1972,64 +1987,82 @@ impl App {
         }
     }
 
-    fn change_setting(&mut self, row: QuickRow, right: bool) {
-        let s = &mut self.state;
-        match row {
+    fn quick_setting_change(&self, row: QuickRow, right: bool) -> Option<QuickSettingChange> {
+        let s = &self.state;
+        Some(match row {
             QuickRow::FastForward => {
                 let to = ff_next(s.ff_speed, right);
                 if to == s.ff_speed {
-                    return;
+                    return None;
                 }
-                s.ff_speed = to;
+                QuickSettingChange::FastForward(to)
             }
-            QuickRow::FastForwardSound => s.ff_sound = !s.ff_sound,
+            QuickRow::FastForwardSound => QuickSettingChange::FastForwardSound(!s.ff_sound),
             QuickRow::ColourCorrection => {
                 if self.profile_colour.is_some() {
-                    self.hud.toast(Toast::ProfileColourLocked, self.now());
-                    return;
+                    return None;
                 }
-                s.colour_correction = !s.colour_correction;
-                self.colour_pending = Some(s.colour_correction);
+                QuickSettingChange::ColourCorrection(!s.colour_correction)
             }
-            // Stops at either end, as Fast Forward does, rather than wrapping: the list is short
-            // and an end that stops is how a row says it has no more.
             QuickRow::Shader => {
                 let at = self
                     .shaders
                     .iter()
                     .position(|n| n == &s.shader)
                     .unwrap_or(0);
-                let to = match right {
-                    true => (at + 1).min(self.shaders.len().saturating_sub(1)),
-                    false => at.saturating_sub(1),
+                let to = if right {
+                    (at + 1).min(self.shaders.len().saturating_sub(1))
+                } else {
+                    at.saturating_sub(1)
                 };
-                // Against the look in use rather than the card's spelling of it: an empty or
-                // stale choice already reads as the first look, so a press that stays there is
-                // a press against the end.
-                if to == at {
-                    return;
+                // Empty or stale saved names already display the first look.
+                if to == at || self.shaders.get(to).is_none() {
+                    return None;
                 }
-                let Some(name) = self.shaders.get(to).cloned() else {
-                    return;
-                };
+                QuickSettingChange::Shader(to)
+            }
+            QuickRow::ShowFps => QuickSettingChange::ShowFps(!s.show_framerate),
+            QuickRow::Rumble => QuickSettingChange::Rumble(!s.rumble),
+            QuickRow::HomeWifi => QuickSettingChange::HomeWifi(!s.home_wifi_enabled),
+            QuickRow::TwelveHour => QuickSettingChange::TwelveHour(!s.twelve_hour),
+            QuickRow::WifiNetworks
+            | QuickRow::RetroAchievements
+            | QuickRow::DateTime
+            | QuickRow::About => return None,
+        })
+    }
+
+    fn change_setting(&mut self, row: QuickRow, right: bool) {
+        let Some(change) = self.quick_setting_change(row, right) else {
+            if row == QuickRow::ColourCorrection && self.profile_colour.is_some() {
+                self.hud.toast(Toast::ProfileColourLocked, self.now());
+            }
+            return;
+        };
+        let s = &mut self.state;
+        match change {
+            QuickSettingChange::FastForward(value) => s.ff_speed = value,
+            QuickSettingChange::FastForwardSound(value) => s.ff_sound = value,
+            QuickSettingChange::ColourCorrection(value) => {
+                s.colour_correction = value;
+                self.colour_pending = Some(value);
+            }
+            QuickSettingChange::Shader(to) => {
+                let name = self.shaders[to].clone();
                 s.shader = name.clone();
                 self.shader_pending = Some(name);
             }
-            QuickRow::ShowFps => s.show_framerate = !s.show_framerate,
-            QuickRow::Rumble => s.rumble = !s.rumble,
-            QuickRow::HomeWifi => {
+            QuickSettingChange::ShowFps(value) => s.show_framerate = value,
+            QuickSettingChange::Rumble(value) => s.rumble = value,
+            QuickSettingChange::HomeWifi(value) => {
                 self.wifi_generation = self.wifi_generation.wrapping_add(1);
                 if let Some(worker) = &self.wifi_worker {
                     worker.cancel(self.wifi_generation);
                 }
-                s.home_wifi_enabled = !s.home_wifi_enabled;
-                self.radio.ask(RadioJob::Home(s.home_wifi_enabled));
+                s.home_wifi_enabled = value;
+                self.radio.ask(RadioJob::Home(value));
             }
-            QuickRow::TwelveHour => s.twelve_hour = !s.twelve_hour,
-            QuickRow::WifiNetworks
-            | QuickRow::RetroAchievements
-            | QuickRow::DateTime
-            | QuickRow::About => return,
+            QuickSettingChange::TwelveHour(value) => s.twelve_hour = value,
         }
         self.persist();
     }
@@ -2539,6 +2572,7 @@ impl App {
             Phase::QuickMenu { row } => QuickMenu {
                 row: *row,
                 values: QuickRow::ALL.map(|r| self.quick_value(r)),
+                carets: self.quick_carets(*row),
                 clock: self.quick_clock_faces,
                 shader: self.quick_shader_faces,
                 faces: self.quick_menu_faces.as_ref(),

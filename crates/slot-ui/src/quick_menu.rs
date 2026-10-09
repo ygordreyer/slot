@@ -1,5 +1,7 @@
 //! Settings in a scrolling window with fixed-size menu type.
 
+use std::sync::OnceLock;
+
 use crate::draw::{Draw, TexId, OUT_H, OUT_W};
 use crate::plate::{arrows_hint_face, centred_hints, hint_face, UndoFace, HINT_H, LEGEND_GAP};
 use crate::power_menu::{MENU_H, MENU_INK, MENU_PAD, MENU_PX};
@@ -171,34 +173,39 @@ pub fn quick_label_face(row: QuickRow) -> UndoFace {
 }
 
 fn shader_scale_face() -> UndoFace {
+    let label = quick_text_face(QuickRow::Shader.label(), MENU_INK);
     let Some(font) = text::label_font() else {
-        return UndoFace {
-            rgba: Vec::new(),
-            w: 0,
-            h: 0,
-        };
+        return label;
     };
-    let lines = [
-        (QuickRow::Shader.label(), 24.0, 24u32),
-        (QuickRow::Shader.note().unwrap(), 12.0, 16u32),
-    ];
-    let width = lines
-        .iter()
-        .map(|(line, px, _)| text::line_width(font, line, *px, 0.0))
-        .fold(0.0, f32::max);
-    let w = width.ceil() as u32 + 2 * MENU_PAD;
+    let Some(metrics) = font.horizontal_line_metrics(MENU_PX) else {
+        return label;
+    };
+    let note = text::Layout {
+        lines: vec![QuickRow::Shader.note().unwrap().into()],
+        px: 12.0,
+        tracking: 0.0,
+    };
+    let gap = MENU_PAD;
+    let note_x = label.w - MENU_PAD + gap;
+    let note_w = text::line_width(font, &note.lines[0], note.px, note.tracking).ceil() as u32;
+    let w = note_x + note_w + MENU_PAD;
     let mut rgba = vec![0u8; (w * MENU_H * 4) as usize];
-    let mut offset = 0;
-    for (line, px, h) in lines {
-        let layout = text::Layout {
-            lines: vec![line.into()],
-            px,
-            tracking: 0.0,
-        };
-        let end = offset + (w * h * 4) as usize;
-        text::draw_centred(&mut rgba[offset..end], w, h, &layout, MENU_INK);
-        offset = end;
+    // Copy the standard face so extending its width cannot recenter the main label.
+    for y in 0..MENU_H as usize {
+        let src = y * label.w as usize * 4;
+        let dst = y * w as usize * 4;
+        rgba[dst..dst + label.w as usize * 4]
+            .copy_from_slice(&label.rgba[src..src + label.w as usize * 4]);
     }
+    let baseline = (MENU_H as f32 - metrics.new_line_size) / 2.0 + metrics.ascent;
+    text::draw_line_at(
+        &mut rgba,
+        w,
+        MENU_H,
+        &note,
+        [note_x as f32, baseline],
+        DIM_INK,
+    );
     UndoFace { rgba, w, h: MENU_H }
 }
 
@@ -214,6 +221,13 @@ fn quick_text_face(label: &str, colour: [u8; 3]) -> UndoFace {
             h: 0,
         };
     };
+    let (layout, w) = quick_text_layout(font, label);
+    let mut rgba = vec![0u8; (w * MENU_H * 4) as usize];
+    text::draw_centred(&mut rgba, w, MENU_H, &layout, colour);
+    UndoFace { rgba, w, h: MENU_H }
+}
+
+fn quick_text_layout(font: &fontdue::Font, label: &str) -> (text::Layout, u32) {
     let layout = text::fit(font, label, OUT_W as f32, 1, MENU_PX, MENU_PX);
     let set = layout
         .lines
@@ -221,9 +235,29 @@ fn quick_text_face(label: &str, colour: [u8; 3]) -> UndoFace {
         .map(|l| text::line_width(font, l, layout.px, layout.tracking))
         .fold(0.0, f32::max);
     let w = set.ceil() as u32 + 2 * MENU_PAD;
-    let mut rgba = vec![0u8; (w * MENU_H * 4) as usize];
-    text::draw_centred(&mut rgba, w, MENU_H, &layout, colour);
-    UndoFace { rgba, w, h: MENU_H }
+    (layout, w)
+}
+
+pub fn quick_shader_value_fits(value: &str) -> bool {
+    static ROOM: OnceLock<f32> = OnceLock::new();
+    let room = *ROOM.get_or_init(|| {
+        let label = quick_label_face(QuickRow::Shader);
+        let left = quick_caret_face(false);
+        let right = quick_caret_face(true);
+        // Reserve both caret slots even at an endpoint, so the value never shifts.
+        OUT_W as f32
+            - 2.0 * QUICK_EDGE
+            - label.w as f32
+            - left.w as f32
+            - right.w as f32
+            - 2.0 * CARET_GAP
+            + 4.0 * MENU_PAD as f32
+    });
+    let Some(font) = text::label_font() else {
+        return false;
+    };
+    let (_, width) = quick_text_layout(font, value);
+    width as f32 <= room
 }
 
 pub fn quick_caret_face(right: bool) -> UndoFace {
@@ -278,6 +312,7 @@ pub struct QuickMenuFaces {
 pub struct QuickMenu<'a> {
     pub row: QuickRow,
     pub values: [Option<QuickValue>; QuickRow::ALL.len()],
+    pub carets: [bool; 2],
     pub clock: Option<[(TexId, u32, u32); 2]>,
     /// Shader's value, grey then lit, built the same way: the name comes off the card.
     pub shader: Option<[(TexId, u32, u32); 2]>,
@@ -332,10 +367,14 @@ impl QuickMenu<'_> {
             }
             let [(left_tex, lw, lh), (right_tex, rw, rh)] = faces.carets;
             let rx = right - rw as f32;
-            push(out, right_tex, rx, y, rw, rh);
+            if self.carets[1] {
+                push(out, right_tex, rx, y, rw, rh);
+            }
             let vx = rx - CARET_GAP + pad - w as f32;
             push(out, tex, vx, y, w, h);
-            push(out, left_tex, vx + pad - CARET_GAP - lw as f32, y, lw, lh);
+            if self.carets[0] {
+                push(out, left_tex, vx + pad - CARET_GAP - lw as f32, y, lw, lh);
+            }
         }
         let [back, change, open] = faces.legend;
         let other = if self.row.opens() || self.row == QuickRow::Shader {

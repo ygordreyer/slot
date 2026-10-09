@@ -440,8 +440,8 @@ fn the_arrows_stand_only_around_the_selected_rows_value() {
     a.apply(Action::QuickMenu);
     let out = frame(&a);
     assert!(
-        drawn(&out, 300) && drawn(&out, 301),
-        "no arrows on Fast Forward"
+        drawn(&out, 300) && !drawn(&out, 301),
+        "Fast Forward at 6x must only offer a left arrow"
     );
     assert!(
         drawn(&out, value(QuickValue::Speed6, true)),
@@ -498,7 +498,10 @@ fn the_bar_runs_edge_to_edge_behind_the_selected_row() {
 
 #[test]
 fn labels_start_and_values_end_thirty_two_pixels_in() {
-    let (_d, mut a, _) = on_carousel();
+    let (_d, mut a, _) = on_carousel_with(SlotState {
+        ff_speed: 4,
+        ..SlotState::default()
+    });
     fake_faces(&mut a);
     a.apply(Action::QuickMenu);
     let out = frame(&a);
@@ -836,4 +839,89 @@ fn preset_colour_is_effective_and_locked_until_the_preset_is_left() {
 fn shader_row_exposes_exact_gba_presentation_scale() {
     assert_eq!(QuickRow::Shader.label(), "Shader");
     assert_eq!(QuickRow::Shader.note(), Some("3X INTEGER"));
+}
+
+#[test]
+fn shader_carets_match_changes_at_the_first_middle_and_last_entry() {
+    let d = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    std::fs::create_dir_all(d.path().join("Shaders")).unwrap();
+    std::fs::write(d.path().join("Shaders/motionblur.glsl"), "void main() {}").unwrap();
+    write_slot_state(
+        d.path(),
+        &SlotState {
+            clock_set: true,
+            ..SlotState::default()
+        },
+    )
+    .unwrap();
+    let (mut a, _) = app_booting_at(d.path(), CLOCK_IS_SET);
+    fake_faces(&mut a);
+    a.set_quick_shader_faces(
+        (TexId::from_raw(510), 150, 40),
+        (TexId::from_raw(511), 150, 40),
+    );
+    open_at(&mut a, QuickRow::Shader);
+    a.take_shader();
+    let mut position = None;
+    for (name, carets, toward_end, blocked) in [
+        ("LCD", [false, true], Btn::Right, Some(Btn::Left)),
+        ("Off", [true, true], Btn::Right, None),
+        ("motionblur", [true, false], Btn::Left, Some(Btn::Right)),
+    ] {
+        assert_eq!(a.shader(), name);
+        assert_eq!(a.quick_carets(QuickRow::Shader), carets);
+        let out = frame(&a);
+        assert_eq!([drawn(&out, 300), drawn(&out, 301)], carets);
+        let value_position = placed(&out, 511).unwrap();
+        assert_eq!(*position.get_or_insert(value_position), value_position);
+        if let Some(btn) = blocked {
+            press(&mut a, btn);
+            assert_eq!(a.shader(), name);
+            assert_eq!(a.take_shader(), None);
+        }
+        press(&mut a, toward_end);
+        assert_ne!(a.shader(), name);
+        assert!(a.take_shader().is_some());
+    }
+    press(&mut a, Btn::Down);
+    assert_eq!(a.quick_menu(), Some(QuickRow::ShowFps));
+    for btn in [Btn::Left, Btn::Right] {
+        assert_eq!([drawn(&frame(&a), 300), drawn(&frame(&a), 301)], [true; 2]);
+        let before = a.quick_value(QuickRow::ShowFps);
+        press(&mut a, btn);
+        assert_ne!(a.quick_value(QuickRow::ShowFps), before);
+    }
+}
+
+#[test]
+fn fast_forward_carets_follow_its_clamps_and_locked_colour_has_no_carets() {
+    let (_d, mut a, _) = on_carousel_with(SlotState {
+        ff_speed: 2,
+        ..SlotState::default()
+    });
+    fake_faces(&mut a);
+    open_at(&mut a, QuickRow::FastForward);
+    for (speed, carets) in [
+        (2, [false, true]),
+        (3, [true, true]),
+        (4, [true, true]),
+        (6, [true, false]),
+    ] {
+        assert_eq!(a.ff_speed(), speed);
+        assert_eq!([drawn(&frame(&a), 300), drawn(&frame(&a), 301)], carets);
+        press(&mut a, Btn::Right);
+    }
+    press(&mut a, Btn::Down);
+    press(&mut a, Btn::Down);
+    assert_eq!(a.quick_menu(), Some(QuickRow::ColourCorrection));
+    assert_eq!(a.quick_carets(QuickRow::ColourCorrection), [true; 2]);
+    a.set_profile_colour(Some(QuickValue::Gba));
+    assert_eq!([drawn(&frame(&a), 300), drawn(&frame(&a), 301)], [false; 2]);
+    for btn in [Btn::Left, Btn::Right] {
+        press(&mut a, btn);
+        assert_eq!(
+            a.quick_value(QuickRow::ColourCorrection),
+            Some(QuickValue::Gba)
+        );
+    }
 }

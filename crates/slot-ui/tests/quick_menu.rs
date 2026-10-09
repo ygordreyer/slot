@@ -192,6 +192,7 @@ fn scrolling_keeps_every_selection_and_its_bar_clear_of_the_legend() {
         QuickMenu {
             row,
             values: [None; QuickRow::ALL.len()],
+            carets: [false; 2],
             clock: None,
             shader: None,
             faces: None,
@@ -218,6 +219,7 @@ fn scroll_chevrons_show_only_hidden_rows_and_clear_text_and_legend() {
         QuickMenu {
             row,
             values: [None; QuickRow::ALL.len()],
+            carets: [false; 2],
             clock: None,
             shader: None,
             faces: None,
@@ -243,4 +245,67 @@ fn scroll_chevrons_show_only_hidden_rows_and_clear_text_and_legend() {
             .iter()
             .all(|(y, h)| (*y + *h < QUICK_TOP || *y >= bottom) && *y + *h <= 427.0));
     }
+}
+
+#[test]
+fn shader_keeps_the_standard_label_and_a_dim_inline_note_on_its_baseline() {
+    let standard = quick_value_face("Shader", true);
+    let shader = quick_label_face(QuickRow::Shader);
+    assert_eq!(shader.h, standard.h);
+    assert!(shader.w > standard.w);
+    for y in 0..standard.h as usize {
+        let src = y * standard.w as usize * 4;
+        let dst = y * shader.w as usize * 4;
+        assert_eq!(
+            &shader.rgba[dst..dst + standard.w as usize * 4],
+            &standard.rgba[src..src + standard.w as usize * 4],
+            "standard label moved or changed on scanline {y}"
+        );
+    }
+    let font = slot_ui::text::label_font().unwrap();
+    let metrics = font.horizontal_line_metrics(30.0).unwrap();
+    let baseline = (standard.h as f32 - metrics.new_line_size) / 2.0 + metrics.ascent;
+    let mut pen = standard.w as f32;
+    let mut expected = vec![0u8; shader.rgba.len()];
+    for ch in "3X INTEGER".chars() {
+        let (m, cov) = font.rasterize(ch, 12.0);
+        let x = (pen + m.xmin as f32).round() as usize;
+        let y = (baseline - (m.height as f32 + m.ymin as f32)).round() as usize;
+        for gy in 0..m.height {
+            for gx in 0..m.width {
+                let a = cov[gy * m.width + gx];
+                if a > 0 {
+                    let at = ((y + gy) * shader.w as usize + x + gx) * 4;
+                    expected[at..at + 4].copy_from_slice(&[0x9a, 0x9a, 0xa4, a]);
+                }
+            }
+        }
+        pen += m.advance_width;
+    }
+    let mut note_pixels = 0;
+    for y in 0..shader.h as usize {
+        let start = (y * shader.w as usize + standard.w as usize) * 4;
+        let end = (y + 1) * shader.w as usize * 4;
+        assert_eq!(&shader.rgba[start..end], &expected[start..end]);
+        note_pixels += shader.rgba[start..end]
+            .chunks(4)
+            .filter(|p| p[3] > 0)
+            .count();
+    }
+    assert!(note_pixels > 0);
+    assert!(
+        shader.w - 2 * MENU_PAD <= 328,
+        "inline note exceeds the label column"
+    );
+}
+
+#[test]
+fn rumble_label_pixels_stay_at_the_previous_output() {
+    let face = quick_label_face(QuickRow::Rumble);
+    let hash = face.rgba.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    assert_eq!((face.w, face.h), (176, 40));
+    assert_eq!(hash, 0x3c079a9db557b8fe);
+    assert_eq!(face.rgba, quick_value_face("Rumble", true).rgba);
 }

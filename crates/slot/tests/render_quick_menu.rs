@@ -126,8 +126,13 @@ fn the_quick_menu_renders_full_screen() {
             }
             let value = inked(&px, 360..OUT_W as usize, top);
             let last = *value.last().expect("a row with no value");
+            // Fast Forward starts at its top speed, so its right arrow is hidden.
+            let edge = match row == selected && row == QuickRow::FastForward {
+                true => 650..=665,
+                false => 679..=688,
+            };
             assert!(
-                (679..=688).contains(&last),
+                edge.contains(&last),
                 "{name}: {row:?}'s value ends at x {last}"
             );
         }
@@ -160,14 +165,20 @@ fn every_fast_forward_speed_sits_on_the_rows_right_edge_and_clears_the_label() {
     tap(&mut f, &mut input, Btn::Left);
 
     let top = QUICK_TOP as usize;
-    for name in ["2x", "3x", "4x", "6x", "8x"] {
+    // Down from the top speed to 3x, then back up and one press past the top.
+    for (name, at_top) in [("3x", false), ("4x", false), ("6x", true), ("6x+", true)] {
         let px = composed(&mut f, &mut c, name);
         let value = inked(&px, 360..OUT_W as usize, top);
         let last = *value
             .last()
             .unwrap_or_else(|| panic!("{name}: the Fast Forward row has no value"));
+        // At the top speed the right arrow is hidden and the value keeps its place.
+        let edge = match at_top {
+            true => 650..=665,
+            false => 679..=688,
+        };
         assert!(
-            (679..=688).contains(&last),
+            edge.contains(&last),
             "{name} ends at x {last}, off the edge every other value keeps"
         );
         assert!(

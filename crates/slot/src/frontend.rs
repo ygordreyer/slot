@@ -897,17 +897,28 @@ fn sync_cheats(app: &mut App, compositor: &mut Compositor, state: &mut CheatFace
 const SHADER_NAME_MAX: usize = 18;
 
 fn shader_display(name: &str) -> String {
-    if name.chars().count() <= SHADER_NAME_MAX {
-        return name.to_string();
+    let mut max = SHADER_NAME_MAX;
+    loop {
+        let display = if name.chars().count() <= max {
+            name.to_string()
+        } else if let Some((stem, folder)) = name.rsplit_once(" (") {
+            let folder: String = folder
+                .trim_end_matches(')')
+                .chars()
+                .take(9.min(max.saturating_sub(6)))
+                .collect();
+            let room = max.saturating_sub(folder.chars().count() + 5);
+            let kept: String = stem.chars().take(room).collect();
+            format!("{kept}... ({folder})")
+        } else {
+            let kept: String = name.chars().take(max.saturating_sub(3)).collect();
+            format!("{kept}...")
+        };
+        if slot_ui::quick_shader_value_fits(&display) || max <= 3 {
+            return display;
+        }
+        max -= 1;
     }
-    if let Some((stem, folder)) = name.rsplit_once(" (") {
-        let folder: String = folder.trim_end_matches(')').chars().take(9).collect();
-        let room = SHADER_NAME_MAX.saturating_sub(folder.chars().count() + 5);
-        let kept: String = stem.chars().take(room).collect();
-        return format!("{kept}... ({folder})");
-    }
-    let kept: String = name.chars().take(SHADER_NAME_MAX - 3).collect();
-    format!("{kept}...")
 }
 
 fn quick_shader_text(app: &App) -> String {
@@ -1244,6 +1255,7 @@ mod tests {
             "pixellate-sharp-shimmerless",
             "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",
             "vba-color-lcd1x (handheld)",
+            "WWWWWWWWWWWWWWWWWW (WWWWWWWWW)",
         ] {
             let display = shader_display(name);
             let value = quick_value_face(&display, true);

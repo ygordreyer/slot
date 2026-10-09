@@ -75,6 +75,41 @@ pub fn draw_centred(dst: &mut [u8], dst_w: u32, dst_h: u32, layout: &Layout, col
     }
 }
 
+pub(crate) fn draw_line_at(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    layout: &Layout,
+    origin: [f32; 2],
+    colour: [u8; 3],
+) {
+    let Some(font) = label_font() else { return };
+    let mut out = vec![0u8; (dst_w * dst_h) as usize];
+    let [mut pen, baseline] = origin;
+    let Some(line) = layout.lines.first() else {
+        return;
+    };
+    for ch in line.chars() {
+        let (m, cov) = font.rasterize(ch, layout.px);
+        stamp(
+            &mut out,
+            dst_w,
+            dst_h,
+            (pen + m.xmin as f32).round() as i32,
+            (baseline - (m.height as f32 + m.ymin as f32)).round() as i32,
+            &cov,
+            m.width as u32,
+            m.height as u32,
+        );
+        pen += m.advance_width + layout.tracking;
+    }
+    for (i, a) in out.into_iter().enumerate() {
+        if a > 0 {
+            blend(&mut dst[i * 4..i * 4 + 4], a as u32, colour);
+        }
+    }
+}
+
 pub fn coverage(dst_w: u32, dst_h: u32, layout: &Layout) -> Vec<u8> {
     let mut out = vec![0u8; (dst_w * dst_h) as usize];
     let Some(font) = label_font() else { return out };
