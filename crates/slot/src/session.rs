@@ -904,6 +904,49 @@ mod profile_tests {
         assert!(session.emu().unwrap().snapshot().state().is_some());
     }
 
+    #[test]
+    fn in_game_settings_pause_and_consume_colour_changes_on_the_running_core() {
+        let root = tempfile::tempdir().unwrap();
+        crate::root::ensure(root.path());
+        std::fs::write(root.path().join("Games/GBA/Example.gba"), vec![0; 256]).unwrap();
+        slot_store::write_slot_state(
+            root.path(),
+            &slot_store::SlotState {
+                cart: Some("Example".into()),
+                clock_set: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut session = Session::boot(root.path().into());
+        session.app.on_core_ready();
+        for _ in 0..120 {
+            session.app.update(1.0 / 60.0);
+        }
+        let values = game_open(&mut session, Core::Mgba);
+        session.act(Action::GameMenu);
+        session.act(Action::GbaDown(Btn::Down));
+        session.act(Action::GbaDown(Btn::A));
+        for _ in 0..QuickRow::ColourCorrection.index() {
+            session.act(Action::GbaDown(Btn::Down));
+        }
+        session.act(Action::GbaDown(Btn::Right));
+        session.update(1.0 / 60.0);
+        flush(&session);
+        assert!(matches!(session.app.phase(), Phase::Playing { .. }));
+        assert!(session.app.game_menu_open());
+        assert_eq!(session.app.quick_menu(), Some(QuickRow::ColourCorrection));
+        assert!(session.app.take_colour_correction().is_none());
+        assert_eq!(values.lock().unwrap()["mgba_color_correction"], "Auto");
+        assert!(session.held());
+        assert!(!session.playing());
+        assert_eq!(session.emu().unwrap().input(), ButtonMask(0));
+        session.act(Action::GameMenu);
+        session.update(1.0 / 60.0);
+        assert!(!session.app.game_menu_open());
+        assert!(session.playing());
+    }
+
     fn owner_profile() -> slot_gfx::preset::Profile {
         slot_gfx::preset::parse_preset("shaders=1\nshader0=copy.glsl\nslot_core=mgba\nslot_core_options=mgba_color_correction;mgba_interframe_blending;mgba_audio_low_pass_filter;mgba_audio_low_pass_range\nmgba_color_correction=GBA\nmgba_interframe_blending=mix_smart\nmgba_audio_low_pass_filter=enabled\nmgba_audio_low_pass_range=30", std::path::Path::new("owner.glslp")).unwrap().profile
     }

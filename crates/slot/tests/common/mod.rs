@@ -553,6 +553,7 @@ pub fn toggle_link_menu(app: &mut slot::app::App) {
     app.apply(slot_input::Action::GameMenu);
     if app.game_picker().is_some() {
         app.apply(slot_input::Action::GbaDown(slot_input::Btn::Down));
+        app.apply(slot_input::Action::GbaDown(slot_input::Btn::Down));
         app.apply(slot_input::Action::GbaDown(slot_input::Btn::A));
     }
 }

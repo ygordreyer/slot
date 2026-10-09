@@ -1160,8 +1160,15 @@ mod tests {
     use slot_ui::QuickRow;
 
     fn rewind_frontend() -> (tempfile::TempDir, Frontend) {
+        rewind_frontend_with_files(&[])
+    }
+
+    fn rewind_frontend_with_files(files: &[(&str, &str)]) -> (tempfile::TempDir, Frontend) {
         let root = tempfile::tempdir().unwrap();
         crate::root::ensure(root.path());
+        for (name, source) in files {
+            std::fs::write(root.path().join("Shaders").join(name), source).unwrap();
+        }
         std::fs::write(root.path().join("Games/GBA/Example.gba"), vec![0; 256]).unwrap();
         slot_store::write_slot_state(
             root.path(),
@@ -1471,6 +1478,91 @@ mod tests {
             let sav = crate::persist::read_sav(root.path(), slot_store::Platform::Gba, "Example");
             assert_eq!(resume, playing.then(|| b"current state".to_vec()));
             assert_eq!(sav, playing.then(|| b"current SRAM".to_vec()));
+        }
+    }
+
+    #[test]
+    fn in_game_shader_value_text_follows_the_selected_look() {
+        let (_root, mut frontend) = rewind_frontend();
+        let app = frontend.session.app_mut();
+        app.apply(Action::GameMenu);
+        app.apply(Action::GbaDown(Btn::Down));
+        app.apply(Action::GbaDown(Btn::A));
+        for _ in 0..QuickRow::Shader.index() {
+            app.apply(Action::GbaDown(Btn::Down));
+        }
+        assert_eq!(quick_shader_text(app), "LCD");
+        app.apply(Action::GbaDown(Btn::Right));
+        assert_eq!(quick_shader_text(app), "OFF");
+        assert_eq!(app.quick_menu(), Some(QuickRow::Shader));
+        assert!(matches!(app.phase(), Phase::Playing { .. }));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "writes in-game settings previews to SCRATCH_PNG_DIR; requires GL"]
+    fn render_in_game_quick_menu_preview() {
+        let surface = slot_gfx::HeadlessSurface::new().expect("preview needs GL");
+        let mut compositor = Compositor::new(&surface).unwrap();
+        let (_root, mut frontend) = rewind_frontend_with_files(&[("broken.glsl", "broken shader")]);
+        let output =
+            std::path::PathBuf::from(std::env::var_os("SCRATCH_PNG_DIR").expect("SCRATCH_PNG_DIR"));
+        std::fs::create_dir_all(&output).unwrap();
+        frontend.upload_faces(&mut compositor);
+        let app = frontend.session.app_mut();
+        app.set_game_ready(true);
+        for _ in 0..120 {
+            app.update(1.0 / 60.0);
+        }
+        app.apply(Action::GameMenu);
+        app.apply(Action::GbaDown(Btn::Down));
+        app.apply(Action::GbaDown(Btn::A));
+        for (name, row) in [
+            ("fast-forward", QuickRow::FastForward),
+            ("shader", QuickRow::Shader),
+            ("rumble", QuickRow::Rumble),
+        ] {
+            while frontend.app().quick_menu().unwrap().index() < row.index() {
+                frontend.session.app_mut().apply(Action::GbaDown(Btn::Down));
+            }
+            frontend.compose(&mut compositor);
+            assert!(frontend.app().game_menu_open());
+            assert!(matches!(frontend.app().phase(), Phase::Playing { .. }));
+            let file = std::fs::File::create(output.join(format!("in-game-quick-menu-{name}.png")))
+                .unwrap();
+            let mut encoder = png::Encoder::new(file, OUT_W, OUT_H);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&compositor.read_frame())
+                .unwrap();
+            if row == QuickRow::Shader {
+                assert_eq!(frontend.quick_shader.shown, "LCD");
+                frontend
+                    .session
+                    .app_mut()
+                    .apply(Action::GbaDown(Btn::Right));
+                frontend.compose(&mut compositor);
+                assert!(matches!(frontend.effective_shader, EffectiveShader::Off));
+                assert_eq!(frontend.quick_shader.shown, "OFF");
+                assert!(frontend.session.app_mut().take_shader().is_none());
+                frontend
+                    .session
+                    .app_mut()
+                    .apply(Action::GbaDown(Btn::Right));
+                frontend.compose(&mut compositor);
+                assert!(matches!(
+                    frontend.effective_shader,
+                    EffectiveShader::Fallback(_)
+                ));
+                assert_eq!(frontend.app().toast(), Some(slot_ui::Toast::ShaderFailed));
+                assert!(frontend.app().shader_parameters().is_empty());
+                assert_eq!(frontend.app().shader(), "broken");
+                assert!(frontend.app().game_menu_open());
+                assert!(frontend.session.app_mut().take_shader().is_none());
+            }
         }
     }
 

@@ -205,6 +205,29 @@ impl LinkRow {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GamePickerRow {
+    Achievements,
+    Settings,
+    Link,
+}
+
+impl GamePickerRow {
+    pub const ALL: [Self; 3] = [Self::Achievements, Self::Settings, Self::Link];
+
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Achievements => "ACHIEVEMENTS",
+            Self::Settings => "SETTINGS",
+            Self::Link => "LINK",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LinkLegend {
     Cancel,
     Mode,
@@ -364,7 +387,8 @@ pub struct App {
     core_legend_faces: Vec<(TexId, u32)>,
     /// than a phase: `Phase::Playing` is
     game_menu: Option<GameMenu>,
-    game_picker: Option<bool>,
+    game_picker: Option<GamePickerRow>,
+    game_quick_menu: Option<QuickRow>,
     achievement_screen: Option<crate::achievement_screen::Selection>,
     achievement_count: usize,
     achievement_description_pages: usize,
@@ -533,6 +557,7 @@ impl App {
             core_legend_faces: Vec::new(),
             game_menu: None,
             game_picker: None,
+            game_quick_menu: None,
             achievement_screen: None,
             achievement_count: 0,
             achievement_description_pages: 1,
@@ -942,7 +967,7 @@ impl App {
     pub fn quick_menu(&self) -> Option<QuickRow> {
         match self.phase {
             Phase::QuickMenu { row } => Some(row),
-            _ => None,
+            _ => self.game_quick_menu,
         }
     }
 
@@ -1625,10 +1650,13 @@ impl App {
     }
 
     pub fn game_menu_open(&self) -> bool {
-        self.game_menu.is_some() || self.game_picker.is_some() || self.achievement_screen.is_some()
+        self.game_menu.is_some()
+            || self.game_picker.is_some()
+            || self.achievement_screen.is_some()
+            || self.game_quick_menu.is_some()
     }
 
-    pub fn game_picker(&self) -> Option<bool> {
+    pub fn game_picker(&self) -> Option<GamePickerRow> {
         self.game_picker
     }
 
@@ -1656,16 +1684,26 @@ impl App {
 
     fn game_picker_input(&mut self, action: Action) {
         match action {
-            Action::GbaDown(Btn::Up) | Action::GbaDown(Btn::Down) => {
-                self.game_picker = self.game_picker.map(|link| !link);
+            Action::GbaDown(Btn::Up) => {
+                self.game_picker = self
+                    .game_picker
+                    .map(|row| GamePickerRow::ALL[row.index().saturating_sub(1)]);
             }
-            Action::GbaDown(Btn::A) => {
-                if self.game_picker.take() == Some(true) {
-                    self.open_link_menu();
-                } else {
+            Action::GbaDown(Btn::Down) => {
+                self.game_picker = self.game_picker.map(|row| {
+                    GamePickerRow::ALL[(row.index() + 1).min(GamePickerRow::ALL.len() - 1)]
+                });
+            }
+            Action::GbaDown(Btn::A) => match self.game_picker.take() {
+                Some(GamePickerRow::Link) => self.open_link_menu(),
+                Some(GamePickerRow::Settings) => {
+                    self.game_quick_menu = Some(QuickRow::FastForward);
+                }
+                Some(GamePickerRow::Achievements) => {
                     self.achievement_screen = Some(Default::default());
                 }
-            }
+                None => {}
+            },
             Action::GbaDown(Btn::B) | Action::GameMenu => self.close_game_menu(),
             _ => {}
         }
@@ -1846,10 +1884,15 @@ impl App {
             return;
         }
         if action == Action::Eject
-            && (self.game_picker.is_some() || self.achievement_screen.is_some())
+            && (self.game_picker.is_some()
+                || self.achievement_screen.is_some()
+                || self.game_quick_menu.is_some())
         {
             self.close_game_menu();
             return self.eject();
+        }
+        if action == Action::GameMenu && self.game_quick_menu.is_some() {
+            return self.close_game_menu();
         }
         if self.game_picker.is_some() {
             return self.game_picker_input(action);
@@ -1864,6 +1907,9 @@ impl App {
         // device's own keys still answered above.
         if self.shader_params_open() {
             return self.shader_params_input(action);
+        }
+        if let Some(row) = self.game_quick_menu {
+            return self.quick_menu_input(row, action);
         }
         if self.cheat_menu.is_some() {
             return self.cheat_menu_input(action);
@@ -1951,18 +1997,50 @@ impl App {
 
     fn quick_menu_input(&mut self, row: QuickRow, action: Action) {
         let row = match action {
+            Action::GbaDown(Btn::Up) if self.game_quick_menu.is_some() => {
+                QuickRow::IN_GAME[row.index().saturating_sub(1)]
+            }
+            Action::GbaDown(Btn::Down) if self.game_quick_menu.is_some() => {
+                QuickRow::IN_GAME[(row.index() + 1).min(QuickRow::IN_GAME.len() - 1)]
+            }
             Action::GbaDown(Btn::Up) => row.up(),
             Action::GbaDown(Btn::Down) => row.down(),
             Action::GbaDown(Btn::Left) => return self.change_setting(row, false),
             Action::GbaDown(Btn::Right) => return self.change_setting(row, true),
             Action::GbaDown(Btn::A) => return self.open_quick_row(row),
+            Action::GbaDown(Btn::B) if self.game_quick_menu.is_some() => {
+                self.game_quick_menu = None;
+                self.game_picker = Some(GamePickerRow::Settings);
+                return;
+            }
+            Action::QuickMenu if self.game_quick_menu.is_some() => return,
             Action::GbaDown(Btn::B) | Action::QuickMenu => {
                 self.phase = Phase::Shelf;
                 return;
             }
             _ => return,
         };
-        self.phase = Phase::QuickMenu { row };
+        if self.game_quick_menu.is_some() {
+            self.game_quick_menu = Some(row);
+        } else {
+            self.phase = Phase::QuickMenu { row };
+        }
+    }
+
+    fn draw_quick_menu(&self, row: QuickRow, in_game: bool, out: &mut Vec<Draw>) {
+        let menu = QuickMenu {
+            row,
+            values: QuickRow::ALL.map(|r| self.quick_value(r)),
+            carets: self.quick_carets(row),
+            clock: self.quick_clock_faces,
+            shader: self.quick_shader_faces,
+            faces: self.quick_menu_faces.as_ref(),
+        };
+        if in_game {
+            menu.draw_in_game(out);
+        } else {
+            menu.draw(out);
+        }
     }
 
     fn open_quick_row(&mut self, row: QuickRow) {
@@ -2569,15 +2647,7 @@ impl App {
                 picker.draw(line, hint, back, out);
                 return;
             }
-            Phase::QuickMenu { row } => QuickMenu {
-                row: *row,
-                values: QuickRow::ALL.map(|r| self.quick_value(r)),
-                carets: self.quick_carets(*row),
-                clock: self.quick_clock_faces,
-                shader: self.quick_shader_faces,
-                faces: self.quick_menu_faces.as_ref(),
-            }
-            .draw(out),
+            Phase::QuickMenu { row } => self.draw_quick_menu(*row, false, out),
             Phase::Shelf => {
                 draw_backdrop(self.wallpaper, out);
                 match (self.core_picker_shown(), self.selected_key_ref()) {
@@ -2676,6 +2746,9 @@ impl App {
         // Only a playing game can raise it, as the in-game menu, so it goes in the same place.
         if self.cheat_menu.is_some() {
             self.draw_cheat_menu(out);
+        }
+        if let Some(row) = self.game_quick_menu {
+            self.draw_quick_menu(row, true, out);
         }
         self.draw_shader_params(out);
         // Over everything, in every phase. The bar is never what the user is looking at.
@@ -3334,7 +3407,7 @@ impl App {
     }
 
     fn game_menu_shortcut(&mut self) {
-        self.game_picker = Some(false);
+        self.game_picker = Some(GamePickerRow::Achievements);
     }
 
     fn open_link_menu(&mut self) {
@@ -3541,6 +3614,9 @@ impl App {
     }
 
     fn close_game_menu(&mut self) {
+        if self.game_quick_menu.take().is_some() {
+            self.close_shader_params();
+        }
         self.game_picker = None;
         self.achievement_screen = None;
         self.game_menu = None;

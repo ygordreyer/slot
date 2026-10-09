@@ -45,6 +45,15 @@ impl QuickRow {
         QuickRow::About,
     ];
 
+    pub const IN_GAME: [QuickRow; 6] = [
+        QuickRow::FastForward,
+        QuickRow::FastForwardSound,
+        QuickRow::ColourCorrection,
+        QuickRow::Shader,
+        QuickRow::ShowFps,
+        QuickRow::Rumble,
+    ];
+
     pub fn index(self) -> usize {
         self as usize
     }
@@ -322,6 +331,20 @@ pub struct QuickMenu<'a> {
 
 impl QuickMenu<'_> {
     pub fn draw(&self, out: &mut Vec<Draw>) {
+        self.draw_rows(&QuickRow::ALL, out);
+    }
+
+    pub fn draw_in_game(&self, out: &mut Vec<Draw>) {
+        self.draw_rows(&QuickRow::IN_GAME, out);
+    }
+
+    fn draw_rows(&self, rows: &[QuickRow], out: &mut Vec<Draw>) {
+        let top = self
+            .row
+            .index()
+            .saturating_sub(QUICK_ROWS / 2)
+            .min(rows.len().saturating_sub(QUICK_ROWS));
+        let row_y = |row: QuickRow| QUICK_TOP + QUICK_PITCH * (row.index() - top) as f32;
         out.push(Draw::Rect {
             x: 0.0,
             y: 0.0,
@@ -331,22 +354,22 @@ impl QuickMenu<'_> {
         });
         out.push(Draw::Rect {
             x: 0.0,
-            y: row_top(self.row, self.row) + BAR_INSET,
+            y: row_y(self.row) + BAR_INSET,
             w: OUT_W as f32,
             h: QUICK_PITCH - 2.0 * BAR_INSET,
             colour: edge(),
         });
-        draw_quick_scroll_hints(out, self.row);
+        if rows.len() == QuickRow::ALL.len() {
+            draw_quick_scroll_hints(out, self.row);
+        } else {
+            draw_scroll_hints(out, top, rows.len());
+        }
         let Some(faces) = self.faces else {
             return;
         };
         let (right, pad) = (OUT_W as f32 - QUICK_EDGE, MENU_PAD as f32);
-        for row in QuickRow::ALL
-            .into_iter()
-            .skip(quick_window(self.row))
-            .take(QUICK_ROWS)
-        {
-            let y = row_top(row, self.row) + TYPE_DROP;
+        for row in rows.iter().copied().skip(top).take(QUICK_ROWS) {
+            let y = row_y(row) + TYPE_DROP;
             let lit = row == self.row;
             if let Some(&(tex, w, h)) = faces.labels.get(row.index()) {
                 push(out, tex, QUICK_EDGE - pad, y, w, h);
@@ -394,10 +417,6 @@ pub fn quick_window(row: QuickRow) -> usize {
         .min(QuickRow::ALL.len().saturating_sub(QUICK_ROWS))
 }
 
-fn row_top(row: QuickRow, selected: QuickRow) -> f32 {
-    QUICK_TOP + QUICK_PITCH * (row.index() - quick_window(selected)) as f32
-}
-
 fn push(out: &mut Vec<Draw>, tex: TexId, x: f32, y: f32, w: u32, h: u32) {
     out.push(Draw::Tex {
         x: x.round(),
@@ -411,11 +430,14 @@ fn push(out: &mut Vec<Draw>, tex: TexId, x: f32, y: f32, w: u32, h: u32) {
 
 /// Pixel chevrons occupy the clear gaps above and below the scrolling window.
 pub fn draw_quick_scroll_hints(out: &mut Vec<Draw>, row: QuickRow) {
-    let top = quick_window(row);
+    draw_scroll_hints(out, quick_window(row), QuickRow::ALL.len());
+}
+
+fn draw_scroll_hints(out: &mut Vec<Draw>, top: usize, len: usize) {
     for (visible, y, down) in [
         (top > 0, QUICK_TOP - 12.0, false),
         (
-            top + QUICK_ROWS < QuickRow::ALL.len(),
+            top + QUICK_ROWS < len,
             QUICK_TOP + QUICK_PITCH * QUICK_ROWS as f32,
             true,
         ),

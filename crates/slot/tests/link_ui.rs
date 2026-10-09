@@ -1295,6 +1295,8 @@ fn a_link_in_a_switched_mode_reloads_the_game_and_then_starts_the_link() {
     );
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Down)]);
     step(&mut s, &mut now, &[RawEvent::Up(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Down(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Up(Btn::Down)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::A)]);
     step(&mut s, &mut now, &[RawEvent::Up(Btn::A)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Right)]);
@@ -1403,6 +1405,8 @@ fn a_game_that_will_not_load_again_comes_back_out_of_the_slot() {
         &[RawEvent::Up(Btn::Menu), RawEvent::Up(Btn::Select)],
     );
     assert!(s.app().game_menu_open(), "the chord never reached the app");
+    step(&mut s, &mut now, &[RawEvent::Down(Btn::Down)]);
+    step(&mut s, &mut now, &[RawEvent::Up(Btn::Down)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::Down)]);
     step(&mut s, &mut now, &[RawEvent::Up(Btn::Down)]);
     step(&mut s, &mut now, &[RawEvent::Down(Btn::A)]);
@@ -1678,7 +1682,10 @@ fn root_picker_opens_on_a_non_link_game_and_achievements_close_to_play() {
     common::write_retail_header(&d, "Apotris", "APOTRIS", "2ATE");
     let mut app = seated_on_gpsp(&d);
     app.apply(Action::GameMenu);
-    assert_eq!(app.game_picker(), Some(false));
+    assert_eq!(
+        app.game_picker(),
+        Some(slot::app::GamePickerRow::Achievements)
+    );
     assert_eq!(app.toast(), None);
     app.apply(Action::GbaDown(Btn::A));
     assert!(app.achievement_screen().is_some());
@@ -1687,6 +1694,7 @@ fn root_picker_opens_on_a_non_link_game_and_achievements_close_to_play() {
     assert!(!app.game_menu_open());
     assert!(matches!(app.phase(), Phase::Playing { .. }));
     app.apply(Action::GameMenu);
+    app.apply(Action::GbaDown(Btn::Down));
     app.apply(Action::GbaDown(Btn::Down));
     app.apply(Action::GbaDown(Btn::A));
     assert_eq!(app.toast(), Some(Toast::NoLink));
@@ -1702,7 +1710,10 @@ fn achievements_pause_solo_and_isolate_menu_input() {
         &mut now,
         &[RawEvent::Down(Btn::Select), RawEvent::Down(Btn::Menu)],
     );
-    assert_eq!(session.app().game_picker(), Some(false));
+    assert_eq!(
+        session.app().game_picker(),
+        Some(slot::app::GamePickerRow::Achievements)
+    );
     step(&mut session, &mut now, &[RawEvent::Down(Btn::A)]);
     assert!(session.app().achievement_screen().is_some());
     assert!(runs_at(&mut session, &mut now, Speed::Paused));

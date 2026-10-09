@@ -5,6 +5,7 @@ use slot_gfx::{Compositor, Draw, TexId, OUT_H, OUT_W};
 use slot_input::{Action, Btn};
 use slot_ui::{text, CartFace};
 
+use crate::app::GamePickerRow;
 use crate::session::Session;
 
 pub const ROWS: usize = 5;
@@ -63,7 +64,7 @@ impl Selection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScreenKey {
-    Picker(bool),
+    Picker(GamePickerRow),
     Linked,
     Achievements(u64, u64, u64, Selection),
 }
@@ -146,8 +147,8 @@ impl Screen {
             self.snapshot_key = (0, 0);
             self.displayed = None;
         }
-        if let Some(link) = app.game_picker() {
-            return Some(ScreenKey::Picker(link));
+        if let Some(row) = app.game_picker() {
+            return Some(ScreenKey::Picker(row));
         }
         if app.link_active() || app.link_player().is_some() {
             self.snapshot = None;
@@ -404,11 +405,21 @@ fn raster(key: &ScreenKey, snapshot: Option<&GameAchievementSnapshot>) -> (CartF
     for pixel in face.rgba.chunks_exact_mut(4) {
         pixel.copy_from_slice(&[18, 18, 18, 235]);
     }
-    if let ScreenKey::Picker(link) = key {
+    if let ScreenKey::Picker(selected) = key {
         put_text(&mut face, "GAME MENU", 32, 70, 656, 50, 1, 30.0);
-        bar(&mut face, if *link { 252 } else { 184 }, 60);
-        put_text(&mut face, "ACHIEVEMENTS", 32, 184, 656, 60, 1, 30.0);
-        put_text(&mut face, "LINK", 32, 252, 656, 60, 1, 30.0);
+        bar(&mut face, 184 + selected.index() as u32 * 68, 60);
+        for row in GamePickerRow::ALL {
+            put_text(
+                &mut face,
+                row.label(),
+                32,
+                184 + row.index() as u32 * 68,
+                656,
+                60,
+                1,
+                30.0,
+            );
+        }
         put_text(
             &mut face,
             "UP / DOWN   A OPEN   B BACK",
@@ -629,13 +640,13 @@ mod tests {
         session.app_mut().apply(Action::GameMenu);
         assert_eq!(
             screen.view_key(&session, |_| panic!("picker fetched a snapshot")),
-            Some(ScreenKey::Picker(false))
+            Some(ScreenKey::Picker(GamePickerRow::Achievements))
         );
         assert!(screen.snapshot.is_none());
         assert!(screen.displayed.is_none());
         assert_eq!(screen.snapshot_key, (0, 0));
         assert_eq!(Arc::strong_count(&stale), 1);
-        screen.wanted = Some(ScreenKey::Picker(false));
+        screen.wanted = Some(ScreenKey::Picker(GamePickerRow::Achievements));
         session.app_mut().apply(Action::GbaDown(Btn::A));
         assert!(matches!(
             screen.view_key(&session, Session::achievement_snapshot),
@@ -659,7 +670,7 @@ mod tests {
         session.app_mut().apply(Action::GbaDown(Btn::A));
         assert!(session.app().achievement_screen().is_some());
         let mut screen = Screen::new();
-        screen.wanted = Some(ScreenKey::Picker(false));
+        screen.wanted = Some(ScreenKey::Picker(GamePickerRow::Achievements));
         screen.snapshot = Some(Arc::new(GameAchievementSnapshot::empty(
             42,
             GameAchievementState::Ready,
@@ -791,7 +802,9 @@ mod tests {
             unsupported: 1,
         };
         for (name, key) in [
-            ("root", ScreenKey::Picker(false)),
+            ("root", ScreenKey::Picker(GamePickerRow::Achievements)),
+            ("root-settings", ScreenKey::Picker(GamePickerRow::Settings)),
+            ("root-link", ScreenKey::Picker(GamePickerRow::Link)),
             (
                 "list",
                 ScreenKey::Achievements(1, 0, 0, Selection::default()),

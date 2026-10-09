@@ -4,12 +4,12 @@ use common::{
     app_booting_at, app_booting_with_clock, app_playing_in, tmp_root_with_carts, Clock,
     CLOCK_IS_SET,
 };
-use slot::app::{App, Phase};
+use slot::app::{App, GameMenu, GamePickerRow, Phase};
 use slot_input::{Action, Btn};
 use slot_store::{read_slot_state, write_slot_state, SlotState};
 use slot_ui::{
-    edge, quick_window, Draw, Icon, QuickMenuFaces, QuickRow, QuickValue, TexId, MENU_PAD, OUT_W,
-    QUICK_EDGE, QUICK_PITCH, QUICK_ROWS, QUICK_TOP,
+    edge, quick_window, Draw, Icon, QuickMenuFaces, QuickRow, QuickValue, TexId, Toast, MENU_PAD,
+    OUT_W, QUICK_EDGE, QUICK_PITCH, QUICK_ROWS, QUICK_TOP,
 };
 use tempfile::TempDir;
 
@@ -921,6 +921,231 @@ fn fast_forward_carets_follow_its_clamps_and_locked_colour_has_no_carets() {
         press(&mut a, btn);
         assert_eq!(
             a.quick_value(QuickRow::ColourCorrection),
+            Some(QuickValue::Gba)
+        );
+    }
+}
+
+fn in_game_settings(row: QuickRow) -> (TempDir, App) {
+    let root = tmp_root_with_carts(&["Emerald", "Fusion"]);
+    let mut app = app_playing_in(root.path(), "Emerald");
+    app.set_game_ready(true);
+    for _ in 0..120 {
+        app.update(1.0 / 60.0);
+    }
+    app.apply(Action::GameMenu);
+    press(&mut app, Btn::Down);
+    assert_eq!(app.game_picker(), Some(GamePickerRow::Settings));
+    press(&mut app, Btn::A);
+    for _ in 0..row.index() {
+        press(&mut app, Btn::Down);
+    }
+    assert_eq!(app.quick_menu(), Some(row));
+    (root, app)
+}
+
+#[test]
+fn in_game_settings_opens_on_the_first_row_and_keeps_playing_paused() {
+    let (_root, app) = in_game_settings(QuickRow::FastForward);
+    assert!(matches!(app.phase(), Phase::Playing { .. }));
+    assert!(app.game_menu_open());
+    assert_eq!(app.game_picker(), None);
+    assert_eq!(app.achievement_screen(), None);
+    assert_eq!(app.game_menu(), None);
+}
+
+#[test]
+fn in_game_shader_changes_are_pending_and_persisted_with_matching_carets() {
+    let (root, mut app) = in_game_settings(QuickRow::Shader);
+    assert_eq!(app.take_shader().as_deref(), Some("LCD"));
+    assert_eq!(app.quick_carets(QuickRow::Shader), [false, true]);
+    press(&mut app, Btn::Right);
+    assert_eq!(app.shader(), "Off");
+    assert_eq!(read_slot_state(root.path()).shader, "Off");
+    assert_eq!(app.take_shader().as_deref(), Some("Off"));
+    assert!(app.take_shader().is_none());
+    assert_eq!(app.quick_carets(QuickRow::Shader), [true, false]);
+    press(&mut app, Btn::Right);
+    assert!(app.take_shader().is_none());
+    app.shader_failed();
+    assert_eq!(app.toast(), Some(Toast::ShaderFailed));
+    assert!(matches!(app.phase(), Phase::Playing { .. }));
+    assert!(app.game_menu_open());
+}
+
+#[test]
+fn in_game_show_fps_toggles_and_becomes_visible_when_the_menu_closes() {
+    let (root, mut app) = in_game_settings(QuickRow::ShowFps);
+    assert!(!app.show_framerate());
+    press(&mut app, Btn::Right);
+    assert!(app.show_framerate());
+    assert!(read_slot_state(root.path()).show_framerate);
+    assert!(!app.framerate_visible());
+    app.apply(Action::GameMenu);
+    assert!(app.framerate_visible());
+    app.apply(Action::GameMenu);
+    press(&mut app, Btn::Down);
+    press(&mut app, Btn::A);
+    for _ in 0..QuickRow::ShowFps.index() {
+        press(&mut app, Btn::Down);
+    }
+    press(&mut app, Btn::Left);
+    assert!(!app.show_framerate());
+    assert!(!read_slot_state(root.path()).show_framerate);
+    app.apply(Action::GameMenu);
+    assert!(!app.framerate_visible());
+}
+
+#[test]
+fn in_game_settings_back_chord_and_eject_follow_the_game_menu_exits() {
+    let (_root, mut app) = in_game_settings(QuickRow::Rumble);
+    press(&mut app, Btn::B);
+    assert_eq!(app.quick_menu(), None);
+    assert_eq!(app.game_picker(), Some(GamePickerRow::Settings));
+    assert!(app.game_menu_open());
+    press(&mut app, Btn::B);
+    assert!(!app.game_menu_open());
+    assert!(matches!(app.phase(), Phase::Playing { .. }));
+    for close in [Action::GameMenu, Action::Eject] {
+        let (_root, mut app) = in_game_settings(QuickRow::Shader);
+        app.apply(close);
+        assert!(!app.game_menu_open());
+        assert_eq!(app.quick_menu(), None);
+        assert_eq!(app.game_picker(), None);
+        assert_eq!(app.game_menu(), None);
+        assert_eq!(app.achievement_screen(), None);
+        if close == Action::Eject {
+            assert!(matches!(app.phase(), Phase::Ejecting { .. }));
+        } else {
+            assert!(matches!(app.phase(), Phase::Playing { .. }));
+        }
+    }
+}
+
+#[test]
+fn in_game_settings_only_visits_and_draws_the_six_game_rows() {
+    let (_root, mut app) = in_game_settings(QuickRow::FastForward);
+    fake_faces(&mut app);
+    for _ in 0..20 {
+        press(&mut app, Btn::Up);
+        assert_eq!(app.quick_menu(), Some(QuickRow::FastForward));
+    }
+    for want in QuickRow::IN_GAME.into_iter().skip(1) {
+        press(&mut app, Btn::Down);
+        assert_eq!(app.quick_menu(), Some(want));
+    }
+    for _ in 0..20 {
+        press(&mut app, Btn::Down);
+        assert_eq!(app.quick_menu(), Some(QuickRow::Rumble));
+    }
+    for want in QuickRow::IN_GAME.into_iter().rev().skip(1) {
+        press(&mut app, Btn::Up);
+        assert_eq!(app.quick_menu(), Some(want));
+    }
+    let draws = frame(&app);
+    assert_eq!(draws.first(), Some(&Draw::Game));
+    for row in QuickRow::ALL {
+        assert_eq!(
+            drawn(&draws, 100 + row.index()),
+            QuickRow::IN_GAME.contains(&row)
+        );
+    }
+    assert!(drawn(&frame(&app), 400));
+    app.apply(Action::QuickMenu);
+    assert!(matches!(app.phase(), Phase::Playing { .. }));
+    assert_eq!(app.quick_menu(), Some(QuickRow::FastForward));
+}
+
+#[test]
+fn in_game_picker_has_three_rows_clamps_and_opens_achievements_and_link() {
+    let root = tmp_root_with_carts(&["Emerald"]);
+    common::write_retail_header(&root, "Emerald", "POKEMON RUBY", "AXVE");
+    let mut app = app_playing_in(root.path(), "Emerald");
+    app.set_core(slot_store::Core::Gpsp);
+    app.apply(Action::GameMenu);
+    for _ in 0..5 {
+        press(&mut app, Btn::Up);
+        assert_eq!(app.game_picker(), Some(GamePickerRow::Achievements));
+    }
+    for want in [GamePickerRow::Settings, GamePickerRow::Link] {
+        press(&mut app, Btn::Down);
+        assert_eq!(app.game_picker(), Some(want));
+    }
+    for _ in 0..5 {
+        press(&mut app, Btn::Down);
+        assert_eq!(app.game_picker(), Some(GamePickerRow::Link));
+    }
+    for want in [GamePickerRow::Settings, GamePickerRow::Achievements] {
+        press(&mut app, Btn::Up);
+        assert_eq!(app.game_picker(), Some(want));
+    }
+    press(&mut app, Btn::A);
+    assert!(app.achievement_screen().is_some());
+    assert_eq!(app.game_menu(), None);
+    app.apply(Action::GameMenu);
+    app.apply(Action::GameMenu);
+    press(&mut app, Btn::Down);
+    press(&mut app, Btn::Down);
+    press(&mut app, Btn::A);
+    assert!(matches!(app.game_menu(), Some(GameMenu::Pick(_))));
+    assert_eq!(app.achievement_screen(), None);
+    assert_eq!(app.quick_menu(), None);
+    assert_eq!(app.game_picker(), None);
+}
+
+#[test]
+fn in_game_shader_parameters_return_to_settings_and_allow_chord_and_eject() {
+    for close in [Action::GbaDown(Btn::B), Action::GameMenu, Action::Eject] {
+        let (_root, mut app) = in_game_settings(QuickRow::Shader);
+        app.set_shader_parameters(vec![slot_gfx::preset::Parameter {
+            name: "P".into(),
+            label: "Amount".into(),
+            default: 0.5,
+            min: 0.0,
+            max: 1.0,
+            step: 0.1,
+            value: 0.5,
+        }]);
+        press(&mut app, Btn::A);
+        assert!(app.shader_params_open());
+        assert!(app.game_menu_open());
+        assert!(matches!(app.phase(), Phase::Playing { .. }));
+        press(&mut app, Btn::Right);
+        assert_eq!(app.shader_parameters()[0].value, 0.6);
+        assert_eq!(app.take_parameter_changes().unwrap()[0].value, 0.6);
+        app.apply(close);
+        assert!(!app.shader_params_open());
+        if close == Action::GbaDown(Btn::B) {
+            assert_eq!(app.quick_menu(), Some(QuickRow::Shader));
+            assert!(app.game_menu_open());
+            assert!(matches!(app.phase(), Phase::Playing { .. }));
+        } else {
+            assert_eq!(app.quick_menu(), None);
+            assert!(!app.game_menu_open());
+            assert_eq!(
+                matches!(app.phase(), Phase::Ejecting { .. }),
+                close == Action::Eject
+            );
+        }
+    }
+}
+
+#[test]
+fn in_game_colour_changes_are_pending_and_the_profile_lock_keeps_its_toast() {
+    let (root, mut app) = in_game_settings(QuickRow::ColourCorrection);
+    press(&mut app, Btn::Right);
+    assert!(app.colour_correction());
+    assert!(read_slot_state(root.path()).colour_correction);
+    assert_eq!(app.take_colour_correction(), Some(true));
+    app.set_profile_colour(Some(QuickValue::Gba));
+    assert_eq!(app.quick_carets(QuickRow::ColourCorrection), [false, false]);
+    for button in [Btn::Left, Btn::Right] {
+        press(&mut app, button);
+        assert_eq!(app.toast(), Some(Toast::ProfileColourLocked));
+        assert!(app.colour_correction());
+        assert!(app.take_colour_correction().is_none());
+        assert_eq!(
+            app.quick_value(QuickRow::ColourCorrection),
             Some(QuickValue::Gba)
         );
     }
