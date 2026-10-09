@@ -1020,7 +1020,7 @@ impl App {
             && matches!(self.phase, Phase::Playing { .. })
             && self.game_visible()
             && !self.shutting_down()
-            && self.game_menu.is_none()
+            && !self.game_menu_open()
             && self.cheat_menu.is_none()
             && !self.shader_params_open()
             && self.wifi_screen.is_none()
