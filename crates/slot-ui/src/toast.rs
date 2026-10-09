@@ -29,10 +29,11 @@ pub enum Toast {
     NoShaderParams,
     ProfileCoreMismatch,
     ProfileColourLocked,
+    ProfileAudioFailed,
 }
 
 impl Toast {
-    pub const ALL: [Toast; 17] = [
+    pub const ALL: [Toast; 18] = [
         Toast::StateSaved,
         Toast::StateLoaded,
         Toast::NeedsGpsp,
@@ -50,6 +51,7 @@ impl Toast {
         Toast::NoShaderParams,
         Toast::ProfileCoreMismatch,
         Toast::ProfileColourLocked,
+        Toast::ProfileAudioFailed,
     ];
 
     pub fn index(self) -> usize {
@@ -75,6 +77,7 @@ impl Toast {
             Toast::NoShaderParams => "No shader parameters",
             Toast::ProfileCoreMismatch => "Preset core mismatch",
             Toast::ProfileColourLocked => "Preset sets colour",
+            Toast::ProfileAudioFailed => "Preset audio failed",
         }
     }
 }

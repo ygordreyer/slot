@@ -244,6 +244,30 @@ impl Session {
         self.custom_shader = active;
         self.shader_profile = profile.filter(|_| active);
         self.apply_shader_profile();
+        self.apply_shader_audio_look();
+    }
+
+    fn apply_shader_audio_look(&mut self) {
+        let wanted = self
+            .shader_profile
+            .as_ref()
+            .filter(|profile| !profile.audio.is_empty())
+            .map(|profile| AudioLook::from_entries(&profile.audio, &profile.directory, &self.root))
+            .transpose();
+        let result = match wanted {
+            Ok(look) if self.audio_look != look => self.set_audio_look(look),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            eprintln!("slot: preset audio: {error}");
+            if self.audio_look.is_some() {
+                if let Err(error) = self.set_audio_look(None) {
+                    eprintln!("slot: preset audio baseline: {error}");
+                }
+            }
+            self.app.show_toast(Toast::ProfileAudioFailed);
+        }
     }
 
     fn apply_shader_profile(&mut self) {
@@ -680,6 +704,7 @@ impl Session {
         if let Some(look) = &self.audio_look {
             if let Err(error) = emu.set_audio_look(Some(look.clone())) {
                 eprintln!("slot: audio look: {error}");
+                self.app.show_toast(Toast::ProfileAudioFailed);
                 self.audio_look = None;
                 let _ = self.sink.open_with_latency(GBA_HZ, BASELINE_LATENCY_MS);
                 let _ = emu.set_audio_look(None);
@@ -883,6 +908,146 @@ mod profile_tests {
         slot_gfx::preset::parse_preset("shaders=1\nshader0=copy.glsl\nslot_core=mgba\nslot_core_options=mgba_color_correction;mgba_interframe_blending;mgba_audio_low_pass_filter;mgba_audio_low_pass_range\nmgba_color_correction=GBA\nmgba_interframe_blending=mix_smart\nmgba_audio_low_pass_filter=enabled\nmgba_audio_low_pass_range=30", std::path::Path::new("owner.glslp")).unwrap().profile
     }
 
+    pub(super) fn owner_audio_profile(root: &std::path::Path) -> slot_gfx::preset::Profile {
+        let directory = root.join("Shaders/private");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir_all(root.join("Audio")).unwrap();
+        std::fs::write(
+            root.join("Audio/ChipTuneEnhance.dsp"),
+            include_str!("../../../card/Audio/ChipTuneEnhance.dsp"),
+        )
+        .unwrap();
+        let mut profile = owner_profile();
+        profile.directory = directory;
+        profile.audio = BTreeMap::from([
+            ("slot_audio_rate".into(), "48000".into()),
+            ("slot_audio_latency_ms".into(), "256".into()),
+            ("slot_audio_resampler".into(), "sinc".into()),
+            ("slot_audio_resampler_quality".into(), "higher".into()),
+            ("slot_audio_sync".into(), "true".into()),
+            ("slot_audio_gain_db".into(), "-2.0".into()),
+            (
+                "slot_audio_dsp".into(),
+                "../../Audio/ChipTuneEnhance.dsp".into(),
+            ),
+        ]);
+        profile
+    }
+
+    #[test]
+    fn profile_audio_installs_owner_look_and_reselection_does_not_reinstall() {
+        let (root, mut session, calls) = super::audio_look_tests::session(false);
+        game_open(&mut session, Core::Mgba);
+        let profile = owner_audio_profile(root.path());
+        let wanted =
+            AudioLook::from_entries(&profile.audio, &profile.directory, root.path()).unwrap();
+        session.set_shader_profile(true, Some(profile.clone()));
+        assert_eq!(session.audio_look(), Some(&wanted));
+        assert_eq!(session.audio_ring().sample_rate(), 48000);
+        assert_eq!(wanted.latency_ms, Some(256));
+        assert_eq!(wanted.sync, Some(true));
+        assert_eq!(wanted.gain_db, Some(-2.0));
+        assert!(wanted.dsp.is_some());
+        assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
+        session.audio_ring().push(&[1234; 100]);
+
+        session.set_shader_profile(true, Some(profile));
+        assert_eq!(session.audio_look(), Some(&wanted));
+        assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
+        assert_eq!(session.audio_ring().queued_frames(), 50);
+        assert_eq!(*calls.lock().unwrap(), [(32768, 40), (48000, 256)]);
+    }
+
+    #[test]
+    fn profile_audio_restores_baseline_on_empty_profile_leave_and_shader_failure() {
+        let (root, mut session, calls) = super::audio_look_tests::session(false);
+        game_open(&mut session, Core::Mgba);
+        let profile = owner_audio_profile(root.path());
+        for (active, next) in [
+            (true, Some(owner_profile())),
+            (true, None),
+            (false, Some(profile.clone())),
+            (false, None),
+        ] {
+            session.set_shader_profile(true, Some(profile.clone()));
+            assert!(session.audio_look().is_some());
+            if active || next.is_some() {
+                session.set_shader_profile(active, next);
+            } else {
+                session.set_custom_shader(false);
+            }
+            assert_eq!(session.audio_look(), None);
+            assert_eq!(session.audio_ring().sample_rate(), GBA_HZ);
+        }
+        assert_eq!(session.emu().unwrap().audio_look_commands(), 8);
+        assert_eq!(calls.lock().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn profile_audio_rejects_dsp_outside_card_and_clears_previous_look() {
+        let (root, mut session, calls) = super::audio_look_tests::session(false);
+        let outside = tempfile::tempdir_in(root.path().parent().unwrap()).unwrap();
+        let dsp = outside.path().join("outside.dsp");
+        std::fs::write(&dsp, "filters=0").unwrap();
+        let profile = owner_audio_profile(root.path());
+        session.set_shader_profile(true, Some(profile.clone()));
+        let mut invalid = profile;
+        invalid.audio.insert(
+            "slot_audio_dsp".into(),
+            format!(
+                "../../../{}/outside.dsp",
+                outside.path().file_name().unwrap().to_str().unwrap()
+            ),
+        );
+        let error =
+            AudioLook::from_entries(&invalid.audio, &invalid.directory, root.path()).unwrap_err();
+        assert!(error.to_string().contains("path escapes card root"));
+
+        session.set_shader_profile(true, Some(invalid.clone()));
+        assert_eq!(session.shader_profile(), Some(&invalid));
+        assert_eq!(session.audio_look(), None);
+        assert_eq!(session.audio_ring().sample_rate(), GBA_HZ);
+        assert_eq!(session.app.toast(), Some(Toast::ProfileAudioFailed));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [(32768, 40), (48000, 256), (32768, 40)]
+        );
+    }
+
+    #[test]
+    fn profile_audio_errors_keep_video_profile_and_core_options() {
+        for sink_fails in [false, true] {
+            let (root, mut session, calls) = super::audio_look_tests::session(sink_fails);
+            let values = game_open(&mut session, Core::Mgba);
+            let mut profile = owner_audio_profile(root.path());
+            profile.overlay = Some(root.path().join("Config/overlays/owner.png"));
+            if !sink_fails {
+                session.set_shader_profile(true, Some(profile.clone()));
+                profile
+                    .audio
+                    .insert("slot_audio_rate".into(), "invalid".into());
+            }
+            session.set_shader_profile(true, Some(profile.clone()));
+            flush(&session);
+            assert!(session.custom_shader);
+            assert_eq!(session.shader_profile(), Some(&profile));
+            for (key, value) in &profile.core_options {
+                assert_eq!(values.lock().unwrap()[key], *value);
+            }
+            assert_eq!(
+                session.app.quick_value(QuickRow::ColourCorrection),
+                Some(QuickValue::Gba)
+            );
+            assert_eq!(session.app.toast(), Some(Toast::ProfileAudioFailed));
+            assert_eq!(session.audio_look(), None);
+            assert_eq!(session.audio_ring().sample_rate(), GBA_HZ);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                [(32768, 40), (48000, 256), (32768, 40)]
+            );
+        }
+    }
+
     #[test]
     fn profile_options_apply_on_select_and_game_open_and_restore_on_leave_or_failure() {
         let root = tempfile::tempdir().unwrap();
@@ -993,7 +1158,7 @@ mod audio_look_tests {
             ..AudioLook::default()
         }
     }
-    fn session(fail: bool) -> (tempfile::TempDir, Session, Arc<Mutex<Vec<(u32, u32)>>>) {
+    pub(super) fn session(fail: bool) -> (tempfile::TempDir, Session, Arc<Mutex<Vec<(u32, u32)>>>) {
         let root = tempfile::tempdir().unwrap();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let sink = RecordingSink {
@@ -1142,19 +1307,25 @@ mod audio_look_tests {
 
     #[test]
     fn new_game_workers_each_receive_the_look_once() {
-        let (_root, mut session, _calls) = session(false);
-        session.set_audio_look(Some(look())).unwrap();
+        let (root, mut session, calls) = session(false);
+        let profile = super::profile_tests::owner_audio_profile(root.path());
+        session.set_shader_profile(true, Some(profile.clone()));
+        let wanted = session.audio_look().cloned();
+        assert!(wanted.is_some());
         for stem in ["first", "second"] {
             let mut cart = mock_cart();
             cart.stem = stem.into();
             session.app = App::new(vec![cart]);
             session.app.apply(Action::Insert);
             session.spawn_core(stem, "off");
+            assert_eq!(session.shader_profile(), Some(&profile));
+            assert_eq!(session.audio_look(), wanted.as_ref());
             assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
             session.update(0.0);
             assert_eq!(session.emu().unwrap().audio_look_commands(), 1);
             session.emu = None;
         }
+        assert_eq!(*calls.lock().unwrap(), [(32768, 40), (48000, 256)]);
     }
 
     #[test]

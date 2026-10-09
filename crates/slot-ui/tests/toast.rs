@@ -44,6 +44,7 @@ fn the_banner_says_what_happened_and_never_what_is_on_screen() {
             Toast::NoShaderParams,
             Toast::ProfileCoreMismatch,
             Toast::ProfileColourLocked,
+            Toast::ProfileAudioFailed,
         ],
         "a banner was added or dropped: every face is uploaded by its place in this list"
     );
